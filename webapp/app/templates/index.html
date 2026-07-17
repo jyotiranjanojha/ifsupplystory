@@ -54,7 +54,7 @@
             <div class="card-top compact-top">
               <div>
                 <h2>Chat Assistant</h2>
-                <p class="hint">Ask in plain English. Example: Validate data for week 2026-W30 scenario S2.</p>
+                <p class="hint">Ask in plain English. Week ID maps to CAPTURE_WK and Scenario ID maps to SIMULATION_NAME. If omitted, the latest available data is used.</p>
               </div>
               <div class="chat-settings compact-settings">
                 <label class="toggle-row compact-toggle" for="chatLlmEnabled">
@@ -71,8 +71,8 @@
             <div class="field-grid">
               <textarea id="chatQuestion" rows="4" placeholder="Type your IFSP question here..."></textarea>
               <div class="split-grid">
-                <input id="chatWeek" placeholder="Week ID (optional)" />
-                <input id="chatScenario" placeholder="Scenario ID (optional)" />
+                <input id="chatWeek" placeholder="Week ID = CAPTURE_WK (optional)" />
+                <input id="chatScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               </div>
               <input id="chatSite" placeholder="Site (optional)" />
             </div>
@@ -82,8 +82,8 @@
           <article class="card feature-panel" data-panel="validation">
             <h2>Validation Gate</h2>
             <div class="field-grid">
-              <input id="valWeek" placeholder="Week ID (e.g. 2026-W30)" />
-              <input id="valScenario" placeholder="Scenario ID" />
+              <input id="valWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
+              <input id="valScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               <input id="valSite" placeholder="Site (optional)" />
               <input id="valProduct" placeholder="Product (optional)" />
             </div>
@@ -93,9 +93,9 @@
           <article class="card feature-panel" data-panel="comparison">
             <h2>Scenario Comparison</h2>
             <div class="field-grid">
-              <input id="cmpWeek" placeholder="Week ID" />
-              <input id="cmpBase" placeholder="Base Scenario ID" />
-              <input id="cmpCompare" placeholder="Compare Scenario ID" />
+              <input id="cmpWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
+              <input id="cmpBase" placeholder="Base Scenario = SIMULATION_NAME" />
+              <input id="cmpCompare" placeholder="Compare Scenario = SIMULATION_NAME" />
               <input id="cmpSite" placeholder="Site (optional)" />
             </div>
             <button id="compareBtn" class="btn">Run Comparison</button>
@@ -104,8 +104,8 @@
           <article class="card feature-panel" data-panel="rootcause">
             <h2>Root Cause</h2>
             <div class="field-grid">
-              <input id="rcWeek" placeholder="Week ID" />
-              <input id="rcScenario" placeholder="Scenario ID" />
+              <input id="rcWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
+              <input id="rcScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               <input id="rcDemand" placeholder="Demand ITEM (with EXTORDERREF or DFUTOSKUFCST)" />
               <input id="rcNode" placeholder="Node (optional)" />
             </div>
@@ -114,12 +114,12 @@
 
           <article class="card feature-panel" data-panel="graph">
             <h2>Knowledge Graph</h2>
-            <p class="hint">Start with ITEM. Add week, scenario, and site to narrow the lineage graph.</p>
+            <p class="hint">Start with ITEM. Week ID maps to CAPTURE_WK and Scenario ID maps to SIMULATION_NAME. Latest available context is used when omitted.</p>
             <div class="field-grid">
               <input id="kgItem" placeholder="ITEM" />
               <div class="split-grid">
-                <input id="kgWeek" placeholder="Week ID" />
-                <input id="kgScenario" placeholder="Scenario ID" />
+                <input id="kgWeek" placeholder="Week ID = CAPTURE_WK (optional)" />
+                <input id="kgScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               </div>
               <input id="kgSite" placeholder="Site (optional)" />
             </div>
@@ -134,7 +134,10 @@
                 <h2>Chat Assistant Output</h2>
                 <p class="hint">Planner-facing answer with grounded evidence.</p>
               </div>
-              <button id="chatClearBtn" class="btn ghost" type="button">Clear Chat</button>
+              <button id="chatClearBtn" class="btn chat-clear-btn" type="button" aria-label="Clear chat history">
+                <span class="btn-icon" aria-hidden="true">x</span>
+                <span>Clear Chat</span>
+              </button>
             </div>
             <div id="chatResultPane" class="result-pane chat-thread"></div>
           </article>

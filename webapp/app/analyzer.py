@@ -124,15 +124,246 @@ def _scenario_match(candidate: str, scenario_id: str) -> bool:
     return c == s or c.startswith(f"{s}_")
 
 
+def _normalize_week_id(week_id: Optional[str]) -> Optional[str]:
+    value = (week_id or "").strip()
+    return value or None
+
+
+def _normalize_scenario_id(scenario_id: Optional[str]) -> Optional[str]:
+    value = (scenario_id or "").strip()
+    return value or None
+
+
+def _parse_solve_version_sort_key(value: Optional[str]) -> Tuple[int, str]:
+    text = (value or "").strip()
+    match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{4})", text)
+    if match:
+        try:
+            dt = datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H%M")
+            return (int(dt.timestamp()), text)
+        except ValueError:
+            pass
+    return (0, text)
+
+
+def _collect_context_catalog(base_dir: Path) -> Dict:
+    output_dir = base_dir / OUTPUT_FOLDER
+    catalog = {}
+
+    for file_path in _list_csv_files(output_dir):
+        for row in _safe_rows(file_path):
+            week = (row.get("CAPTURE_WK") or "").strip()
+            scenario = (row.get("SIMULATION_NAME") or "").strip()
+            solve_version = (row.get("SOLVE_VERSION") or "").strip()
+            capture_type = (row.get("CAPTURE_TYPE") or "").strip()
+            if not week:
+                continue
+
+            week_bucket = catalog.setdefault(week, {})
+            if scenario:
+                current = week_bucket.get(scenario)
+                sort_key = _parse_solve_version_sort_key(solve_version)
+                if current is None or sort_key > current["sort_key"]:
+                    week_bucket[scenario] = {
+                        "solve_version": solve_version or None,
+                        "capture_type": capture_type or None,
+                        "sort_key": sort_key,
+                    }
+
+    return catalog
+
+
+def _rank_scenarios(catalog: Dict, week_id: Optional[str]) -> List[str]:
+    if not week_id or week_id not in catalog:
+        return []
+    ranked = sorted(
+        catalog[week_id].items(),
+        key=lambda item: (item[1]["sort_key"], item[0]),
+        reverse=True,
+    )
+    return [scenario for scenario, _meta in ranked]
+
+
+def _resolve_context(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str]) -> Dict:
+    requested_week = _normalize_week_id(week_id)
+    requested_scenario = _normalize_scenario_id(scenario_id)
+    catalog = _collect_context_catalog(base_dir)
+    weeks = sorted(catalog.keys())
+    latest_week = weeks[-1] if weeks else None
+
+    resolved_week = requested_week if requested_week in catalog else (requested_week or latest_week)
+    ranked_scenarios = _rank_scenarios(catalog, resolved_week)
+
+    resolved_scenario = requested_scenario
+    if requested_scenario and resolved_week in catalog:
+        matched = next((name for name in ranked_scenarios if _scenario_match(name, requested_scenario)), None)
+        resolved_scenario = matched or requested_scenario
+    elif not requested_scenario:
+        resolved_scenario = ranked_scenarios[0] if ranked_scenarios else None
+
+    notes = []
+    if requested_week is None and resolved_week:
+        notes.append(f"Week ID not provided. Defaulted to latest CAPTURE_WK: {resolved_week}.")
+    elif requested_week and requested_week not in catalog and latest_week:
+        notes.append(f"Requested Week ID '{requested_week}' was not found. Defaulted to latest CAPTURE_WK: {latest_week}.")
+
+    if requested_scenario is None and resolved_scenario:
+        notes.append(f"Scenario ID not provided. Defaulted to latest SIMULATION_NAME in week {resolved_week}: {resolved_scenario}.")
+    elif requested_scenario and resolved_week in catalog and resolved_scenario == requested_scenario and requested_scenario not in catalog.get(resolved_week, {}):
+        notes.append(f"Requested Scenario ID '{requested_scenario}' was not found in SIMULATION_NAME for week {resolved_week}.")
+
+    return {
+        "requested_week_id": requested_week,
+        "requested_scenario_id": requested_scenario,
+        "week_id": resolved_week,
+        "scenario_id": resolved_scenario,
+        "latest_week_id": latest_week,
+        "available_weeks": weeks,
+        "available_scenarios_for_week": ranked_scenarios,
+        "notes": notes,
+    }
+
+
+def _resolve_compare_context(base_dir: Path, week_id: Optional[str], base_scenario_id: Optional[str], compare_scenario_id: Optional[str]) -> Dict:
+    week_context = _resolve_context(base_dir, week_id, None)
+    resolved_week = week_context["week_id"]
+    ranked_scenarios = week_context["available_scenarios_for_week"]
+
+    def match_requested(requested: Optional[str]) -> Optional[str]:
+        req = _normalize_scenario_id(requested)
+        if not req:
+            return None
+        return next((name for name in ranked_scenarios if _scenario_match(name, req)), req)
+
+    base_resolved = match_requested(base_scenario_id)
+    compare_resolved = match_requested(compare_scenario_id)
+
+    if not base_resolved and not compare_resolved:
+        if len(ranked_scenarios) >= 2:
+            compare_resolved = ranked_scenarios[0]
+            base_resolved = ranked_scenarios[1]
+        elif len(ranked_scenarios) == 1:
+            base_resolved = ranked_scenarios[0]
+            compare_resolved = ranked_scenarios[0]
+    elif not base_resolved:
+        base_resolved = next((name for name in ranked_scenarios if name != compare_resolved), compare_resolved)
+    elif not compare_resolved:
+        compare_resolved = next((name for name in ranked_scenarios if name != base_resolved), base_resolved)
+
+    notes = list(week_context["notes"])
+    if not _normalize_scenario_id(base_scenario_id) and base_resolved:
+        notes.append(f"Base Scenario ID not provided. Defaulted using SIMULATION_NAME: {base_resolved}.")
+    if not _normalize_scenario_id(compare_scenario_id) and compare_resolved:
+        notes.append(f"Compare Scenario ID not provided. Defaulted using SIMULATION_NAME: {compare_resolved}.")
+    if len(set([s for s in [base_resolved, compare_resolved] if s])) < 2:
+        notes.append("Only one SIMULATION_NAME is available for the resolved week, so scenario comparison is limited.")
+
+    return {
+        "requested_week_id": week_context["requested_week_id"],
+        "week_id": resolved_week,
+        "base_scenario_id": base_resolved,
+        "compare_scenario_id": compare_resolved,
+        "available_scenarios_for_week": ranked_scenarios,
+        "notes": notes,
+    }
+
+
+def _extract_item_candidates(question: str) -> List[str]:
+    q = question or ""
+    candidates: List[str] = []
+    patterns = [
+        r"\bdemand\s+(?:for|item)\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        r"\bfor\s+([A-Za-z0-9\-]{6,})\b",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, q, flags=re.IGNORECASE):
+            value = (match.group(1) or "").strip(" .,:;!?()[]{}")
+            if value and value not in candidates:
+                candidates.append(value)
+
+    numeric_tokens = re.findall(r"\b\d{6,}\b", q)
+    for token in numeric_tokens:
+        if token not in candidates:
+            candidates.append(token)
+
+    return candidates
+
+
+def _infer_demand_item_from_question(question: str) -> Dict:
+    q = (question or "").strip()
+    ql = q.lower()
+    candidates = _extract_item_candidates(q)
+    demand_language = any(term in ql for term in ["demand", "met", "meet", "unmet", "fulfilled", "root cause", "lineage"])
+
+    selected = candidates[0] if len(candidates) == 1 else None
+    if not selected and demand_language and len(candidates) > 0:
+        demand_for = re.search(r"\bdemand\s+for\s+([A-Za-z0-9\-]+)", q, flags=re.IGNORECASE)
+        if demand_for:
+            selected = demand_for.group(1).strip()
+
+    confidence = "high" if selected else ("low" if candidates else "none")
+    reason = ""
+    if selected:
+        reason = "Single likely ITEM candidate found in the question."
+    elif len(candidates) > 1:
+        reason = "Multiple ITEM-like identifiers were found in the question."
+    else:
+        reason = "No ITEM-like identifier was found in the question."
+
+    return {
+        "selected_item": selected,
+        "candidates": candidates,
+        "confidence": confidence,
+        "demand_language": demand_language,
+        "reason": reason,
+    }
+
+
+def _item_demand_evidence(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], item_id: Optional[str], scope: Dict) -> Dict:
+    item = (item_id or "").strip()
+    if not item:
+        return {"item": None, "demand_rows": 0, "extorder_hits": 0, "headerextref_hits": 0, "site_filtered": bool((scope.get("site") or "").strip())}
+
+    output_dir = base_dir / OUTPUT_FOLDER
+    inddmdview_file = _find_file_by_prefix(output_dir, "by_if_snop_out_inddmdview-")
+    site = (scope.get("site") or "").strip()
+    demand_rows = 0
+    extorder_hits = 0
+    header_hits = 0
+
+    if inddmdview_file:
+        for row in _safe_rows(inddmdview_file):
+            if (row.get("ITEM") or "").strip() != item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            demand_rows += 1
+            if (row.get("EXTORDERID") or "").strip():
+                extorder_hits += 1
+            if (row.get("HEADEREXTREF") or "").strip():
+                header_hits += 1
+
+    return {
+        "item": item,
+        "demand_rows": demand_rows,
+        "extorder_hits": extorder_hits,
+        "headerextref_hits": header_hits,
+        "site_filtered": bool(site),
+        "is_demand_item": demand_rows > 0 and (extorder_hits > 0 or header_hits > 0),
+    }
+
+
 def _matches_context(row: Dict[str, str], week_id: Optional[str], scenario_id: Optional[str]) -> bool:
     if week_id and (row.get("CAPTURE_WK") or "").strip() != week_id:
         return False
 
     if scenario_id:
         scenario_candidates = [
-            (row.get("CAPTURE_TYPE") or ""),
             (row.get("SIMULATION_NAME") or ""),
-            (row.get("SOLVE_VERSION") or ""),
         ]
         if not any(_scenario_match(value, scenario_id) for value in scenario_candidates):
             return False
@@ -260,6 +491,9 @@ def _summarize_with_ollama(
 
 
 def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], scope: Dict, focus_areas: List[str]) -> Dict:
+    context = _resolve_context(base_dir, week_id, scenario_id)
+    week_id = context["week_id"]
+    scenario_id = context["scenario_id"]
     input_dir = base_dir / INPUT_FOLDER
     output_dir = base_dir / OUTPUT_FOLDER
 
@@ -333,15 +567,17 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     scope_summary = {
         "week_id": week_id,
         "scenario_id": scenario_id,
+        "week_column": "CAPTURE_WK",
+        "scenario_column": "SIMULATION_NAME",
         "scope": scope,
         "focus_areas": focus_areas,
     }
 
     data_gaps = []
     if not week_id:
-        data_gaps.append("week_id missing")
+        data_gaps.append("no CAPTURE_WK found in available output datasets")
     if not scenario_id:
-        data_gaps.append("scenario_id missing")
+        data_gaps.append("no SIMULATION_NAME found in available output datasets")
 
     return {
         "Validation Scope": scope_summary,
@@ -349,6 +585,7 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "source_priority": ["by_input", "by_output", "Snowflake fallback"],
             "missing_input_prefixes": missing_input,
             "missing_output_prefixes": missing_output,
+            "context_resolution": context,
         },
         "Checks Executed": checks,
         "Issues Found (Critical, High, Medium, Low)": {
@@ -376,13 +613,17 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
 
 
 def run_scenario_compare(base_dir: Path, week_id: Optional[str], base_scenario_id: Optional[str], compare_scenario_id: Optional[str], scope: Dict, metrics: List[str]) -> Dict:
+    context = _resolve_compare_context(base_dir, week_id, base_scenario_id, compare_scenario_id)
+    week_id = context["week_id"]
+    base_scenario_id = context["base_scenario_id"]
+    compare_scenario_id = context["compare_scenario_id"]
     inventory = dataset_inventory(base_dir)
 
     data_gaps = []
     if not week_id:
-        data_gaps.append("week_id missing")
+        data_gaps.append("no CAPTURE_WK found in available output datasets")
     if not base_scenario_id or not compare_scenario_id:
-        data_gaps.append("scenario identifiers missing")
+        data_gaps.append("SIMULATION_NAME values are insufficient for comparison")
 
     # Current local files are run snapshots; explicit scenario columns may be absent.
     comparability_notes = [
@@ -395,8 +636,10 @@ def run_scenario_compare(base_dir: Path, week_id: Optional[str], base_scenario_i
     return {
         "Comparison Scope": {
             "week_id": week_id,
+            "week_column": "CAPTURE_WK",
             "base_scenario_id": base_scenario_id,
             "compare_scenario_id": compare_scenario_id,
+            "scenario_column": "SIMULATION_NAME",
             "scope": scope,
             "metrics": metrics,
         },
@@ -404,6 +647,7 @@ def run_scenario_compare(base_dir: Path, week_id: Optional[str], base_scenario_i
             "input_folder": inventory["input_folder"],
             "output_folder": inventory["output_folder"],
             "comparability_notes": comparability_notes,
+            "context_resolution": context,
         },
         "Top Delta Metrics (ranked)": [
             "Snapshot comparison requires scenario-tagged evidence.",
@@ -432,6 +676,9 @@ def run_scenario_compare(base_dir: Path, week_id: Optional[str], base_scenario_i
 
 def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], demand_id: Optional[str], scope: Dict) -> Dict:
     # In this app, demand_id is treated as the demand ITEM identifier.
+    context = _resolve_context(base_dir, week_id, scenario_id)
+    week_id = context["week_id"]
+    scenario_id = context["scenario_id"]
     demand_item = (demand_id or "").strip()
 
     input_dir = base_dir / INPUT_FOLDER
@@ -588,9 +835,9 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
 
     gaps = []
     if not week_id:
-        gaps.append("week_id missing")
+        gaps.append("no CAPTURE_WK found in available output datasets")
     if not scenario_id:
-        gaps.append("scenario_id missing")
+        gaps.append("no SIMULATION_NAME found in available output datasets")
     if not demand_item:
         gaps.append("demand item (ITEM) missing for direct lineage trace")
     if demand_item and demand_qty_total <= 0:
@@ -627,10 +874,13 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         "Explainability Scope": {
             "week_id": week_id,
             "scenario_id": scenario_id,
+            "week_column": "CAPTURE_WK",
+            "scenario_column": "SIMULATION_NAME",
             "demand_item": demand_item or None,
             "scope": scope,
         },
         "Evidence Used": {
+            "context_resolution": context,
             "input_source": "by_input",
             "output_source": "by_output",
             "exception_file": exception_file.name if exception_file else None,
@@ -702,6 +952,9 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
 
 
 def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], item_id: Optional[str], scope: Dict) -> Dict:
+    context = _resolve_context(base_dir, week_id, scenario_id)
+    week_id = context["week_id"]
+    scenario_id = context["scenario_id"]
     demand_item = (item_id or "").strip()
     site = (scope.get("site") or "").strip()
 
@@ -848,6 +1101,8 @@ def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Opt
         "Graph Scope": {
             "week_id": week_id,
             "scenario_id": scenario_id,
+            "week_column": "CAPTURE_WK",
+            "scenario_column": "SIMULATION_NAME",
             "item_id": demand_item or None,
             "scope": scope,
         },
@@ -861,6 +1116,7 @@ def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Opt
             "node_count": len(nodes),
             "edge_count": len(edges),
         },
+        "Context Resolution": context,
         "Prompt for User": {
             "title": "Knowledge Graph",
             "description": "Start with ITEM. Add week, scenario, and site when available for a cleaner lineage graph.",
@@ -893,8 +1149,8 @@ def run_chat_assistant(
     validation_terms = ["validate", "validation", "quality", "check data", "readiness", "bom", "master data"]
     compare_terms = ["compare", "difference", "delta", "scenario compare", "versus", "vs"]
     root_terms = ["root cause", "why unmet", "unmet", "why demand", "explain demand", "lineage", "genealogy", "met", "meet", "fulfilled"]
-    item_match = re.search(r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)", q, flags=re.IGNORECASE)
-    demand_item = item_match.group(1).strip() if item_match else None
+    item_inference = _infer_demand_item_from_question(q)
+    demand_item = item_inference["selected_item"]
     history_window = (history or [])[-10:]
 
     if any(term in ql for term in validation_terms):
@@ -948,6 +1204,44 @@ def run_chat_assistant(
         return (_summarize_with_ollama(q, "Scenario Comparison", result, note, llm_model=llm_model) if llm_enabled else None) or fallback
 
     if any(term in ql for term in root_terms):
+        context = _resolve_context(base_dir, week_id, scenario_id)
+        resolved_week = context["week_id"]
+        resolved_scenario = context["scenario_id"]
+
+        if not demand_item:
+            return {
+                "Assistant Reply": "I can check demand status, but I need the demand ITEM first.",
+                "Workflow": "Root Cause Clarification",
+                "Clarification Needed": {
+                    "question": "Which ITEM should I evaluate as demand?",
+                    "expected_fields": ["ITEM", "Week ID = CAPTURE_WK (optional)", "Scenario ID = SIMULATION_NAME (optional)", "Site (optional)"],
+                    "examples": [
+                        "Check if the demand for ITEM 100000000008 was met",
+                        "Was demand item 100000000008 met for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED?",
+                    ],
+                },
+                "Parsing Evidence": item_inference,
+                "Context Resolution": context,
+            }
+
+        demand_evidence = _item_demand_evidence(base_dir, resolved_week, resolved_scenario, demand_item, scope)
+        if item_inference["confidence"] != "high" or not demand_evidence["is_demand_item"]:
+            return {
+                "Assistant Reply": f"I found ITEM {demand_item}, but I cannot confirm yet that it is the demand item for the resolved context.",
+                "Workflow": "Root Cause Clarification",
+                "Clarification Needed": {
+                    "question": "Do you want me to treat this ITEM as a demand item, or do you want to provide a different demand ITEM/site/week/scenario?",
+                    "examples": [
+                        f"Yes, treat {demand_item} as the demand item",
+                        f"Use ITEM {demand_item} for site 1004",
+                        "Use demand ITEM 100000000004 for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED",
+                    ],
+                },
+                "Parsing Evidence": item_inference,
+                "Demand Evidence Check": demand_evidence,
+                "Context Resolution": context,
+            }
+
         result = run_root_cause(base_dir, week_id, scenario_id, demand_item, scope)
         note = "For best accuracy, include week and scenario IDs along with ITEM."
         fallback = {
@@ -955,6 +1249,7 @@ def run_chat_assistant(
             "Workflow": "Root Cause",
             "Result": result,
             "Note": note,
+            "Parsing Evidence": item_inference,
         }
         return (_summarize_with_ollama(q, "Root Cause", result, note, llm_model=llm_model) if llm_enabled else None) or fallback
 
