@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IFSP Planning Copilot WebApp</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <main class="layout">
+      <header class="hero">
+        <div class="brand-row">
+          <img class="brand-logo" src="/static/intelfoundrylogo.png" alt="Intel Foundry logo" />
+          <span class="brand-pill">Planner Workspace</span>
+        </div>
+        <h1>IFSP Planning Copilot</h1>
+        <p>Intel-aligned web application for BY ESP input and output validation, scenario comparison, and root-cause explainability.</p>
+        <button id="summaryBtn" class="btn primary">Load Dataset Summary</button>
+      </header>
+
+      <section class="workspace-shell">
+        <aside class="app-menu card">
+          <div class="menu-head">
+            <h2>Menu</h2>
+            <button id="menuToggle" class="menu-toggle" type="button" aria-label="Collapse menu">Collapse</button>
+          </div>
+          <button class="menu-btn active" data-panel="chat" type="button" title="Chat Assistant">
+            <span class="menu-icon">C</span>
+            <span class="menu-label">Chat Assistant</span>
+          </button>
+          <button class="menu-btn" data-panel="validation" type="button" title="Validation Gate">
+            <span class="menu-icon">V</span>
+            <span class="menu-label">Validation Gate</span>
+          </button>
+          <button class="menu-btn" data-panel="comparison" type="button" title="Scenario Comparison">
+            <span class="menu-icon">S</span>
+            <span class="menu-label">Scenario Comparison</span>
+          </button>
+          <button class="menu-btn" data-panel="rootcause" type="button" title="Root Cause">
+            <span class="menu-icon">R</span>
+            <span class="menu-label">Root Cause</span>
+          </button>
+          <button class="menu-btn" data-panel="graph" type="button" title="Knowledge Graph">
+            <span class="menu-icon">G</span>
+            <span class="menu-label">Knowledge Graph</span>
+          </button>
+        </aside>
+
+        <section class="controls-column">
+          <article class="card chat-card feature-panel active" data-panel="chat">
+            <div class="card-top compact-top">
+              <div>
+                <h2>Chat Assistant</h2>
+                <p class="hint">Ask in plain English. Example: Validate data for week 2026-W30 scenario S2.</p>
+              </div>
+              <div class="chat-settings compact-settings">
+                <label class="toggle-row compact-toggle" for="chatLlmEnabled">
+                  <input id="chatLlmEnabled" type="checkbox" checked />
+                  <span>Ollama</span>
+                </label>
+                <div class="inline-field compact-field">
+                  <label for="chatLlmModel">Model</label>
+                  <select id="chatLlmModel"></select>
+                </div>
+                <div id="chatLlmStatus" class="settings-note compact-note">Loading Ollama models...</div>
+              </div>
+            </div>
+            <div class="field-grid">
+              <textarea id="chatQuestion" rows="4" placeholder="Type your IFSP question here..."></textarea>
+              <div class="split-grid">
+                <input id="chatWeek" placeholder="Week ID (optional)" />
+                <input id="chatScenario" placeholder="Scenario ID (optional)" />
+              </div>
+              <input id="chatSite" placeholder="Site (optional)" />
+            </div>
+            <button id="chatBtn" class="btn primary">Ask Assistant</button>
+          </article>
+
+          <article class="card feature-panel" data-panel="validation">
+            <h2>Validation Gate</h2>
+            <div class="field-grid">
+              <input id="valWeek" placeholder="Week ID (e.g. 2026-W30)" />
+              <input id="valScenario" placeholder="Scenario ID" />
+              <input id="valSite" placeholder="Site (optional)" />
+              <input id="valProduct" placeholder="Product (optional)" />
+            </div>
+            <button id="validateBtn" class="btn">Run Validation</button>
+          </article>
+
+          <article class="card feature-panel" data-panel="comparison">
+            <h2>Scenario Comparison</h2>
+            <div class="field-grid">
+              <input id="cmpWeek" placeholder="Week ID" />
+              <input id="cmpBase" placeholder="Base Scenario ID" />
+              <input id="cmpCompare" placeholder="Compare Scenario ID" />
+              <input id="cmpSite" placeholder="Site (optional)" />
+            </div>
+            <button id="compareBtn" class="btn">Run Comparison</button>
+          </article>
+
+          <article class="card feature-panel" data-panel="rootcause">
+            <h2>Root Cause</h2>
+            <div class="field-grid">
+              <input id="rcWeek" placeholder="Week ID" />
+              <input id="rcScenario" placeholder="Scenario ID" />
+              <input id="rcDemand" placeholder="Demand ITEM (with EXTORDERREF or DFUTOSKUFCST)" />
+              <input id="rcNode" placeholder="Node (optional)" />
+            </div>
+            <button id="rootCauseBtn" class="btn">Run Root Cause</button>
+          </article>
+
+          <article class="card feature-panel" data-panel="graph">
+            <h2>Knowledge Graph</h2>
+            <p class="hint">Start with ITEM. Add week, scenario, and site to narrow the lineage graph.</p>
+            <div class="field-grid">
+              <input id="kgItem" placeholder="ITEM" />
+              <div class="split-grid">
+                <input id="kgWeek" placeholder="Week ID" />
+                <input id="kgScenario" placeholder="Scenario ID" />
+              </div>
+              <input id="kgSite" placeholder="Site (optional)" />
+            </div>
+            <button id="graphBtn" class="btn">Show Knowledge Graph</button>
+          </article>
+        </section>
+
+        <section class="insights-column">
+          <article class="output insight-page active" data-panel="chat">
+            <div class="panel-top">
+              <div>
+                <h2>Chat Assistant Output</h2>
+                <p class="hint">Planner-facing answer with grounded evidence.</p>
+              </div>
+              <button id="chatClearBtn" class="btn ghost" type="button">Clear Chat</button>
+            </div>
+            <div id="chatResultPane" class="result-pane chat-thread"></div>
+          </article>
+
+          <article class="output insight-page" data-panel="validation">
+            <div class="panel-top">
+              <div>
+                <h2>Validation Gate Output</h2>
+                <p class="hint">Validation findings, severity, and recommended fixes.</p>
+              </div>
+            </div>
+            <div id="validationResultPane" class="result-pane">Run validation to view results...</div>
+          </article>
+
+          <article class="output insight-page" data-panel="comparison">
+            <div class="panel-top">
+              <div>
+                <h2>Scenario Comparison Output</h2>
+                <p class="hint">Scenario delta summary and driver analysis.</p>
+              </div>
+            </div>
+            <div id="comparisonResultPane" class="result-pane">Run comparison to view results...</div>
+          </article>
+
+          <article class="output insight-page" data-panel="rootcause">
+            <div class="panel-top">
+              <div>
+                <h2>Root Cause Output</h2>
+                <p class="hint">Demand-supply status, causes, and timing analysis.</p>
+              </div>
+            </div>
+            <div id="rootCauseResultPane" class="result-pane">Run root cause to view results...</div>
+          </article>
+
+          <article class="output insight-page" data-panel="graph">
+            <div class="panel-top">
+              <div>
+                <h2>Knowledge Graph View</h2>
+                <p class="hint">Visual lineage from demand item to supply, method, and resource nodes.</p>
+              </div>
+            </div>
+            <div id="graphSummary" class="graph-summary">Choose an ITEM and run Knowledge Graph to begin.</div>
+            <div id="graphCanvas" class="graph-canvas"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=4"></script>
+  </body>
+</html>
