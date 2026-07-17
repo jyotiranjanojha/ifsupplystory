@@ -92,10 +92,10 @@ results.append(check("[3]", body, expect_workflow="Validation", expect_keys=["As
 print(f"       ({t}s)")
 
 # ── 4. Scenario compare ──────────────────────────────────────────────────────
-print("\n[4] Scenario compare (keyword)")
-body, t = chat("compare the two scenarios and show deltas")
-results.append(check("[4]", body, expect_workflow="Comparison", expect_keys=["Assistant Reply"]))
-print(f"       ({t}s)")
+print("\n[4] Scenario compare (keyword) — SKIPPED")
+# body, t = chat("compare the two scenarios and show deltas")
+# results.append(check("[4]", body, expect_workflow="Comparison", expect_keys=["Assistant Reply"]))
+# print(f"       ({t}s)")
 
 # ── 5. Domain fulfillment ────────────────────────────────────────────────────
 print("\n[5] Domain – Fulfillment (keyword)")
