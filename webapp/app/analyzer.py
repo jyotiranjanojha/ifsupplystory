@@ -17,7 +17,7 @@ INPUT_FOLDER = "by_input"
 OUTPUT_FOLDER = "by_output"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
-OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.2:latest")
+OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.1:8b")
 OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2:latest")
 
@@ -3379,6 +3379,22 @@ def _dispatch_by_intent(
             "note": "Root-cause analysis uses demand/supply/resource linkage evidence.",
             "router_metadata": router_meta,
         }
+
+    # ── log_reader ───────────────────────────────────────────────────────
+    if intent == "log_reader":
+        question = meta.get("question", "")
+        log_content = entities.get("log_content")  # optional separate log text
+        result = run_log_reader(base_dir, question, log_content, week_id, scenario_id, scope)
+        result["router_metadata"] = router_meta
+        return result
+
+    # ── vision_query ─────────────────────────────────────────────────────
+    if intent == "vision_query":
+        question = meta.get("question", "")
+        image_base64 = entities.get("image_base64", "")
+        result = run_vision_query(base_dir, question, image_base64, week_id, scenario_id, scope)
+        result["router_metadata"] = router_meta
+        return result
 
     # ── conversational fallback ──────────────────────────────────────────
     return {"workflow": "Conversational Copilot", "router_metadata": router_meta}
