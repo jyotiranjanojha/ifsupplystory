@@ -1,4 +1,4 @@
-# IFSP Planning Copilot WebApp
+# Intel Foundry Planning AI Assistant
 
 Deployable web application wrapper for IFSP workflows using `by_input/` and `by_output/` datasets.
 

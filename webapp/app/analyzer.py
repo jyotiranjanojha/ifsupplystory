@@ -100,6 +100,16 @@ def _safe_float(value: Optional[str]) -> float:
         return 0.0
 
 
+def _safe_int(value: Optional[str]) -> Optional[int]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_date(value: Optional[str]) -> Optional[datetime]:
     text = (value or "").strip()
     if not text:
@@ -691,6 +701,16 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     planarriv_file = _find_file_by_prefix(output_dir, "by_if_snop_out_planarriv-")
     planorder_file = _find_file_by_prefix(output_dir, "by_if_snop_out_planorder-")
     planpurch_file = _find_file_by_prefix(output_dir, "by_if_snop_out_planpurch-")
+    resexception_file = _find_file_by_prefix(output_dir, "by_if_snop_out_resexception-")
+    resloaddetail_file = _find_file_by_prefix(output_dir, "by_if_snop_out_resloaddetail-")
+
+    items_file = _find_file_by_prefix(input_dir, "if_snop_items-")
+    sku_file = _find_file_by_prefix(input_dir, "if_snop_sku-")
+    bom_file = _find_file_by_prefix(input_dir, "if_snop_billofmaterials-")
+    alt_bom_file = _find_file_by_prefix(input_dir, "if_snop_altbillofmaterials-")
+    sourcing_file = _find_file_by_prefix(input_dir, "if_snop_sourcing-")
+    productionmethod_file = _find_file_by_prefix(input_dir, "if_snop_productionmethod-")
+
     dfu_fcst_file = _find_file_by_prefix(input_dir, "if_snop_dfutoskufcst-")
     site = (scope.get("site") or "").strip()
 
@@ -710,6 +730,17 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     plan_arriv_dates: List[datetime] = []
     plan_order_dates: List[datetime] = []
     plan_purch_dates: List[datetime] = []
+
+    item_profile: Dict[str, Optional[str]] = {}
+    sku_rows = []
+    bom_parent_rows = []
+    bom_component_rows = []
+    alt_bom_rows = []
+    sourcing_out_rows = []
+    sourcing_in_rows = []
+    production_rows = []
+    resload_rows = []
+    resexception_rows = []
 
     if exception_file:
         exception_rows = _file_summary(exception_file)["rows"]
@@ -800,6 +831,97 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             if (row.get("ITEM") or "").strip() == demand_item:
                 dfu_item_hits += 1
 
+    if items_file and demand_item:
+        for row in _safe_rows(items_file):
+            if (row.get("ITEM") or "").strip() == demand_item:
+                item_profile = {
+                    "descr": (row.get("DESCR") or "").strip() or None,
+                    "itemclass": (row.get("ITEMCLASS") or "").strip() or None,
+                    "uom": (row.get("U_UOM") or "").strip() or None,
+                    "status": (row.get("U_STATUS") or "").strip() or None,
+                    "material_type": (row.get("U_MAT_TYPE_CD") or "").strip() or None,
+                    "capacity_group": (row.get("U_CAPACITY_GROUP") or "").strip() or None,
+                    "capacity_corridor": (row.get("U_CAPACITY_CORRIDOR") or "").strip() or None,
+                    "process_node": (row.get("U_PROCESSNODEUPPERCASE_TXT") or "").strip() or None,
+                    "mfg_stage": (row.get("U_MFG_STAGE") or "").strip() or None,
+                }
+                break
+
+    if sku_file and demand_item:
+        for row in _safe_rows(sku_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            sku_rows.append(row)
+
+    if bom_file and demand_item:
+        for row in _safe_rows(bom_file):
+            item = (row.get("ITEM") or "").strip()
+            subord = (row.get("SUBORD") or "").strip()
+            loc = (row.get("LOC") or "").strip()
+            if site and loc != site:
+                continue
+            if item == demand_item:
+                bom_parent_rows.append(row)
+            if subord == demand_item:
+                bom_component_rows.append(row)
+
+    if alt_bom_file and demand_item:
+        for row in _safe_rows(alt_bom_file):
+            item = (row.get("ITEM") or "").strip()
+            subord = (row.get("SUBORD") or "").strip()
+            loc = (row.get("LOC") or "").strip()
+            if site and loc != site:
+                continue
+            if item == demand_item or subord == demand_item:
+                alt_bom_rows.append(row)
+
+    if sourcing_file and demand_item:
+        for row in _safe_rows(sourcing_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            source = (row.get("SOURCE") or "").strip()
+            dest = (row.get("DEST") or "").strip()
+            if site and site not in {source, dest}:
+                continue
+            if not site or source == site:
+                sourcing_out_rows.append(row)
+            if not site or dest == site:
+                sourcing_in_rows.append(row)
+
+    if productionmethod_file and demand_item:
+        for row in _safe_rows(productionmethod_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            loc = (row.get("LOC") or "").strip()
+            if site and loc != site:
+                continue
+            production_rows.append(row)
+
+    if resloaddetail_file and demand_item:
+        for row in _safe_rows(resloaddetail_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            resload_rows.append(row)
+
+    if resexception_file and demand_item:
+        for row in _safe_rows(resexception_file):
+            row_item = (row.get("ITEM") or "").strip()
+            row_loc = (row.get("LOC") or "").strip()
+            row_method = (row.get("PRODUCTIONMETHOD") or "").strip()
+            if row_item != demand_item and not row_method.startswith(f"{demand_item}_"):
+                continue
+            if site and row_loc and row_loc != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            resexception_rows.append(row)
+
     demand_qty_total = sum(_safe_float(row.get("QTY")) for row in demand_rows)
     scheduled_qty_total = sum(_safe_float(row.get("SCHEDQTY")) for row in demand_rows)
     unmet_qty = max(demand_qty_total - scheduled_qty_total, 0.0)
@@ -828,6 +950,92 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     supply_avail_dates = [d for d in supply_avail_dates if d]
 
     supply_methods = sorted({(row.get("SUPPLYMETHOD") or "").strip() for row in link_rows if (row.get("SUPPLYMETHOD") or "").strip()})
+    supply_types = sorted({(row.get("SUPPLYTYPE") or "").strip() for row in link_rows if (row.get("SUPPLYTYPE") or "").strip()})
+    demand_types = sorted({(row.get("DMDTYPE") or "").strip() for row in demand_rows if (row.get("DMDTYPE") or "").strip()})
+
+    demand_locs = sorted({(row.get("LOC") or "").strip() for row in demand_rows if (row.get("LOC") or "").strip()})
+    demand_customers = sorted({(row.get("CUST") or "").strip() for row in demand_rows if (row.get("CUST") or "").strip()})
+    demand_order_ids = sorted({(row.get("EXTORDERID") or "").strip() for row in demand_rows if (row.get("EXTORDERID") or "").strip()})
+    demand_priorities = sorted({p for p in [_safe_int(row.get("PRIORITY")) for row in demand_rows] if p is not None})
+
+    pegged_supply_by_item: Dict[Tuple[str, str], float] = {}
+    genealogy_links = []
+    for row in link_rows:
+        s_item = (row.get("SUPPLYITEM") or "").strip()
+        s_loc = (row.get("SUPPLYLOC") or "").strip()
+        qty = _safe_float(row.get("SUPPLYPEGQTY"))
+        if s_item:
+            pegged_supply_by_item[(s_item, s_loc)] = pegged_supply_by_item.get((s_item, s_loc), 0.0) + qty
+        parent_item = (row.get("PARENTITEM") or "").strip()
+        parent_loc = (row.get("PARENTLOC") or "").strip()
+        if parent_item:
+            genealogy_links.append({
+                "demand_item": (row.get("DMDITEM") or "").strip() or demand_item,
+                "supply_item": s_item or None,
+                "supply_loc": s_loc or None,
+                "parent_item": parent_item,
+                "parent_loc": parent_loc or None,
+                "supply_method": (row.get("SUPPLYMETHOD") or "").strip() or None,
+                "parent_supply_method": (row.get("PARENTSUPPLYMETHOD") or "").strip() or None,
+                "pegged_supply_qty": round(qty, 3),
+                "demand_need_date": _fmt_date(_parse_date(row.get("DMDNEEDDATE"))),
+                "supply_avail_date": _fmt_date(_parse_date(row.get("SUPPLYAVAILDATE"))),
+            })
+
+    top_pegged_supply_items = sorted(
+        [
+            {
+                "supply_item": k[0],
+                "supply_loc": k[1] or None,
+                "pegged_qty": round(v, 3),
+            }
+            for k, v in pegged_supply_by_item.items()
+        ],
+        key=lambda row: row["pegged_qty"],
+        reverse=True,
+    )[:10]
+
+    capacity_exception_rows = []
+    for row in resexception_rows:
+        descr = (row.get("DESCR") or "").strip().lower()
+        category = (row.get("CATEGORY") or "").strip()
+        exception_code = (row.get("EXCEPTION") or "").strip()
+        if "capacity" in descr or category == "602" or exception_code == "6801":
+            capacity_exception_rows.append(row)
+
+    capacity_exception_count = len(capacity_exception_rows)
+    capacity_overutil_qty = sum(_safe_float(row.get("OVERUTILQTY")) for row in capacity_exception_rows)
+
+    total_resload_qty = sum(_safe_float(row.get("LOADQTY")) for row in resload_rows)
+    total_fcst_load_qty = sum(_safe_float(row.get("FCSTORDLOADQTY")) for row in resload_rows)
+    total_cust_load_qty = sum(_safe_float(row.get("CUSTORDLOADQTY")) for row in resload_rows)
+    unique_resources = sorted({(row.get("RES") or "").strip() for row in resload_rows if (row.get("RES") or "").strip()})
+
+    competing_higher_priority_qty = 0.0
+    competing_higher_priority_count = 0
+    if inddmdview_file and demand_locs and demand_priorities:
+        min_priority = min(demand_priorities)
+        for row in _safe_rows(inddmdview_file):
+            if (row.get("ITEM") or "").strip() == demand_item:
+                continue
+            if (row.get("LOC") or "").strip() not in demand_locs:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            p = _safe_int(row.get("PRIORITY"))
+            if p is None or p >= min_priority:
+                continue
+            competing_higher_priority_count += 1
+            competing_higher_priority_qty += _safe_float(row.get("QTY"))
+
+    setup_flags = {
+        "item_exists_in_master": bool(item_profile),
+        "sku_coverage_exists": len(sku_rows) > 0,
+        "production_method_exists": len(production_rows) > 0,
+        "sourcing_path_exists": len(sourcing_out_rows) + len(sourcing_in_rows) > 0,
+        "bom_parent_path_exists": len(bom_parent_rows) > 0,
+        "bom_component_usage_exists": len(bom_component_rows) > 0,
+    }
 
     fully_met = demand_qty_total > 0 and scheduled_qty_total + 1e-6 >= demand_qty_total
     met_status = "Met" if fully_met else ("Partially Met" if scheduled_qty_total > 0 else "Not Met")
@@ -867,8 +1075,41 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         root_causes.append("Pegged supply quantity is lower than pegged demand quantity in lineage links.")
     if exception_item_rows > 0:
         root_causes.append(f"Item has {exception_item_rows} SKU exception row(s), indicating planning constraints.")
+    if capacity_exception_count > 0:
+        root_causes.append(f"Capacity exceptions found: {capacity_exception_count} row(s) with total overutilized quantity {capacity_overutil_qty:.3f}.")
+    if not setup_flags["production_method_exists"] and not setup_flags["sourcing_path_exists"]:
+        root_causes.append("No production method or sourcing path found for the demand item in the selected scope; master data setup may block supply creation.")
+    if competing_higher_priority_count > 0:
+        root_causes.append(
+            f"Higher-priority competing demand detected in the same location context: {competing_higher_priority_count} row(s), quantity {competing_higher_priority_qty:.3f}."
+        )
     if not root_causes:
         root_causes.append("Demand appears covered by scheduled and pegged supply in the current dataset scope.")
+
+    attribution_signals = {
+        "master_data_setup_risk": int(not setup_flags["item_exists_in_master"] or not setup_flags["sku_coverage_exists"] or (not setup_flags["production_method_exists"] and not setup_flags["sourcing_path_exists"])),
+        "capacity_constraint_risk": int(capacity_exception_count > 0 or (resource_link_rows > 0 and late_sched_qty > 0)),
+        "priority_allocation_risk": int(competing_higher_priority_count > 0),
+        "supply_shortage_risk": int(unmet_qty > 0 and (scheduled_qty_total + 1e-6 < demand_qty_total)),
+        "pegging_mismatch_risk": int(pegged_supply_qty + 1e-6 < pegged_demand_qty),
+    }
+
+    ranked_attribution = sorted(attribution_signals.items(), key=lambda kv: kv[1], reverse=True)
+    primary_causes = [name for name, score in ranked_attribution if score > 0]
+    if not primary_causes:
+        primary_causes = ["no_material_constraint_detected_in_current_scope"]
+
+    by_esp_reasoning = []
+    if attribution_signals["master_data_setup_risk"] > 0:
+        by_esp_reasoning.append("Input setup risk: missing SKU/production/sourcing paths can prevent BY ESP from creating feasible supply.")
+    if attribution_signals["capacity_constraint_risk"] > 0:
+        by_esp_reasoning.append("Capacity risk: resource-load linkage and capacity exceptions indicate finite-capacity bottlenecks.")
+    if attribution_signals["priority_allocation_risk"] > 0:
+        by_esp_reasoning.append("Priority risk: higher-priority competing demand in the same location can consume constrained supply first.")
+    if attribution_signals["supply_shortage_risk"] > 0:
+        by_esp_reasoning.append("Supply shortage risk: scheduled and planned supply quantities remain below demand requirement.")
+    if attribution_signals["pegging_mismatch_risk"] > 0:
+        by_esp_reasoning.append("Pegging mismatch risk: demand pegging exceeds pegged supply, indicating unresolved linkage.")
 
     return {
         "Explainability Scope": {
@@ -903,6 +1144,23 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "item_hits_in_inddmdview_with_HEADEREXTREF": inddmd_item_with_extorder_header_hits,
             "item_hits_in_dfutoskufcst": dfu_item_hits,
         },
+        "Item Master and Planning Setup": {
+            "item_profile": item_profile,
+            "demand_locations": demand_locs,
+            "demand_customers": demand_customers[:20],
+            "demand_types_seen": demand_types,
+            "demand_priorities_seen": demand_priorities,
+            "sku_rows_for_item": len(sku_rows),
+            "sku_locations": sorted({(row.get("LOC") or "").strip() for row in sku_rows if (row.get("LOC") or "").strip()})[:20],
+            "sourcing_out_paths": len(sourcing_out_rows),
+            "sourcing_in_paths": len(sourcing_in_rows),
+            "production_method_rows": len(production_rows),
+            "production_methods": sorted({(row.get("PRODUCTIONMETHOD") or "").strip() for row in production_rows if (row.get("PRODUCTIONMETHOD") or "").strip()})[:20],
+            "bom_parent_rows": len(bom_parent_rows),
+            "bom_component_rows": len(bom_component_rows),
+            "alt_bom_rows": len(alt_bom_rows),
+            "setup_flags": setup_flags,
+        },
         "Demand and Supply Summary": {
             "demand_rows": len(demand_rows),
             "demand_qty_total": round(demand_qty_total, 3),
@@ -917,14 +1175,19 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "meet_status": met_status,
             "fully_met_date": _fmt_date(met_date),
         },
-        "Lineage Trace": {
+        "Lineage and Linkage Findings": {
             "inddmdlink_rows": len(link_rows),
             "resource_link_rows": resource_link_rows,
             "pegged_demand_qty": round(pegged_demand_qty, 3),
             "pegged_supply_qty": round(pegged_supply_qty, 3),
             "first_supply_avail_date": _fmt_date(min(supply_avail_dates) if supply_avail_dates else None),
             "last_supply_avail_date": _fmt_date(max(supply_avail_dates) if supply_avail_dates else None),
+            "demand_order_count": len(demand_order_ids),
+            "demand_orders_sample": demand_order_ids[:20],
+            "supply_types_seen": supply_types,
             "supply_methods_seen": supply_methods[:10],
+            "top_pegged_supply_items": top_pegged_supply_items,
+            "genealogy_paths_sample": genealogy_links[:25],
         },
         "Planned Supply Evidence": {
             "plan_arrival_qty": round(plan_arriv_qty, 3),
@@ -934,8 +1197,30 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "plan_order_first_date": _fmt_date(min(plan_order_dates) if plan_order_dates else None),
             "plan_purchase_first_date": _fmt_date(min(plan_purch_dates) if plan_purch_dates else None),
         },
+        "Constraint and Exception Analysis": {
+            "sku_exception_rows_for_item": exception_item_rows,
+            "resource_load_rows_for_item": len(resload_rows),
+            "resource_count": len(unique_resources),
+            "resources_sample": unique_resources[:20],
+            "total_resource_load_qty": round(total_resload_qty, 3),
+            "customer_order_load_qty": round(total_cust_load_qty, 3),
+            "forecast_order_load_qty": round(total_fcst_load_qty, 3),
+            "capacity_exception_rows": capacity_exception_count,
+            "capacity_overutil_qty": round(capacity_overutil_qty, 3),
+            "higher_priority_competing_rows": competing_higher_priority_count,
+            "higher_priority_competing_qty": round(competing_higher_priority_qty, 3),
+        },
         "Confirmed Findings": confirmed_findings,
         "Root Causes": root_causes,
+        "Cause Attribution (BY ESP Expert View)": {
+            "primary_cause_tags": primary_causes,
+            "attribution_signals": attribution_signals,
+            "by_esp_reasoning": by_esp_reasoning,
+            "semiconductor_planning_notes": [
+                "In semiconductor planning, constrained resources and long-cycle production routes can shift fulfillment across weeks.",
+                "Item setup quality (SKU, BOM, sourcing, production method) directly impacts BY ESP solvability and pegging quality.",
+            ],
+        },
         "Hypotheses and Missing Evidence": {
             "hypotheses": [
                 "Unmet demand likely links to capacity, sourcing, or BOM constraints where exception density is high.",
@@ -1119,7 +1404,7 @@ def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Opt
         "Context Resolution": context,
         "Prompt for User": {
             "title": "Knowledge Graph",
-            "description": "Start with ITEM. Add week, scenario, and site when available for a cleaner lineage graph.",
+            "description": "Start with ITEM. Add week, scenario, and plant when available for a cleaner lineage graph.",
         },
         "nodes": nodes,
         "edges": edges,
@@ -1214,7 +1499,7 @@ def run_chat_assistant(
                 "Workflow": "Root Cause Clarification",
                 "Clarification Needed": {
                     "question": "Which ITEM should I evaluate as demand?",
-                    "expected_fields": ["ITEM", "Week ID = CAPTURE_WK (optional)", "Scenario ID = SIMULATION_NAME (optional)", "Site (optional)"],
+                    "expected_fields": ["ITEM", "Week ID = CAPTURE_WK (optional)", "Scenario ID = SIMULATION_NAME (optional)", "Plant (optional)"],
                     "examples": [
                         "Check if the demand for ITEM 100000000008 was met",
                         "Was demand item 100000000008 met for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED?",
@@ -1230,10 +1515,10 @@ def run_chat_assistant(
                 "Assistant Reply": f"I found ITEM {demand_item}, but I cannot confirm yet that it is the demand item for the resolved context.",
                 "Workflow": "Root Cause Clarification",
                 "Clarification Needed": {
-                    "question": "Do you want me to treat this ITEM as a demand item, or do you want to provide a different demand ITEM/site/week/scenario?",
+                    "question": "Do you want me to treat this ITEM as a demand item, or do you want to provide a different demand ITEM/plant/week/scenario?",
                     "examples": [
                         f"Yes, treat {demand_item} as the demand item",
-                        f"Use ITEM {demand_item} for site 1004",
+                        f"Use ITEM {demand_item} for plant 1004",
                         "Use demand ITEM 100000000004 for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED",
                     ],
                 },
@@ -1269,7 +1554,7 @@ def run_chat_assistant(
             "You are IFSP Planning Copilot for Intel Foundry. "
             "Behave like a helpful chat assistant: understand follow-up questions, answer concisely, and ask clarifying questions when needed. "
             "Stay in IFSP/BY ESP planning scope. "
-            "If a request needs specific identifiers (item, week, scenario, site), ask for them clearly."
+            "If a request needs specific identifiers (item, week, scenario, plant), ask for them clearly."
         )
         conversational_reply = _ollama_chat_with_model(
             q,

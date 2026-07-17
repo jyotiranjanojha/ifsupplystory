@@ -1,4 +1,4 @@
-# IF Supply Story - IFSP Planning Copilot
+# Intel Foundry Planning AI Assistant
 
 ![Intel Foundry Logo](webapp/app/static/intelfoundrylogo.png)
 

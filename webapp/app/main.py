@@ -12,7 +12,7 @@ from .models import ChatRequest, CompareRequest, KnowledgeGraphRequest, RootCaus
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 app = FastAPI(
-    title="IFSP Planning Copilot WebApp",
+    title="Intel Foundry Planning AI Assistant",
     version="1.0.0",
     description="Web application wrapper for IFSP validation, scenario comparison, and root-cause workflows.",
 )

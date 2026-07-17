@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>IFSP Planning Copilot WebApp</title>
+    <title>Intel Foundry Planning AI Assistant</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -16,8 +16,8 @@
           <img class="brand-logo" src="/static/intelfoundrylogo.png" alt="Intel Foundry logo" />
           <span class="brand-pill">Planner Workspace</span>
         </div>
-        <h1>IFSP Planning Copilot</h1>
-        <p>Intel-aligned web application for BY ESP input and output validation, scenario comparison, and root-cause explainability.</p>
+        <h1>Intel Foundry Planning AI Assistant</h1>
+        <p class="hero-tagline"><em>Unlock Planning Confidence with Automated Validation, Scenario Analysis, and Root-Cause Intelligence</em></p>
         <button id="summaryBtn" class="btn primary">Load Dataset Summary</button>
       </header>
 
@@ -74,7 +74,7 @@
                 <input id="chatWeek" placeholder="Week ID = CAPTURE_WK (optional)" />
                 <input id="chatScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               </div>
-              <input id="chatSite" placeholder="Site (optional)" />
+              <input id="chatSite" placeholder="Plant (optional)" />
             </div>
             <button id="chatBtn" class="btn primary">Ask Assistant</button>
           </article>
@@ -84,7 +84,7 @@
             <div class="field-grid">
               <input id="valWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
               <input id="valScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
-              <input id="valSite" placeholder="Site (optional)" />
+              <input id="valSite" placeholder="Plant (optional)" />
               <input id="valProduct" placeholder="Product (optional)" />
             </div>
             <button id="validateBtn" class="btn">Run Validation</button>
@@ -96,7 +96,7 @@
               <input id="cmpWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
               <input id="cmpBase" placeholder="Base Scenario = SIMULATION_NAME" />
               <input id="cmpCompare" placeholder="Compare Scenario = SIMULATION_NAME" />
-              <input id="cmpSite" placeholder="Site (optional)" />
+              <input id="cmpSite" placeholder="Plant (optional)" />
             </div>
             <button id="compareBtn" class="btn">Run Comparison</button>
           </article>
@@ -121,7 +121,7 @@
                 <input id="kgWeek" placeholder="Week ID = CAPTURE_WK (optional)" />
                 <input id="kgScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
               </div>
-              <input id="kgSite" placeholder="Site (optional)" />
+              <input id="kgSite" placeholder="Plant (optional)" />
             </div>
             <button id="graphBtn" class="btn">Show Knowledge Graph</button>
           </article>
