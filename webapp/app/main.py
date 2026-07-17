@@ -1,12 +1,14 @@
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .analyzer import dataset_inventory, list_ollama_models, run_chat_assistant, run_insights, run_knowledge_graph, run_root_cause, run_scenario_compare, run_validation
-from .models import ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, ValidationRequest
+from .analyzer import dataset_inventory, list_ollama_models, run_chat_assistant, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_scenario_compare, run_validation, run_vision_query
+from .langgraph_bom import run_bom_drill
+from .text_to_sql_agent import run_sql_query
+from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationRequest, VisionQueryRequest
 from .rag import build_rag_index, get_rag_status, query_rag
 
 
@@ -20,6 +22,11 @@ app = FastAPI(
 
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return RedirectResponse(url="/static/intelfoundrylogo.png")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -114,6 +121,41 @@ def insights(req: InsightsRequest):
 @app.post("/api/knowledge-graph")
 def knowledge_graph(req: KnowledgeGraphRequest):
     return run_knowledge_graph(BASE_DIR, req.week_id, req.scenario_id, req.item_id, req.scope.model_dump())
+
+
+@app.post("/api/bom-drill")
+def bom_drill(req: BomDrillRequest):
+    return run_bom_drill(
+        BASE_DIR,
+        req.week_id,
+        req.scenario_id,
+        req.root_item,
+        req.scope.model_dump(),
+        max_depth=req.max_depth,
+    )
+
+
+@app.post("/api/sql-query")
+def sql_query(req: SqlQueryRequest):
+    return run_sql_query(
+        BASE_DIR,
+        req.question,
+        req.week_id,
+        req.scenario_id,
+        req.scope.model_dump(),
+    )
+
+
+@app.post("/api/vision-query")
+def vision_query_endpoint(req: VisionQueryRequest):
+    return run_vision_query(
+        BASE_DIR,
+        req.question,
+        req.image_base64,
+        req.week_id,
+        req.scenario_id,
+        req.scope.model_dump(),
+    )
 
 
 @app.post("/api/chat")

@@ -1,8 +1,26 @@
 import argparse
 import importlib.util
+import os
 import socket
+from pathlib import Path
 
 import uvicorn
+
+
+def _load_dotenv(env_path: Path) -> None:
+    """Load key=value pairs from a .env file into os.environ (no override)."""
+    if not env_path.exists():
+        return
+    with env_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:   # existing env vars take priority
+                os.environ[key] = value
 
 try:
     from webapp.app.main import app as fastapi_app
@@ -24,6 +42,9 @@ def pick_port(host: str, start_port: int, max_tries: int) -> int:
 
 
 def main() -> None:
+    # Load .env before anything else so env vars are set before module imports
+    _load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
     parser = argparse.ArgumentParser(description="Run IFSP web app on a free port.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Preferred starting port (default: 8000)")

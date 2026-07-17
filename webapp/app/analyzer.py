@@ -19,6 +19,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
 OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.2:latest")
 OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2:latest")
 
 
 class DemandEntityType(str, Enum):
@@ -1052,7 +1053,7 @@ def _ollama_chat_with_model(
     )
 
     try:
-        with request.urlopen(req, timeout=60) as response:
+        with request.urlopen(req, timeout=180) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
@@ -1925,6 +1926,144 @@ def run_root_cause(
             "Compare demand need dates with supply available and scheduled dates for lateness diagnosis.",
             "Join exception, demand-link, and resource-link outputs with capacity and sourcing inputs for final constraint attribution.",
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Log Reader — parse and summarize planning logs via Ollama
+# ---------------------------------------------------------------------------
+
+def run_log_reader(
+    base_dir: Path,
+    question: str,
+    log_content: Optional[str] = None,
+    week_id: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    scope: Optional[Dict] = None,
+) -> Dict:
+    """
+    Parse and summarize a planning log, solver output, or exception report.
+    Uses Ollama with a BY ESP-aware system prompt.
+    log_content defaults to question when not provided separately.
+    """
+    content = (log_content or question or "").strip()
+    context = _resolve_context(base_dir, week_id, scenario_id)
+
+    system_prompt = (
+        "You are an Intel Foundry Supply Planning log analyst specializing in "
+        "Blue Yonder Enterprise Supply Planning (BY ESP) solver outputs and exception logs. "
+        "Analyze the provided planning log excerpt and extract:\n"
+        "1. Log Type (solver log / exception log / data error / planning output / other)\n"
+        "2. Key Events (errors, warnings, exceptions found in order of severity)\n"
+        "3. Planning Domain (Fulfillment / Generation / Data Hygiene / Unknown)\n"
+        "4. Root Cause Indicators (what the log suggests is wrong)\n"
+        "5. Recommended Actions (what a planner should investigate next)\n"
+        "Be concise and planner-friendly. Use BY ESP terminology where applicable. "
+        "If the input is not a log, say so clearly and ask the planner to paste the log content."
+    )
+    prompt = f"Planning context: week={context.get('week_id')}, scenario={context.get('scenario_id')}\n\nLog content:\n{content}"
+
+    reply = _ollama_chat_with_model(prompt, system_prompt, OLLAMA_MODEL)
+
+    return {
+        "Workflow": "Log Reader",
+        "Context Resolution": context,
+        "Log Content Length": len(content),
+        "Assistant Reply": reply or "Log analysis could not be completed — Ollama unavailable.",
+        "LLM Provider": "Ollama",
+        "LLM Model": OLLAMA_MODEL,
+        "Note": "Paste the full log text as your question or in the log_text field for best results.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Vision Query — analyze planning images via Ollama vision model
+# ---------------------------------------------------------------------------
+
+def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
+    """Call the Ollama vision model with a base64-encoded image."""
+    # Strip data URI prefix if present (data:image/...;base64,...)
+    b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64.strip())
+
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an Intel Foundry Supply Planning visual analyst. "
+                    "Analyze the planning image and extract: "
+                    "chart/table type, key planning metrics, anomalies or concerns, "
+                    "planning context (demand/supply/capacity/BOM/inventory), "
+                    "and recommended follow-up analysis. "
+                    "Be concise and use BY ESP terminology."
+                ),
+            },
+            {
+                "role": "user",
+                "content": question or "Analyze this planning image.",
+                "images": [b64],
+            },
+        ],
+        "options": {"temperature": 0.1},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    return ((body.get("message") or {}).get("content") or "").strip() or None
+
+
+def run_vision_query(
+    base_dir: Path,
+    question: str,
+    image_base64: str,
+    week_id: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    scope: Optional[Dict] = None,
+) -> Dict:
+    """
+    Analyze a planning screenshot, chart, or visual report using the Ollama vision model.
+    image_base64: base64-encoded image string (with or without data URI prefix).
+    Requires a vision-capable model (e.g. llama3.2-vision:latest).
+    Set OLLAMA_VISION_MODEL in .env.
+    """
+    context = _resolve_context(base_dir, week_id, scenario_id)
+
+    if not image_base64:
+        return {
+            "Workflow": "Vision Query",
+            "Error": "No image provided. Send a base64-encoded image in the image_base64 field.",
+        }
+
+    reply = _call_vision_ollama(question, image_base64)
+
+    return {
+        "Workflow": "Vision Query",
+        "Context Resolution": context,
+        "Question": question,
+        "Assistant Reply": reply or (
+            f"Vision analysis could not be completed. "
+            f"Ensure a vision-capable model is available: "
+            f"OLLAMA_VISION_MODEL={OLLAMA_VISION_MODEL}. "
+            "Try: ollama pull llama3.2-vision:latest"
+        ),
+        "LLM Provider": "Ollama",
+        "Vision Model": OLLAMA_VISION_MODEL,
+        "Note": (
+            f"Uses {OLLAMA_VISION_MODEL}. "
+            "For best results pull a dedicated vision model: ollama pull llama3.2-vision:latest "
+            "then set OLLAMA_VISION_MODEL=llama3.2-vision:latest in .env"
+        ),
     }
 
 
@@ -3053,102 +3192,114 @@ def _execute_chat_command(base_dir: Path, parsed: Dict, week_id: Optional[str], 
     }
 
 
-def _run_chat_workflow_if_needed(
+_DOMAIN_CATALOG_MAP = {
+    "Fulfillment": "Fulfillment",
+    "Generation": "Generation",
+    "DataHygiene": "Data Hygiene",
+}
+
+
+def _dispatch_by_intent(
     base_dir: Path,
-    question: str,
+    meta: Dict,
     week_id: Optional[str],
     scenario_id: Optional[str],
     scope: Dict,
-    history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict:
-    ql = (question or "").lower()
-    item_resolution = _resolve_chat_item(question, history)
-    resolved_item = item_resolution.get("selected_item")
-    domain_candidates = _detect_domain_focus_candidates(question)
-    domain_focus = domain_candidates[0] if domain_candidates else None
+    """
+    Clean dispatcher driven by RouterAgent IntentMetadata.
+    Replaces the old if/elif keyword chain.
+    """
+    intent = meta.get("intent", "conversational")
+    entities = meta.get("entities") or {}
+    domain_raw = meta.get("domain")
+    resolved_item = entities.get("item")
+    router_meta = {
+        "intent": intent,
+        "workflow": meta.get("workflow"),
+        "domain": domain_raw,
+        "confidence": meta.get("confidence"),
+        "matched_terms": meta.get("matched_terms"),
+        "conflict": meta.get("conflict"),
+        "conflicting_intents": meta.get("conflicting_intents"),
+        "entities": entities,
+        "entity_sources": meta.get("entity_sources"),
+        "missing_slots": meta.get("missing_slots"),
+    }
 
-    table_explain_terms = ["explain table", "describe table", "table definition", "table schema", "column definition"]
-    summary_terms = ["summary", "dataset", "datasets", "files", "inventory", "what is available", "table list", "tables are available", "available tables"]
-    validation_terms = ["validate", "validation", "quality", "readiness", "referential", "integrity", "orphan"]
-    compare_terms = ["compare", "difference", "delta", "scenario compare", "versus", "vs"]
-    insights_terms = ["insight", "fill rate", "capacity", "trend", "demand supply", "analytics"]
-    root_terms = [
-        "root cause",
-        "why unmet",
-        "unmet",
-        "why demand",
-        "why did demand",
-        "demand miss",
-        "missed demand",
-        "explain demand",
-        "lineage",
-        "genealogy",
-        "pegging",
-    ]
-    item_demand_supply_terms = [
-        "demand and supply",
-        "demand vs supply",
-        "supply situation",
-        "demand situation",
-        "share more details about demand vs supply",
-    ]
+    # ── clarification needed (missing required slot) ─────────────────────
+    if meta.get("needs_clarification"):
+        return {
+            "workflow": f"{meta.get('workflow', intent)} Clarification",
+            "clarification": meta["clarification"],
+            "router_metadata": router_meta,
+        }
 
-    if any(term in ql for term in item_demand_supply_terms) and resolved_item:
-        result = _run_item_demand_supply_workflow(base_dir, week_id, scenario_id, resolved_item, scope)
-        result["parsing_evidence"] = item_resolution
+    # ── sql_query (Text-to-SQL Engineer) ─────────────────────────────────
+    if intent == "sql_query":
+        from .text_to_sql_agent import run_sql_query  # lazy import
+        return run_sql_query(base_dir, meta.get("question", ""), week_id, scenario_id, scope)
+
+    # ── bom_drill ────────────────────────────────────────────────────────
+    if intent == "bom_drill":
+        from .langgraph_bom import run_bom_drill
+        result = run_bom_drill(base_dir, week_id, scenario_id, resolved_item, scope)
+        result["router_metadata"] = router_meta
         return result
 
-    if any(term in ql for term in item_demand_supply_terms) and not resolved_item:
-        return {
-            "workflow": "Root Cause Clarification",
-            "clarification": {
-                "question": "Which ITEM should I use for demand vs supply details?",
-                "examples": [
-                    "Use ITEM 100000000004",
-                    "Use ITEM 100000000004 for plant 1004",
-                ],
-            },
-            "parsing_evidence": item_resolution,
-        }
+    # ── item_demand_supply ───────────────────────────────────────────────
+    if intent == "item_demand_supply":
+        result = _run_item_demand_supply_workflow(base_dir, week_id, scenario_id, resolved_item, scope)
+        result["router_metadata"] = router_meta
+        return result
 
-    if len(domain_candidates) > 1:
-        return {
-            "workflow": "Domain Focus Clarification",
-            "clarification": {
-                "question": "Your question spans multiple domains. Which lens should I prioritize?",
-                "options": domain_candidates,
-                "guidance": {
-                    "Fulfillment": "Use when the core question is service impact: unmet demand, backorders, OTIF/fill-rate.",
-                    "Generation": "Use when the core question is plan creation constraints: capacity, lead-time, calendar, policy.",
-                    "Data Hygiene": "Use when the core question is data quality/input defects driving bad outputs.",
+    # ── domain focus (Fulfillment / Generation / Data Hygiene) ──────────
+    if intent in {"domain_fulfillment", "domain_generation", "domain_data_hygiene"}:
+        domain_name = _DOMAIN_CATALOG_MAP.get(domain_raw or "", "Data Hygiene")
+
+        # Conflict: multiple domains matched → ask the planner to choose
+        conflicting = meta.get("conflicting_intents") or []
+        if meta.get("conflict") and any(i.startswith("domain_") for i in conflicting):
+            domain_candidates = [domain_name] + [
+                _DOMAIN_CATALOG_MAP.get(
+                    (_DOMAIN_CATALOG_MAP.get(INTENT_CATALOG_DOMAIN_KEY(c), c)), c
+                )
+                for c in conflicting if c.startswith("domain_")
+            ]
+            return {
+                "workflow": "Domain Focus Clarification",
+                "clarification": {
+                    "question": "Your question spans multiple domains. Which lens should I prioritize?",
+                    "options": domain_candidates,
+                    "guidance": {
+                        "Fulfillment": "Service impact: unmet demand, backorders, OTIF/fill-rate.",
+                        "Generation": "Plan creation: capacity, lead-time, calendar, policy.",
+                        "Data Hygiene": "Data quality/input defects driving bad outputs.",
+                    },
                 },
-            },
-            "parsing_evidence": {
-                "domain_candidates": domain_candidates,
-                "item_resolution": item_resolution,
-            },
-        }
+                "router_metadata": router_meta,
+            }
+        return _run_domain_focus_workflow(base_dir, domain_name, week_id, scenario_id, scope)
 
-    if domain_focus:
-        return _run_domain_focus_workflow(base_dir, domain_focus, week_id, scenario_id, scope)
-
-    if any(term in ql for term in table_explain_terms):
+    # ── table_explain ────────────────────────────────────────────────────
+    if intent == "table_explain":
+        question = meta.get("question", "")
         return _run_table_explain_workflow(base_dir, question)
 
-    if any(term in ql for term in validation_terms):
+    # ── validation ───────────────────────────────────────────────────────
+    if intent == "validation":
         return {
             "workflow": "Validation Gate",
             "result": run_validation(
-                base_dir,
-                week_id,
-                scenario_id,
-                scope,
+                base_dir, week_id, scenario_id, scope,
                 ["master_data", "bom", "parameters", "output_sanity"],
             ),
             "note": "Validation is focused on data quality, referential integrity, and planning readiness.",
+            "router_metadata": router_meta,
         }
 
-    if any(term in ql for term in summary_terms):
+    # ── summary ──────────────────────────────────────────────────────────
+    if intent == "summary":
         inv = dataset_inventory(base_dir)
         largest_input = max(inv["input_files"], key=lambda x: x["rows"], default=None)
         largest_output = max(inv["output_files"], key=lambda x: x["rows"], default=None)
@@ -3161,34 +3312,34 @@ def _run_chat_workflow_if_needed(
                 "largest_output_file": largest_output["file"] if largest_output else None,
             },
             "note": "Summary reflects current by_input and by_output snapshots.",
+            "router_metadata": router_meta,
         }
 
-    if any(term in ql for term in compare_terms):
+    # ── scenario compare ─────────────────────────────────────────────────
+    if intent == "compare":
         return {
             "workflow": "Scenario Comparison",
             "result": run_scenario_compare(
-                base_dir,
-                week_id,
-                None,
-                None,
-                scope,
+                base_dir, week_id, None, None, scope,
                 ["unmet_demand", "capacity_utilization", "lateness"],
             ),
             "note": "Provide exact base and compare SIMULATION_NAME values for strict scenario deltas.",
+            "router_metadata": router_meta,
         }
 
-    if any(term in ql for term in insights_terms):
+    # ── insights ─────────────────────────────────────────────────────────
+    if intent == "insights":
         return {
             "workflow": "Analytics Insights",
             "result": run_insights(base_dir, week_id, scenario_id, None, None, scope),
             "note": "Insights show trend behavior by workweek, month, and quarter.",
+            "router_metadata": router_meta,
         }
 
-    if any(term in ql for term in root_terms):
+    # ── root_cause ───────────────────────────────────────────────────────
+    if intent == "root_cause":
         context = _resolve_context(base_dir, week_id, scenario_id)
-        demand_item = resolved_item
-
-        if not demand_item:
+        if not resolved_item:
             return {
                 "workflow": "Root Cause Clarification",
                 "clarification": {
@@ -3199,37 +3350,59 @@ def _run_chat_workflow_if_needed(
                         "Why is ITEM 100000000008 unmet for week 202547 and scenario CONSTRAINED?",
                     ],
                 },
-                "parsing_evidence": item_resolution,
                 "context": context,
+                "router_metadata": router_meta,
             }
-
-        demand_evidence = _item_demand_evidence(base_dir, context["week_id"], context["scenario_id"], demand_item, scope)
-        source = item_resolution.get("source") or "question"
-        confidence = (item_resolution.get("question_inference") or {}).get("confidence")
-        if (source == "question" and confidence != "high") or (source == "question" and not demand_evidence["is_demand_item"]):
+        # Validate item exists in demand data before committing to root cause
+        demand_evidence = _item_demand_evidence(
+            base_dir, context["week_id"], context["scenario_id"], resolved_item, scope
+        )
+        item_source = (entities.get("item") and (meta.get("entity_sources") or {}).get("item")) or "question"
+        if item_source == "question" and not demand_evidence["is_demand_item"]:
             return {
                 "workflow": "Root Cause Clarification",
                 "clarification": {
-                    "question": f"I found ITEM {demand_item}. Should I treat it as the demand item for this context?",
+                    "question": f"I found ITEM {resolved_item}. Should I treat it as the demand item?",
                     "examples": [
-                        f"Yes, use {demand_item}",
-                        f"Use {demand_item} for plant 1004",
+                        f"Yes, use {resolved_item}",
+                        f"Use {resolved_item} for plant 1004",
                         "Use demand ITEM 100000000004 instead",
                     ],
                 },
-                "parsing_evidence": item_resolution,
                 "demand_evidence": demand_evidence,
                 "context": context,
+                "router_metadata": router_meta,
             }
-
         return {
             "workflow": "Root Cause",
-            "result": run_root_cause(base_dir, week_id, scenario_id, demand_item, scope),
+            "result": run_root_cause(base_dir, week_id, scenario_id, resolved_item, scope),
             "note": "Root-cause analysis uses demand/supply/resource linkage evidence.",
-            "parsing_evidence": item_resolution,
+            "router_metadata": router_meta,
         }
 
-    return {"workflow": "Conversational Copilot"}
+    # ── conversational fallback ──────────────────────────────────────────
+    return {"workflow": "Conversational Copilot", "router_metadata": router_meta}
+
+
+def INTENT_CATALOG_DOMAIN_KEY(intent_name: str) -> str:
+    """Map router intent name to INTENT_CATALOG domain string."""
+    from .router_agent import INTENT_CATALOG
+    return (INTENT_CATALOG.get(intent_name) or {}).get("domain") or ""
+
+
+def _run_chat_workflow_if_needed(
+    base_dir: Path,
+    question: str,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    scope: Dict,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict:
+    from .router_agent import route_question
+    meta = route_question(question, history, week_id, scenario_id, scope)
+    meta["question"] = question  # make question available to dispatcher
+    # forward optional fields (vision, log) if caller passes them via extra kwargs
+    return _dispatch_by_intent(base_dir, meta, week_id, scenario_id, scope)
 
 
 def _build_item_demand_supply_reply(workflow_result: Dict) -> Optional[str]:
@@ -3388,6 +3561,8 @@ def run_chat_assistant(
                 response["RAG Evidence"] = rag_evidence
             if judge_review is not None:
                 response["LLM Judge Review"] = judge_review
+            if workflow_payload.get("router_metadata"):
+                response["Router Metadata"] = workflow_payload["router_metadata"]
             return response
 
     fallback_reply = "I can answer BY ESP planning questions in natural language and run validation, compare, root-cause, and insights workflows."

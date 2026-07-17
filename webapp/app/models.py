@@ -77,6 +77,29 @@ class ChatRequest(BaseModel):
     scope: Scope = Field(default_factory=Scope)
 
 
+class BomDrillRequest(BaseModel):
+    root_item: str
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    scope: Scope = Field(default_factory=Scope)
+    max_depth: int = Field(default=3, ge=1, le=6)
+
+
+class SqlQueryRequest(BaseModel):
+    question: str
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    scope: Scope = Field(default_factory=Scope)
+
+
+class VisionQueryRequest(BaseModel):
+    question: str
+    image_base64: str
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    scope: Scope = Field(default_factory=Scope)
+
+
 class RagQueryRequest(BaseModel):
     question: str
     top_k: int = 8
