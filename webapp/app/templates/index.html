@@ -12,16 +12,32 @@
     <div class="bg-orb orb-b"></div>
     <main class="layout">
       <header class="hero">
-        <div class="brand-row">
+        <section class="hero-main">
           <img class="brand-logo" src="/static/intelfoundrylogo.png" alt="Intel Foundry logo" />
+          <h1>Intel Foundry Planning AI Assistant</h1>
+          <p class="hero-tagline"><em>Unlock Planning Confidence with Automated Validation, Scenario Analysis, and Root-Cause Intelligence</em></p>
+          <button id="summaryBtn" class="btn primary">Load Dataset Summary</button>
+        </section>
+        <aside class="hero-side">
           <span class="brand-pill">Planner Workspace</span>
-        </div>
-        <h1>Intel Foundry Planning AI Assistant</h1>
-        <p class="hero-tagline"><em>Unlock Planning Confidence with Automated Validation, Scenario Analysis, and Root-Cause Intelligence</em></p>
-        <button id="summaryBtn" class="btn primary">Load Dataset Summary</button>
+          <div class="global-model-card">
+            <div class="global-model-head">Assistant Model</div>
+            <div class="global-model-controls">
+              <label class="toggle-row compact-toggle" for="chatLlmEnabled">
+                <input id="chatLlmEnabled" type="checkbox" checked />
+                <span>Ollama</span>
+              </label>
+              <div class="inline-field compact-field">
+                <label for="chatLlmModel">Model</label>
+                <select id="chatLlmModel"></select>
+              </div>
+            </div>
+            <div id="chatLlmStatus" class="settings-note compact-note">Loading Ollama models...</div>
+          </div>
+        </aside>
       </header>
 
-      <section class="workspace-shell">
+      <section class="workspace-shell chat-merged">
         <aside class="app-menu card">
           <div class="menu-head">
             <h2>Menu</h2>
@@ -43,6 +59,10 @@
             <span class="menu-icon">R</span>
             <span class="menu-label">Root Cause</span>
           </button>
+          <button class="menu-btn" data-panel="insights" type="button" title="Analytics Module">
+            <span class="menu-icon">I</span>
+            <span class="menu-label">Analytics Module</span>
+          </button>
           <button class="menu-btn" data-panel="graph" type="button" title="Knowledge Graph">
             <span class="menu-icon">G</span>
             <span class="menu-label">Knowledge Graph</span>
@@ -54,29 +74,31 @@
             <div class="card-top compact-top">
               <div>
                 <h2>Chat Assistant</h2>
-                <p class="hint">Ask in plain English. Week ID maps to CAPTURE_WK and Scenario ID maps to SIMULATION_NAME. If omitted, the latest available data is used.</p>
               </div>
-              <div class="chat-settings compact-settings">
-                <label class="toggle-row compact-toggle" for="chatLlmEnabled">
-                  <input id="chatLlmEnabled" type="checkbox" checked />
-                  <span>Ollama</span>
-                </label>
-                <div class="inline-field compact-field">
-                  <label for="chatLlmModel">Model</label>
-                  <select id="chatLlmModel"></select>
-                </div>
-                <div id="chatLlmStatus" class="settings-note compact-note">Loading Ollama models...</div>
-              </div>
+              <button id="chatClearBtn" class="btn chat-clear-btn" type="button" aria-label="Clear chat history">
+                <span class="btn-icon" aria-hidden="true">x</span>
+                <span>Clear Chat</span>
+              </button>
             </div>
             <div class="field-grid">
-              <textarea id="chatQuestion" rows="4" placeholder="Type your IFSP question here..."></textarea>
-              <div class="split-grid">
-                <input id="chatWeek" placeholder="Week ID = CAPTURE_WK (optional)" />
-                <input id="chatScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
+              <div class="split-grid chat-context-grid">
+                <input
+                  id="chatWeek"
+                  placeholder="Week ID (optional)"
+                  title="Maps to CAPTURE_WK"
+                  aria-label="Week ID, maps to CAPTURE_WK"
+                />
+                <input
+                  id="chatScenario"
+                  placeholder="Scenario ID (optional)"
+                  title="Maps to SIMULATION_NAME"
+                  aria-label="Scenario ID, maps to SIMULATION_NAME"
+                />
               </div>
-              <input id="chatSite" placeholder="Plant (optional)" />
+              <textarea id="chatQuestion" rows="4" placeholder="Type your IFSP question here..."></textarea>
             </div>
             <button id="chatBtn" class="btn primary">Ask Assistant</button>
+            <div id="chatResultPane" class="result-pane chat-thread chat-inline-thread"></div>
           </article>
 
           <article class="card feature-panel" data-panel="validation">
@@ -112,6 +134,16 @@
             <button id="rootCauseBtn" class="btn">Run Root Cause</button>
           </article>
 
+          <article class="card feature-panel" data-panel="insights">
+            <h2>Analytics Module</h2>
+            <div class="analytics-control-tabs" id="analyticsControlTabs" role="tablist" aria-label="Analytics tabs">
+              <button class="analytics-control-tab active" type="button" data-tab="demand_supply">Demand vs Supply trend</button>
+              <button class="analytics-control-tab" type="button" data-tab="fill_rate">Fill Rate trend</button>
+              <button class="analytics-control-tab" type="button" data-tab="capacity">Capacity Utilization trend</button>
+              <button class="analytics-control-tab" type="button" data-tab="met_split">Demand Met vs UnMet vs Partially Met split</button>
+            </div>
+          </article>
+
           <article class="card feature-panel" data-panel="graph">
             <h2>Knowledge Graph</h2>
             <p class="hint">Start with ITEM. Week ID maps to CAPTURE_WK and Scenario ID maps to SIMULATION_NAME. Latest available context is used when omitted.</p>
@@ -128,20 +160,6 @@
         </section>
 
         <section class="insights-column">
-          <article class="output insight-page active" data-panel="chat">
-            <div class="panel-top">
-              <div>
-                <h2>Chat Assistant Output</h2>
-                <p class="hint">Planner-facing answer with grounded evidence.</p>
-              </div>
-              <button id="chatClearBtn" class="btn chat-clear-btn" type="button" aria-label="Clear chat history">
-                <span class="btn-icon" aria-hidden="true">x</span>
-                <span>Clear Chat</span>
-              </button>
-            </div>
-            <div id="chatResultPane" class="result-pane chat-thread"></div>
-          </article>
-
           <article class="output insight-page" data-panel="validation">
             <div class="panel-top">
               <div>
@@ -170,6 +188,16 @@
               </div>
             </div>
             <div id="rootCauseResultPane" class="result-pane">Run root cause to view results...</div>
+          </article>
+
+          <article class="output insight-page" data-panel="insights">
+            <div class="panel-top">
+              <div>
+                <h2>Analytics Output</h2>
+                <p class="hint">Interactive charts and trend insights by Week ID and Scenario ID.</p>
+              </div>
+            </div>
+            <div id="insightsResultPane" class="result-pane">Select an analytics sub-tab, enter Week ID and Scenario ID, and click Go.</div>
           </article>
 
           <article class="output insight-page" data-panel="graph">

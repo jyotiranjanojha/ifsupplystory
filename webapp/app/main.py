@@ -5,8 +5,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .analyzer import dataset_inventory, list_ollama_models, run_chat_assistant, run_knowledge_graph, run_root_cause, run_scenario_compare, run_validation
-from .models import ChatRequest, CompareRequest, KnowledgeGraphRequest, RootCauseRequest, ValidationRequest
+from .analyzer import dataset_inventory, list_ollama_models, run_chat_assistant, run_insights, run_knowledge_graph, run_root_cause, run_scenario_compare, run_validation
+from .models import ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, ValidationRequest
+from .rag import build_rag_index, get_rag_status, query_rag
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -41,6 +42,33 @@ def llm_models():
     return list_ollama_models()
 
 
+@app.get("/api/rag/status")
+def rag_status():
+    return get_rag_status(BASE_DIR)
+
+
+@app.post("/api/rag/reindex")
+def rag_reindex(req: RagReindexRequest):
+    return build_rag_index(
+        BASE_DIR,
+        force=req.force,
+        max_rows_per_file=req.max_rows_per_file,
+    )
+
+
+@app.post("/api/rag/query")
+def rag_query(req: RagQueryRequest):
+    return query_rag(
+        BASE_DIR,
+        req.question,
+        top_k=req.top_k,
+        week_id=req.week_id,
+        scenario_id=req.scenario_id,
+        site=req.scope.site,
+        item_id=req.item_id,
+    )
+
+
 @app.post("/api/validate")
 def validate(req: ValidationRequest):
     return run_validation(BASE_DIR, req.week_id, req.scenario_id, req.scope.model_dump(), req.focus_areas)
@@ -60,7 +88,27 @@ def compare(req: CompareRequest):
 
 @app.post("/api/root-cause")
 def root_cause(req: RootCauseRequest):
-    return run_root_cause(BASE_DIR, req.week_id, req.scenario_id, req.demand_id, req.scope.model_dump())
+    demand_entity = req.demand_entity.model_dump() if req.demand_entity else None
+    return run_root_cause(
+        BASE_DIR,
+        req.week_id,
+        req.scenario_id,
+        req.demand_id,
+        req.scope.model_dump(),
+        demand_entity=demand_entity,
+    )
+
+
+@app.post("/api/insights")
+def insights(req: InsightsRequest):
+    return run_insights(
+        BASE_DIR,
+        req.week_id,
+        req.scenario_id,
+        req.base_scenario_id,
+        req.compare_scenario_id,
+        req.scope.model_dump(),
+    )
 
 
 @app.post("/api/knowledge-graph")

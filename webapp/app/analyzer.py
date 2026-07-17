@@ -1,17 +1,302 @@
 import csv
 import json
+import math
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib import error, request
+
+from .rag import ensure_rag_index, query_rag
 
 
 INPUT_FOLDER = "by_input"
 OUTPUT_FOLDER = "by_output"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.2:latest")
+OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
+
+
+class DemandEntityType(str, Enum):
+    ITEM = "item"
+    ORDER = "order"
+    FORECAST = "forecast"
+    TRANSFER = "transfer"
+    DEPENDENT = "dependent"
+
+
+class FulfillmentStatus(str, Enum):
+    MET = "Met"
+    PARTIALLY_MET = "Partially Met"
+    NOT_MET = "Not Met"
+    MET_LATE = "Met Late"
+
+
+class EvidenceGrade(str, Enum):
+    HIGH = "High"
+    MEDIUM = "Medium"
+    LOW = "Low"
+
+
+@dataclass
+class DomainDemandEntity:
+    entity_type: DemandEntityType
+    entity_id: str
+    resolved_item: Optional[str] = None
+    resolution_note: str = ""
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": self.entity_type.value,
+            "id": self.entity_id,
+            "resolved_item": self.resolved_item,
+            "resolution_note": self.resolution_note,
+        }
+
+
+class ConstraintAttributionPolicy:
+    @staticmethod
+    def evaluate(
+        unmet_qty: float,
+        late_sched_qty: float,
+        pegged_demand_qty: float,
+        pegged_supply_qty: float,
+        setup_flags: Dict[str, bool],
+        capacity_exception_count: int,
+        resource_link_rows: int,
+        competing_higher_priority_count: int,
+        demand_qty_total: float,
+        scheduled_qty_total: float,
+    ) -> Dict[str, int]:
+        return {
+            "master_data_setup_risk": int(
+                not setup_flags.get("item_exists_in_master", False)
+                or not setup_flags.get("sku_coverage_exists", False)
+                or (
+                    not setup_flags.get("production_method_exists", False)
+                    and not setup_flags.get("sourcing_path_exists", False)
+                )
+            ),
+            "capacity_constraint_risk": int(capacity_exception_count > 0 or (resource_link_rows > 0 and late_sched_qty > 0)),
+            "priority_allocation_risk": int(competing_higher_priority_count > 0),
+            "supply_shortage_risk": int(unmet_qty > 0 and (scheduled_qty_total + 1e-6 < demand_qty_total)),
+            "pegging_mismatch_risk": int(pegged_supply_qty + 1e-6 < pegged_demand_qty),
+        }
+
+BY_ESP_DOMAIN_KNOWLEDGE = {
+    "solver": {
+        "name": "Blue Yonder Enterprise Supply Planning (BY ESP) LP Optimization",
+        "summary": "LP optimization balances demand service, supply cost, sourcing, and capacity limits under planning constraints.",
+        "core_mechanics": [
+            "Objective function optimizes weighted business outcomes such as service, margin, and penalties.",
+            "Constraints enforce capacity, material flow, lead-time, lot-size, calendar, and sourcing rules.",
+            "Pegs and links provide explainability from demand to supply, method, and resource consumption.",
+        ],
+    },
+    "table_guidance": {
+        "if_snop_items": "Item master and core product-level attributes.",
+        "if_snop_locations": "Location/plant master used by planning network entities.",
+        "if_snop_sku": "Item-location-customer planning grain used for policy and execution context.",
+        "if_snop_billofmaterials": "Primary BOM parent-component relationships.",
+        "if_snop_altbillofmaterials": "Alternate BOM options for substitution and flexibility.",
+        "if_snop_sourcing": "Source-destination sourcing options and policies.",
+        "if_snop_productionmethod": "Production pathways and method-level behavior.",
+        "if_snop_res": "Resource master used for capacity assignment.",
+        "by_if_snop_out_inddmdview": "Demand view including quantity, schedule quantity, and status context.",
+        "by_if_snop_out_inddmdlink": "Demand-to-supply linkage records for explainability.",
+        "by_if_snop_out_planorder": "Planned production order outputs.",
+        "by_if_snop_out_planpurch": "Planned purchase supply outputs.",
+        "by_if_snop_out_planarriv": "Planned arrival supply outputs.",
+        "by_if_snop_out_resloaddetail": "Resource loading detail by plan and period.",
+        "by_if_snop_out_resloadinddmdlink": "Resource-load linkage to demand entities.",
+        "by_if_snop_out_skuprojstatic": "SKU projection summary with demand/supply and service indicators.",
+        "by_if_snop_out_resprojstatic": "Resource projection summary including utilization fields.",
+    },
+    "linkages": [
+        {
+            "from": "if_snop_billofmaterials",
+            "to": "if_snop_items",
+            "keys": ["ITEM", "SUBORD"],
+            "purpose": "Validates parent/component item references.",
+        },
+        {
+            "from": "if_snop_sku",
+            "to": "if_snop_items / if_snop_locations / if_snop_customer",
+            "keys": ["ITEM", "LOC", "CUST"],
+            "purpose": "Enforces SKU-level referential integrity.",
+        },
+        {
+            "from": "by_if_snop_out_inddmdview",
+            "to": "by_if_snop_out_inddmdlink",
+            "keys": ["ITEM", "LOC", "CAPTURE_WK", "SIMULATION_NAME"],
+            "purpose": "Connects demand records to linkage/pegging structure.",
+        },
+        {
+            "from": "by_if_snop_out_inddmdlink",
+            "to": "by_if_snop_out_planorder / by_if_snop_out_planarriv / by_if_snop_out_planpurch",
+            "keys": ["ITEM", "LOC", "CAPTURE_WK", "SIMULATION_NAME"],
+            "purpose": "Traces planned supply supporting demand.",
+        },
+        {
+            "from": "by_if_snop_out_resloadinddmdlink",
+            "to": "by_if_snop_out_resloaddetail",
+            "keys": ["RES", "LOC", "CAPTURE_WK", "SIMULATION_NAME"],
+            "purpose": "Links demand-driven loads to resource utilization.",
+        },
+    ],
+}
+
+BY_ESP_DOMAIN_FRAMEWORK = {
+    "Fulfillment": {
+        "bounded_context": "Context A: Demand Fulfillment (The Why did not we ship? Domain)",
+        "user_story": "As a planner, I want to ask why Customer Order X was not met so that I can see the exact constraint (material, capacity, or calendar) that blocked it.",
+        "key_inputs_outputs": ["Demand Postings", "Allocation Output", "Shortage Tables"],
+        "focus": "Customer commitments and service level effectiveness.",
+        "met_demand_metrics": ["OTIF", "Case Fill Rate", "Perfect Order Index"],
+        "unmet_demand_metrics": ["Stockouts", "Lost Sales", "Backorders"],
+        "delayed_order_metrics": ["Backlog Age", "DSO", "Delivery Lead Time Variability"],
+        "intent_terms": [
+            "fulfillment",
+            "why didn't we ship",
+            "why did not we ship",
+            "why not shipped",
+            "customer order not met",
+            "otif",
+            "fill rate",
+            "stockout",
+            "backorder",
+            "shortage",
+        ],
+    },
+    "Generation": {
+        "bounded_context": "Context B: Supply Generation (The Why did not we build or buy? Domain)",
+        "user_story": "As a planner, I want to know why no planned orders were generated for SKU Y in Week 24, despite an active forecast.",
+        "key_inputs_outputs": ["SKU Master (Min-lot, Lead times)", "Production Capacity", "Sourcing Yields", "Planned Orders Output"],
+        "focus": "Constraints, policies, and parameters that drive the supply plan.",
+        "capacity_metrics": ["Machine Downtime", "Labor Shortages", "OEE"],
+        "lead_time_metrics": ["Supplier Lead Time", "Transit Time", "Variability"],
+        "calendar_gap_metrics": ["Holiday Shutdowns", "Planned Maintenance", "Shift Variances"],
+        "intent_terms": [
+            "generation",
+            "why didn't we build",
+            "why did not we build",
+            "why didn't we buy",
+            "why did not we buy",
+            "no planned orders",
+            "planned order not generated",
+            "capacity",
+            "lead time",
+            "active forecast",
+        ],
+    },
+    "Data Hygiene": {
+        "bounded_context": "Context C: Data Hygiene (Garbage In, Garbage Out Domain)",
+        "user_story": "As a planner, I want to check if a sudden drop in planned supply is due to a data input error rather than a physical supply chain constraint.",
+        "key_inputs_outputs": ["Calendars", "Sourcing or Routing Masters", "Inventory On-Hand inputs"],
+        "focus": "Structural integrity and quality of planning data feeding the planning engine.",
+        "bad_master_metrics": ["Outdated BOM", "Incorrect Routings", "Duplicate Item Codes"],
+        "parameter_gap_metrics": ["Unmaintained Safety Stock", "Missing MOQ", "Incorrect Lot Sizes"],
+        "intent_terms": [
+            "data hygiene",
+            "garbage in garbage out",
+            "data input error",
+            "master data error",
+            "master data",
+            "data quality",
+            "sudden drop in planned supply",
+            "routing master",
+            "calendar issue",
+            "inventory input",
+            "moq",
+            "lot size",
+        ],
+    },
+}
+
+
+def _detect_domain_focus_candidates(question: str) -> List[str]:
+    q = (question or "").lower()
+    matched: List[str] = []
+    for domain_name, domain_meta in BY_ESP_DOMAIN_FRAMEWORK.items():
+        terms = [str(t).lower() for t in domain_meta.get("intent_terms", [])]
+        if any(term in q for term in terms):
+            matched.append(domain_name)
+    return matched
+
+
+def _detect_domain_focus(question: str) -> Optional[str]:
+    candidates = _detect_domain_focus_candidates(question)
+    return candidates[0] if candidates else None
+
+
+def _run_domain_focus_workflow(
+    base_dir: Path,
+    domain_focus: str,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    scope: Dict,
+) -> Dict:
+    insights = run_insights(base_dir, week_id, scenario_id, None, None, scope)
+    trend = insights.get("Trend Analysis", {}) if isinstance(insights, dict) else {}
+
+    if domain_focus == "Fulfillment":
+        fill_rate_rows = ((trend.get("Fill Rate") or {}).get("workweek") or [])[:12]
+        demand_supply_rows = ((trend.get("Demand vs Supply") or {}).get("workweek") or [])[:12]
+        met_split = trend.get("Demand Met vs UnMet vs Partially Met") or {}
+        return {
+            "workflow": "Domain Focus - Fulfillment",
+            "result": {
+                "domain": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"],
+                "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"].get("bounded_context"),
+                "user_story": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"].get("user_story"),
+                "kpi_summary": insights.get("KPI Summary", {}),
+                "fill_rate_trend_workweek": fill_rate_rows,
+                "demand_supply_trend_workweek": demand_supply_rows,
+                "met_unmet_split": met_split,
+                "context": (insights.get("Insights Scope") or {}).get("context_resolution"),
+            },
+            "note": "Fulfillment domain analysis grounded on demand/supply and service behavior trends.",
+        }
+
+    if domain_focus == "Generation":
+        capacity_rows = ((trend.get("Capacity Utilization") or {}).get("workweek") or [])[:12]
+        return {
+            "workflow": "Domain Focus - Generation",
+            "result": {
+                "domain": BY_ESP_DOMAIN_FRAMEWORK["Generation"],
+                "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Generation"].get("bounded_context"),
+                "user_story": BY_ESP_DOMAIN_FRAMEWORK["Generation"].get("user_story"),
+                "capacity_trend_workweek": capacity_rows,
+                "kpi_summary": insights.get("KPI Summary", {}),
+                "context": (insights.get("Insights Scope") or {}).get("context_resolution"),
+                "notes": [
+                    "Generation domain focuses on capacity, lead-time, and calendar-policy effects.",
+                    "Some metrics (downtime, OEE, labor shortage) may require additional operational datasets.",
+                ],
+            },
+            "note": "Generation domain analysis grounded on capacity and timing signals from planning outputs.",
+        }
+
+    validation = run_validation(base_dir, week_id, scenario_id, scope, ["master_data", "bom", "parameters", "output_sanity"])
+    return {
+        "workflow": "Domain Focus - Data Hygiene",
+        "result": {
+            "domain": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"],
+            "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"].get("bounded_context"),
+            "user_story": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"].get("user_story"),
+            "validation_summary": {
+                "verdict": validation.get("Readiness Verdict (Pass, Conditional Pass, Fail)"),
+                "checks_executed": validation.get("Checks Executed", {}),
+                "issues": validation.get("Issues Found (Critical, High, Medium, Low)", {}),
+            },
+            "context": (validation.get("Datasets and Evidence Used") or {}).get("context_resolution"),
+        },
+        "note": "Data Hygiene domain analysis grounded on referential integrity and parameter quality checks.",
+    }
 
 
 def _safe_rows(file_path: Path) -> Iterable[dict]:
@@ -331,6 +616,50 @@ def _infer_demand_item_from_question(question: str) -> Dict:
     }
 
 
+def _infer_recent_item_from_history(history: Optional[List[Dict[str, str]]]) -> Optional[str]:
+    for msg in reversed(history or []):
+        role = (msg.get("role") or "").strip().lower()
+        if role != "user":
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        inference = _infer_demand_item_from_question(content)
+        if inference.get("selected_item"):
+            return inference["selected_item"]
+    return None
+
+
+def _resolve_chat_item(question: str, history: Optional[List[Dict[str, str]]]) -> Dict:
+    current = _infer_demand_item_from_question(question)
+    selected = current.get("selected_item")
+    source = "question" if selected else None
+
+    if not selected:
+        ql = (question or "").lower()
+        reference_terms = [
+            "for the item",
+            "that item",
+            "this item",
+            "same item",
+            "the item",
+        ]
+        demand_supply_terms = ["demand", "supply", "unmet", "root cause", "lineage", "details"]
+        is_reference_question = any(term in ql for term in reference_terms)
+        is_demand_supply_followup = any(term in ql for term in demand_supply_terms)
+        if is_reference_question or is_demand_supply_followup:
+            prior_item = _infer_recent_item_from_history(history)
+            if prior_item:
+                selected = prior_item
+                source = "history"
+
+    return {
+        "selected_item": selected,
+        "source": source,
+        "question_inference": current,
+    }
+
+
 def _item_demand_evidence(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], item_id: Optional[str], scope: Dict) -> Dict:
     item = (item_id or "").strip()
     if not item:
@@ -381,8 +710,311 @@ def _matches_context(row: Dict[str, str], week_id: Optional[str], scenario_id: O
     return True
 
 
+def _parse_demand_entity(demand_id: Optional[str], demand_entity: Optional[Dict]) -> DomainDemandEntity:
+    if demand_entity:
+        entity_type_raw = (demand_entity.get("type") or "").strip().lower()
+        entity_id = (demand_entity.get("id") or "").strip()
+        try:
+            entity_type = DemandEntityType(entity_type_raw)
+        except ValueError:
+            entity_type = DemandEntityType.ITEM
+        return DomainDemandEntity(entity_type=entity_type, entity_id=entity_id, resolved_item=entity_id if entity_type == DemandEntityType.ITEM else None)
+
+    fallback_id = (demand_id or "").strip()
+    return DomainDemandEntity(
+        entity_type=DemandEntityType.ITEM,
+        entity_id=fallback_id,
+        resolved_item=fallback_id or None,
+        resolution_note="Legacy demand_id interpreted as ITEM.",
+    )
+
+
+def _resolve_entity_to_item(
+    inddmdview_file: Optional[Path],
+    entity: DomainDemandEntity,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    site: Optional[str],
+) -> DomainDemandEntity:
+    if entity.entity_type == DemandEntityType.ITEM:
+        entity.resolved_item = entity.entity_id or None
+        if not entity.resolution_note:
+            entity.resolution_note = "Demand entity type item maps directly to ITEM."
+        return entity
+
+    if not inddmdview_file or not entity.entity_id:
+        entity.resolution_note = "Could not resolve demand entity to ITEM due to missing demand output evidence."
+        return entity
+
+    target = entity.entity_id.strip()
+    item_totals: Dict[str, float] = {}
+    site_filter = (site or "").strip()
+
+    dmdtype_map = {
+        DemandEntityType.FORECAST: "fcst",
+        DemandEntityType.TRANSFER: "xfer",
+        DemandEntityType.DEPENDENT: "dep",
+    }
+
+    for row in _safe_rows(inddmdview_file):
+        if site_filter and (row.get("LOC") or "").strip() != site_filter:
+            continue
+        if not _matches_context(row, week_id, scenario_id):
+            continue
+
+        item = (row.get("ITEM") or "").strip()
+        if not item:
+            continue
+
+        matched = False
+        if entity.entity_type == DemandEntityType.ORDER:
+            if (row.get("EXTORDERID") or "").strip() == target or (row.get("HEADEREXTREF") or "").strip() == target:
+                matched = True
+        elif entity.entity_type in {DemandEntityType.FORECAST, DemandEntityType.TRANSFER, DemandEntityType.DEPENDENT}:
+            dmd_type = (row.get("DMDTYPE") or "").strip().lower()
+            token = dmdtype_map.get(entity.entity_type, "")
+            if token and token in dmd_type and (item == target or not target):
+                matched = True
+
+        if matched:
+            item_totals[item] = item_totals.get(item, 0.0) + _safe_float(row.get("QTY"))
+
+    if not item_totals:
+        entity.resolution_note = (
+            f"Demand entity type '{entity.entity_type.value}' with id '{target}' could not be resolved to ITEM in by_if_snop_out_inddmdview."
+        )
+        return entity
+
+    entity.resolved_item = max(item_totals.items(), key=lambda kv: kv[1])[0]
+    entity.resolution_note = (
+        f"Demand entity type '{entity.entity_type.value}' id '{target}' resolved to ITEM '{entity.resolved_item}' by highest matched demand quantity."
+    )
+    return entity
+
+
+def _grade_evidence(demand_qty_total: float, link_rows_count: int, gaps: List[str]) -> EvidenceGrade:
+    if demand_qty_total > 0 and link_rows_count > 0 and len(gaps) == 0:
+        return EvidenceGrade.HIGH
+    if demand_qty_total > 0:
+        return EvidenceGrade.MEDIUM
+    return EvidenceGrade.LOW
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _stddev(values: List[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    var = sum((x - mean) ** 2 for x in values) / len(values)
+    return math.sqrt(var)
+
+
+def _build_domain_focus_assessment(
+    demand_qty_total: float,
+    scheduled_qty_total: float,
+    unmet_qty: float,
+    on_time_sched_qty: float,
+    late_sched_qty: float,
+    lateness_days: List[float],
+    supply_lead_variability_days: Optional[float],
+    capacity_exception_count: int,
+    capacity_overutil_qty: float,
+    competing_higher_priority_count: int,
+    setup_flags: Dict[str, bool],
+    bom_parent_rows: List[Dict],
+    bom_component_rows: List[Dict],
+    production_rows: List[Dict],
+    sourcing_out_rows: List[Dict],
+    sourcing_in_rows: List[Dict],
+    evidence_grade: EvidenceGrade,
+) -> Dict:
+    case_fill_rate = _safe_ratio(scheduled_qty_total, demand_qty_total) * 100.0
+    otif = _safe_ratio(on_time_sched_qty, demand_qty_total) * 100.0
+    perfect_order_index = min(otif, case_fill_rate)
+
+    delayed_orders_count_proxy = len([x for x in lateness_days if x > 0])
+    lead_time_variability = _stddev(lateness_days)
+
+    return {
+        "Fulfillment Domain": {
+            "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"].get("bounded_context"),
+            "user_story": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"].get("user_story"),
+            "key_inputs_outputs": BY_ESP_DOMAIN_FRAMEWORK["Fulfillment"].get("key_inputs_outputs"),
+            "focus": "Customer commitments and service level effectiveness.",
+            "Met Demand": {
+                "OTIF_pct": round(otif, 2),
+                "Case_Fill_Rate_pct": round(case_fill_rate, 2),
+                "Perfect_Order_Index_proxy_pct": round(perfect_order_index, 2),
+            },
+            "Unmet Demand": {
+                "Stockouts_qty_proxy": round(unmet_qty, 3),
+                "Lost_Sales_qty": None,
+                "Backorders_qty_proxy": round(max(unmet_qty + late_sched_qty, 0.0), 3),
+            },
+            "Delayed Orders": {
+                "Backlog_Age_days": None,
+                "DSO_days": None,
+                "Delivery_Lead_Time_Variability_days": round(lead_time_variability, 3) if lead_time_variability is not None else None,
+                "Delayed_Order_Count_proxy": delayed_orders_count_proxy,
+            },
+            "evidence_grade": evidence_grade.value,
+        },
+        "Generation Domain": {
+            "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Generation"].get("bounded_context"),
+            "user_story": BY_ESP_DOMAIN_FRAMEWORK["Generation"].get("user_story"),
+            "key_inputs_outputs": BY_ESP_DOMAIN_FRAMEWORK["Generation"].get("key_inputs_outputs"),
+            "focus": "Constraints, policies, and parameters driving the supply plan.",
+            "Capacity": {
+                "Machine_Downtime": None,
+                "Labor_Shortages": None,
+                "OEE_pct": None,
+                "Capacity_Exception_Rows": int(capacity_exception_count),
+                "Capacity_Overutil_Qty": round(capacity_overutil_qty, 3),
+            },
+            "Lead Time": {
+                "Supplier_Lead_Time_days": None,
+                "Transit_Time_days": None,
+                "Lead_Time_Variability_days": round(supply_lead_variability_days, 3) if supply_lead_variability_days is not None else None,
+            },
+            "Calendar Gaps": {
+                "Holiday_Shutdowns": None,
+                "Planned_Maintenance": None,
+                "Shift_Variances": None,
+            },
+            "allocation_pressure": {
+                "Higher_Priority_Competing_Rows": int(competing_higher_priority_count),
+            },
+            "evidence_grade": evidence_grade.value,
+        },
+        "Data Hygiene Domain": {
+            "bounded_context": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"].get("bounded_context"),
+            "user_story": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"].get("user_story"),
+            "key_inputs_outputs": BY_ESP_DOMAIN_FRAMEWORK["Data Hygiene"].get("key_inputs_outputs"),
+            "focus": "Structural integrity and quality of planning master and parameter data.",
+            "Bad Masters": {
+                "Outdated_BOM_proxy": int(len(bom_parent_rows) == 0 and len(bom_component_rows) == 0),
+                "Incorrect_Routings_proxy": int(len(production_rows) == 0),
+                "Duplicate_Item_Codes": None,
+            },
+            "Parameter Gaps": {
+                "Unmaintained_Safety_Stock": None,
+                "Missing_MOQ": None,
+                "Incorrect_Lot_Sizes": None,
+            },
+            "setup_integrity": {
+                "item_exists_in_master": setup_flags.get("item_exists_in_master"),
+                "sku_coverage_exists": setup_flags.get("sku_coverage_exists"),
+                "production_method_exists": setup_flags.get("production_method_exists"),
+                "sourcing_path_exists": setup_flags.get("sourcing_path_exists"),
+                "sourcing_out_paths": len(sourcing_out_rows),
+                "sourcing_in_paths": len(sourcing_in_rows),
+            },
+            "evidence_grade": evidence_grade.value,
+        },
+        "Notes": [
+            "Metrics marked null are not directly available from current snapshot schema and require upstream KPI or finance datasets.",
+            "OTIF and fill-rate values are computed proxies from demand and scheduled quantities in current by_output evidence.",
+        ],
+    }
+
+
 def _ollama_chat(prompt: str, system_prompt: str) -> Optional[str]:
     return _ollama_chat_with_model(prompt, system_prompt, OLLAMA_MODEL)
+
+
+def _env_flag(value: Optional[str], default: bool = False) -> bool:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def _parse_json_object_from_text(text: str) -> Optional[Dict]:
+    content = (text or "").strip()
+    if not content:
+        return None
+
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(content[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _judge_llm_output(
+    question: str,
+    answer: str,
+    workflow_name: str,
+    context: Dict,
+    grounded_result: Optional[Dict],
+    llm_model: Optional[str],
+) -> Optional[Dict]:
+    if not _env_flag(OLLAMA_JUDGE_ENABLED, default=True):
+        return None
+
+    system_prompt = (
+        "You are a strict LLM judge for IFSP planning assistant quality. "
+        "Evaluate assistant output for factuality, groundedness, completeness, and clarity. "
+        "Never invent evidence. If answer is weak, provide concise correction guidance. "
+        "Return JSON only."
+    )
+
+    prompt = "\n\n".join(
+        [
+            f"User question: {question}",
+            f"Assistant answer: {answer}",
+            f"Workflow: {workflow_name}",
+            f"Context: {json.dumps(context, ensure_ascii=True)}",
+            f"Grounded result JSON: {json.dumps(grounded_result or {}, ensure_ascii=True)}",
+            (
+                "Return only valid JSON with keys: "
+                "verdict (pass|needs_revision|fail), overall_score (0-100), factuality (0-100), "
+                "groundedness (0-100), completeness (0-100), clarity (0-100), "
+                "issues (array of strings), recommended_fixes (array of strings), revised_answer (string)."
+            ),
+        ]
+    )
+
+    review_text = _ollama_chat_with_model(prompt, system_prompt, OLLAMA_JUDGE_MODEL)
+    if not review_text:
+        return {
+            "status": "unavailable",
+            "judge_model": OLLAMA_JUDGE_MODEL,
+            "reason": "Judge model did not return a response.",
+        }
+
+    parsed = _parse_json_object_from_text(review_text)
+    if not parsed:
+        return {
+            "status": "parse_error",
+            "judge_model": OLLAMA_JUDGE_MODEL,
+            "raw_review": review_text,
+            "reason": "Judge response was not valid JSON.",
+        }
+
+    parsed["status"] = parsed.get("status") or "ok"
+    parsed["judge_model"] = parsed.get("judge_model") or OLLAMA_JUDGE_MODEL
+    parsed["target_llm_model"] = parsed.get("target_llm_model") or ((llm_model or OLLAMA_MODEL).strip() or OLLAMA_MODEL)
+    return parsed
 
 
 def _ollama_chat_with_model(
@@ -684,12 +1316,18 @@ def run_scenario_compare(base_dir: Path, week_id: Optional[str], base_scenario_i
     }
 
 
-def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], demand_id: Optional[str], scope: Dict) -> Dict:
-    # In this app, demand_id is treated as the demand ITEM identifier.
+def run_root_cause(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    demand_id: Optional[str],
+    scope: Dict,
+    demand_entity: Optional[Dict] = None,
+) -> Dict:
     context = _resolve_context(base_dir, week_id, scenario_id)
     week_id = context["week_id"]
     scenario_id = context["scenario_id"]
-    demand_item = (demand_id or "").strip()
+    domain_entity = _parse_demand_entity(demand_id, demand_entity)
 
     input_dir = base_dir / INPUT_FOLDER
     output_dir = base_dir / OUTPUT_FOLDER
@@ -713,6 +1351,8 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
 
     dfu_fcst_file = _find_file_by_prefix(input_dir, "if_snop_dfutoskufcst-")
     site = (scope.get("site") or "").strip()
+    domain_entity = _resolve_entity_to_item(inddmdview_file, domain_entity, week_id, scenario_id, site)
+    demand_item = (domain_entity.resolved_item or "").strip()
 
     exception_rows = 0
     relation_rows = 0
@@ -944,10 +1584,24 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         else:
             late_sched_qty += sched_qty
 
+    lateness_days: List[float] = []
+    for row in demand_rows:
+        need_date = _parse_date(row.get("NEEDDATE"))
+        sched_date = _parse_date(row.get("SCHEDDATE"))
+        if need_date and sched_date and sched_date > need_date:
+            lateness_days.append(float((sched_date - need_date).days))
+
     pegged_demand_qty = sum(_safe_float(row.get("DMDPEGQTY")) for row in link_rows)
     pegged_supply_qty = sum(_safe_float(row.get("SUPPLYPEGQTY")) for row in link_rows)
     supply_avail_dates = [_parse_date(row.get("SUPPLYAVAILDATE")) for row in link_rows]
     supply_avail_dates = [d for d in supply_avail_dates if d]
+
+    supply_lead_deltas: List[float] = []
+    for row in link_rows:
+        dmd_need = _parse_date(row.get("DMDNEEDDATE"))
+        supply_avail = _parse_date(row.get("SUPPLYAVAILDATE"))
+        if dmd_need and supply_avail:
+            supply_lead_deltas.append(float((supply_avail - dmd_need).days))
 
     supply_methods = sorted({(row.get("SUPPLYMETHOD") or "").strip() for row in link_rows if (row.get("SUPPLYMETHOD") or "").strip()})
     supply_types = sorted({(row.get("SUPPLYTYPE") or "").strip() for row in link_rows if (row.get("SUPPLYTYPE") or "").strip()})
@@ -1038,7 +1692,15 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     }
 
     fully_met = demand_qty_total > 0 and scheduled_qty_total + 1e-6 >= demand_qty_total
-    met_status = "Met" if fully_met else ("Partially Met" if scheduled_qty_total > 0 else "Not Met")
+    if fully_met and late_sched_qty > 0:
+        fulfillment_status = FulfillmentStatus.MET_LATE
+    elif fully_met:
+        fulfillment_status = FulfillmentStatus.MET
+    elif scheduled_qty_total > 0:
+        fulfillment_status = FulfillmentStatus.PARTIALLY_MET
+    else:
+        fulfillment_status = FulfillmentStatus.NOT_MET
+    met_status = fulfillment_status.value
     met_date = max(sched_dates) if fully_met and sched_dates else None
 
     gaps = []
@@ -1047,7 +1709,7 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     if not scenario_id:
         gaps.append("no SIMULATION_NAME found in available output datasets")
     if not demand_item:
-        gaps.append("demand item (ITEM) missing for direct lineage trace")
+        gaps.append("demand entity could not be resolved to ITEM for lineage trace")
     if demand_item and demand_qty_total <= 0:
         gaps.append("no matching demand rows found for item in by_if_snop_out_inddmdview")
 
@@ -1086,13 +1748,18 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     if not root_causes:
         root_causes.append("Demand appears covered by scheduled and pegged supply in the current dataset scope.")
 
-    attribution_signals = {
-        "master_data_setup_risk": int(not setup_flags["item_exists_in_master"] or not setup_flags["sku_coverage_exists"] or (not setup_flags["production_method_exists"] and not setup_flags["sourcing_path_exists"])),
-        "capacity_constraint_risk": int(capacity_exception_count > 0 or (resource_link_rows > 0 and late_sched_qty > 0)),
-        "priority_allocation_risk": int(competing_higher_priority_count > 0),
-        "supply_shortage_risk": int(unmet_qty > 0 and (scheduled_qty_total + 1e-6 < demand_qty_total)),
-        "pegging_mismatch_risk": int(pegged_supply_qty + 1e-6 < pegged_demand_qty),
-    }
+    attribution_signals = ConstraintAttributionPolicy.evaluate(
+        unmet_qty,
+        late_sched_qty,
+        pegged_demand_qty,
+        pegged_supply_qty,
+        setup_flags,
+        capacity_exception_count,
+        resource_link_rows,
+        competing_higher_priority_count,
+        demand_qty_total,
+        scheduled_qty_total,
+    )
 
     ranked_attribution = sorted(attribution_signals.items(), key=lambda kv: kv[1], reverse=True)
     primary_causes = [name for name, score in ranked_attribution if score > 0]
@@ -1111,12 +1778,34 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
     if attribution_signals["pegging_mismatch_risk"] > 0:
         by_esp_reasoning.append("Pegging mismatch risk: demand pegging exceeds pegged supply, indicating unresolved linkage.")
 
+    evidence_grade = _grade_evidence(demand_qty_total, len(link_rows), gaps)
+    domain_focus_assessment = _build_domain_focus_assessment(
+        demand_qty_total,
+        scheduled_qty_total,
+        unmet_qty,
+        on_time_sched_qty,
+        late_sched_qty,
+        lateness_days,
+        _stddev(supply_lead_deltas),
+        capacity_exception_count,
+        capacity_overutil_qty,
+        competing_higher_priority_count,
+        setup_flags,
+        bom_parent_rows,
+        bom_component_rows,
+        production_rows,
+        sourcing_out_rows,
+        sourcing_in_rows,
+        evidence_grade,
+    )
+
     return {
         "Explainability Scope": {
             "week_id": week_id,
             "scenario_id": scenario_id,
             "week_column": "CAPTURE_WK",
             "scenario_column": "SIMULATION_NAME",
+            "demand_entity": domain_entity.to_dict(),
             "demand_item": demand_item or None,
             "scope": scope,
         },
@@ -1173,6 +1862,7 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "first_sched_date": _fmt_date(min(sched_dates) if sched_dates else None),
             "last_sched_date": _fmt_date(max(sched_dates) if sched_dates else None),
             "meet_status": met_status,
+            "fulfillment_status": fulfillment_status.value,
             "fully_met_date": _fmt_date(met_date),
         },
         "Lineage and Linkage Findings": {
@@ -1210,11 +1900,13 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "higher_priority_competing_rows": competing_higher_priority_count,
             "higher_priority_competing_qty": round(competing_higher_priority_qty, 3),
         },
+        "Domain Focus Assessment": domain_focus_assessment,
         "Confirmed Findings": confirmed_findings,
         "Root Causes": root_causes,
         "Cause Attribution (BY ESP Expert View)": {
             "primary_cause_tags": primary_causes,
             "attribution_signals": attribution_signals,
+            "policy": "ConstraintAttributionPolicy.v1",
             "by_esp_reasoning": by_esp_reasoning,
             "semiconductor_planning_notes": [
                 "In semiconductor planning, constrained resources and long-cycle production routes can shift fulfillment across weeks.",
@@ -1227,7 +1919,7 @@ def run_root_cause(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             ],
             "missing_evidence": gaps,
         },
-        "Confidence Level": "Medium" if demand_qty_total > 0 and len(link_rows) > 0 else "Low-Medium",
+        "Confidence Level": evidence_grade.value,
         "Recommended Next Checks": [
             "Provide demand ITEM and scope for targeted lineage trace.",
             "Compare demand need dates with supply available and scheduled dates for lateness diagnosis.",
@@ -1411,6 +2103,1152 @@ def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Opt
     }
 
 
+def run_insights(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    base_scenario_id: Optional[str],
+    compare_scenario_id: Optional[str],
+    scope: Dict,
+) -> Dict:
+    site = (scope.get("site") or "").strip()
+    input_dir = base_dir / INPUT_FOLDER
+    output_dir = base_dir / OUTPUT_FOLDER
+
+    skuproj_file = _find_file_by_prefix(output_dir, "by_if_snop_out_skuprojstatic-")
+    resproj_file = _find_file_by_prefix(output_dir, "by_if_snop_out_resprojstatic-")
+    inddmdview_file = _find_file_by_prefix(output_dir, "by_if_snop_out_inddmdview-")
+    calpattern_file = _find_file_by_prefix(input_dir, "if_snop_calpattern-")
+
+    calendar_windows: List[Tuple[datetime, datetime, str]] = []
+    seen_windows = set()
+    if calpattern_file:
+        for row in _safe_rows(calpattern_file):
+            start = _parse_date(row.get("STARTDATE"))
+            end = _parse_date(row.get("ENDDATE"))
+            seq = (row.get("PATTERNSEQNUM") or "").strip()
+            if not start or not end:
+                continue
+            key = (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), seq)
+            if key in seen_windows:
+                continue
+            seen_windows.add(key)
+            calendar_windows.append((start, end, seq))
+    calendar_windows.sort(key=lambda item: item[0])
+
+    grains = ["workweek", "month", "quarter"]
+
+    def _bucket_labels(dt: Optional[datetime]) -> Dict[str, str]:
+        if not dt:
+            return {
+                "workweek": "Unknown",
+                "month": "Unknown",
+                "quarter": "Unknown",
+            }
+
+        ww_label = None
+        for start, end, seq in calendar_windows:
+            if start <= dt <= end:
+                ww_label = seq or None
+                break
+        if not ww_label:
+            ww_label = f"{dt.year}{int(dt.strftime('%W')):02d}"
+
+        month_label = f"{dt.year}-{dt.month:02d}"
+        quarter_label = f"{dt.year}-Q{((dt.month - 1) // 3) + 1}"
+        return {
+            "workweek": ww_label,
+            "month": month_label,
+            "quarter": quarter_label,
+        }
+
+    def _sort_bucket_keys(grain: str, keys: List[str]) -> List[str]:
+        if grain == "workweek":
+            return sorted(keys, key=lambda value: (0, int(value)) if str(value).isdigit() else (1, str(value)))
+        return sorted(keys)
+
+    def _collect_for_context(resolved_week: Optional[str], resolved_scenario: Optional[str]) -> Dict:
+        demand_supply_by_grain: Dict[str, Dict[str, Dict[str, float]]] = {grain: {} for grain in grains}
+        fill_rate_by_grain: Dict[str, Dict[str, Dict[str, float]]] = {grain: {} for grain in grains}
+        fill_rate_sched_by_grain: Dict[str, Dict[str, Dict[str, float]]] = {grain: {} for grain in grains}
+        capacity_by_grain: Dict[str, Dict[str, Dict[str, float]]] = {grain: {} for grain in grains}
+        demand_split_by_grain: Dict[str, Dict[str, Dict[str, float]]] = {grain: {} for grain in grains}
+        overall_counts = {"Met": 0, "Partially Met": 0, "UnMet": 0}
+        overall_qty = {"Met": 0.0, "Partially Met": 0.0, "UnMet": 0.0}
+
+        if skuproj_file:
+            for row in _safe_rows(skuproj_file):
+                if not _matches_context(row, resolved_week, resolved_scenario):
+                    continue
+                if site and (row.get("LOC") or "").strip() != site:
+                    continue
+
+                labels = _bucket_labels(_parse_date(row.get("STARTDATE")))
+                demand_qty = _safe_float(row.get("TOTDMD"))
+                supply_qty = _safe_float(row.get("TOTSUPPLY"))
+                met_qty = _safe_float(row.get("METINDDMD"))
+
+                for grain in grains:
+                    label = labels[grain]
+                    ds_bucket = demand_supply_by_grain[grain].setdefault(label, {"demand_qty": 0.0, "supply_qty": 0.0})
+                    ds_bucket["demand_qty"] += demand_qty
+                    ds_bucket["supply_qty"] += supply_qty
+
+                    fr_bucket = fill_rate_by_grain[grain].setdefault(label, {"demand_qty": 0.0, "met_qty": 0.0})
+                    fr_bucket["demand_qty"] += demand_qty
+                    fr_bucket["met_qty"] += met_qty
+
+        if resproj_file:
+            for row in _safe_rows(resproj_file):
+                if not _matches_context(row, resolved_week, resolved_scenario):
+                    continue
+                if site and (row.get("LOC") or "").strip() != site:
+                    continue
+
+                labels = _bucket_labels(_parse_date(row.get("STARTDATE")))
+                pct_used = _safe_float(row.get("PCTUSED"))
+                avail_cap = _safe_float(row.get("AVAILCAP"))
+                total_load = _safe_float(row.get("MPTOTLOAD"))
+
+                for grain in grains:
+                    label = labels[grain]
+                    cap_bucket = capacity_by_grain[grain].setdefault(
+                        label,
+                        {
+                            "pct_used_sum": 0.0,
+                            "pct_used_count": 0.0,
+                            "avail_cap": 0.0,
+                            "total_load": 0.0,
+                        },
+                    )
+                    cap_bucket["pct_used_sum"] += pct_used
+                    cap_bucket["pct_used_count"] += 1.0
+                    cap_bucket["avail_cap"] += avail_cap
+                    cap_bucket["total_load"] += total_load
+
+        if inddmdview_file:
+            for row in _safe_rows(inddmdview_file):
+                if not _matches_context(row, resolved_week, resolved_scenario):
+                    continue
+                if site and (row.get("LOC") or "").strip() != site:
+                    continue
+
+                labels = _bucket_labels(_parse_date(row.get("NEEDDATE")))
+                demand_qty = _safe_float(row.get("QTY"))
+                sched_qty = _safe_float(row.get("SCHEDQTY"))
+
+                if sched_qty <= 0:
+                    bucket = "UnMet"
+                elif sched_qty + 1e-9 >= demand_qty:
+                    bucket = "Met"
+                else:
+                    bucket = "Partially Met"
+
+                overall_counts[bucket] += 1
+                overall_qty[bucket] += demand_qty
+
+                for grain in grains:
+                    label = labels[grain]
+                    split_bucket = demand_split_by_grain[grain].setdefault(
+                        label,
+                        {
+                            "met_count": 0,
+                            "partial_count": 0,
+                            "unmet_count": 0,
+                            "demand_qty": 0.0,
+                            "scheduled_qty": 0.0,
+                        },
+                    )
+                    if bucket == "Met":
+                        split_bucket["met_count"] += 1
+                    elif bucket == "Partially Met":
+                        split_bucket["partial_count"] += 1
+                    else:
+                        split_bucket["unmet_count"] += 1
+                    split_bucket["demand_qty"] += demand_qty
+                    split_bucket["scheduled_qty"] += sched_qty
+
+                    fr_sched_bucket = fill_rate_sched_by_grain[grain].setdefault(label, {"demand_qty": 0.0, "met_qty": 0.0})
+                    fr_sched_bucket["demand_qty"] += demand_qty
+                    fr_sched_bucket["met_qty"] += min(sched_qty, demand_qty)
+
+        met_qty_from_sku = sum(item["met_qty"] for item in fill_rate_by_grain["workweek"].values())
+        demand_qty_from_sched = sum(item["demand_qty"] for item in fill_rate_sched_by_grain["workweek"].values())
+        fill_rate_source = fill_rate_by_grain
+        fill_rate_source_name = "METINDDMD"
+        if met_qty_from_sku <= 0 and demand_qty_from_sched > 0:
+            fill_rate_source = fill_rate_sched_by_grain
+            fill_rate_source_name = "SCHEDQTY/QTY fallback"
+
+        demand_supply_trend = {grain: [] for grain in grains}
+        for grain in grains:
+            for key in _sort_bucket_keys(grain, list(demand_supply_by_grain[grain].keys())):
+                demand_qty = demand_supply_by_grain[grain][key]["demand_qty"]
+                supply_qty = demand_supply_by_grain[grain][key]["supply_qty"]
+                demand_supply_trend[grain].append(
+                    {
+                        "bucket": key,
+                        "demand_qty": round(demand_qty, 3),
+                        "supply_qty": round(supply_qty, 3),
+                        "gap_qty": round(supply_qty - demand_qty, 3),
+                    }
+                )
+
+        fill_rate_trend = {grain: [] for grain in grains}
+        for grain in grains:
+            for key in _sort_bucket_keys(grain, list(fill_rate_source[grain].keys())):
+                demand_qty = fill_rate_source[grain][key]["demand_qty"]
+                met_qty = fill_rate_source[grain][key]["met_qty"]
+                fill_rate_pct = (met_qty / demand_qty * 100.0) if demand_qty > 0 else 0.0
+                fill_rate_trend[grain].append(
+                    {
+                        "bucket": key,
+                        "demand_qty": round(demand_qty, 3),
+                        "met_qty": round(met_qty, 3),
+                        "fill_rate_pct": round(fill_rate_pct, 2),
+                    }
+                )
+
+        capacity_utilization_trend = {grain: [] for grain in grains}
+        for grain in grains:
+            for key in _sort_bucket_keys(grain, list(capacity_by_grain[grain].keys())):
+                bucket = capacity_by_grain[grain][key]
+                avg_pct = (bucket["pct_used_sum"] / bucket["pct_used_count"]) if bucket["pct_used_count"] > 0 else 0.0
+                derived_pct = (bucket["total_load"] / bucket["avail_cap"] * 100.0) if bucket["avail_cap"] > 0 else 0.0
+                capacity_utilization_trend[grain].append(
+                    {
+                        "bucket": key,
+                        "avg_pct_used": round(avg_pct, 2),
+                        "derived_utilization_pct": round(derived_pct, 2),
+                        "available_capacity": round(bucket["avail_cap"], 3),
+                        "total_load": round(bucket["total_load"], 3),
+                    }
+                )
+
+        demand_status_split = {grain: [] for grain in grains}
+        for grain in grains:
+            for key in _sort_bucket_keys(grain, list(demand_split_by_grain[grain].keys())):
+                split = demand_split_by_grain[grain][key]
+                demand_status_split[grain].append(
+                    {
+                        "bucket": key,
+                        "met_count": int(split["met_count"]),
+                        "partial_count": int(split["partial_count"]),
+                        "unmet_count": int(split["unmet_count"]),
+                        "total_count": int(split["met_count"] + split["partial_count"] + split["unmet_count"]),
+                        "demand_qty": round(split["demand_qty"], 3),
+                        "scheduled_qty": round(split["scheduled_qty"], 3),
+                    }
+                )
+
+        total_demand = sum(item["demand_qty"] for item in fill_rate_source["workweek"].values())
+        total_met = sum(item["met_qty"] for item in fill_rate_source["workweek"].values())
+        overall_fill_rate = (total_met / total_demand * 100.0) if total_demand > 0 else 0.0
+
+        return {
+            "Trend Analysis": {
+                "Demand vs Supply": demand_supply_trend,
+                "Fill Rate": fill_rate_trend,
+                "Capacity Utilization": capacity_utilization_trend,
+                "Demand Met vs UnMet vs Partially Met": {
+                    "by_grain": demand_status_split,
+                    "counts": overall_counts,
+                    "demand_qty": {k: round(v, 3) for k, v in overall_qty.items()},
+                },
+            },
+            "KPI Summary": {
+                "overall_fill_rate_pct": round(overall_fill_rate, 2),
+                "total_demand_qty": round(total_demand, 3),
+                "total_met_qty": round(total_met, 3),
+                "total_records_in_met_status_split": int(sum(overall_counts.values())),
+                "fill_rate_source": fill_rate_source_name,
+            },
+        }
+
+    data_gaps = []
+    if not skuproj_file:
+        data_gaps.append("Missing by_if_snop_out_skuprojstatic file for demand/supply and fill-rate trends.")
+    if not resproj_file:
+        data_gaps.append("Missing by_if_snop_out_resprojstatic file for capacity utilization trend.")
+    if not inddmdview_file:
+        data_gaps.append("Missing by_if_snop_out_inddmdview file for demand met/unmet split.")
+    if not calpattern_file:
+        data_gaps.append("Missing if_snop_calpattern file for Workweek calendar mapping. Fallback buckets are used.")
+
+    compare_requested = bool((base_scenario_id or "").strip() or (compare_scenario_id or "").strip())
+
+    if compare_requested:
+        cmp_context = _resolve_compare_context(base_dir, week_id, base_scenario_id, compare_scenario_id)
+        resolved_week = cmp_context["week_id"]
+        base_sc = cmp_context["base_scenario_id"]
+        cmp_sc = cmp_context["compare_scenario_id"]
+        if not base_sc or not cmp_sc:
+            data_gaps.append("Scenario compare mode requires at least one resolvable SIMULATION_NAME.")
+
+        base_metrics = _collect_for_context(resolved_week, base_sc)
+        cmp_metrics = _collect_for_context(resolved_week, cmp_sc)
+
+        base_kpi = base_metrics["KPI Summary"]
+        cmp_kpi = cmp_metrics["KPI Summary"]
+
+        split_order = ["Met", "Partially Met", "UnMet"]
+        base_split = base_metrics["Trend Analysis"]["Demand Met vs UnMet vs Partially Met"]["counts"]
+        cmp_split = cmp_metrics["Trend Analysis"]["Demand Met vs UnMet vs Partially Met"]["counts"]
+
+        demand_delta = {grain: [] for grain in grains}
+        for grain in grains:
+            base_rows = {row["bucket"]: row for row in base_metrics["Trend Analysis"]["Demand vs Supply"].get(grain, [])}
+            cmp_rows = {row["bucket"]: row for row in cmp_metrics["Trend Analysis"]["Demand vs Supply"].get(grain, [])}
+            keys = _sort_bucket_keys(grain, list(set(base_rows.keys()) | set(cmp_rows.keys())))
+            for key in keys:
+                b = base_rows.get(key, {"demand_qty": 0.0, "supply_qty": 0.0})
+                c = cmp_rows.get(key, {"demand_qty": 0.0, "supply_qty": 0.0})
+                demand_delta[grain].append(
+                    {
+                        "bucket": key,
+                        "demand_qty_delta": round(c["demand_qty"] - b["demand_qty"], 3),
+                        "supply_qty_delta": round(c["supply_qty"] - b["supply_qty"], 3),
+                        "gap_qty_delta": round((c["supply_qty"] - c["demand_qty"]) - (b["supply_qty"] - b["demand_qty"]), 3),
+                    }
+                )
+
+        demand_status_delta = {grain: [] for grain in grains}
+        for grain in grains:
+            base_rows = {
+                row["bucket"]: row
+                for row in base_metrics["Trend Analysis"]["Demand Met vs UnMet vs Partially Met"]["by_grain"].get(grain, [])
+            }
+            cmp_rows = {
+                row["bucket"]: row
+                for row in cmp_metrics["Trend Analysis"]["Demand Met vs UnMet vs Partially Met"]["by_grain"].get(grain, [])
+            }
+            keys = _sort_bucket_keys(grain, list(set(base_rows.keys()) | set(cmp_rows.keys())))
+            for key in keys:
+                b = base_rows.get(key, {"met_count": 0, "partial_count": 0, "unmet_count": 0, "total_count": 0})
+                c = cmp_rows.get(key, {"met_count": 0, "partial_count": 0, "unmet_count": 0, "total_count": 0})
+                demand_status_delta[grain].append(
+                    {
+                        "bucket": key,
+                        "met_delta": int(c["met_count"] - b["met_count"]),
+                        "partial_delta": int(c["partial_count"] - b["partial_count"]),
+                        "unmet_delta": int(c["unmet_count"] - b["unmet_count"]),
+                        "total_delta": int(c["total_count"] - b["total_count"]),
+                    }
+                )
+
+        return {
+            "Insights Mode": "Scenario Compare",
+            "Comparison Scope": {
+                "week_id": resolved_week,
+                "base_scenario_id": base_sc,
+                "compare_scenario_id": cmp_sc,
+                "week_column": "CAPTURE_WK",
+                "scenario_column": "SIMULATION_NAME",
+                "scope": scope,
+                "context_resolution": cmp_context,
+            },
+            "Base Scenario Insights": base_metrics,
+            "Compare Scenario Insights": cmp_metrics,
+            "Scenario Delta": {
+                "KPI Summary Delta (compare - base)": {
+                    "overall_fill_rate_pct_delta": round(cmp_kpi["overall_fill_rate_pct"] - base_kpi["overall_fill_rate_pct"], 2),
+                    "total_demand_qty_delta": round(cmp_kpi["total_demand_qty"] - base_kpi["total_demand_qty"], 3),
+                    "total_met_qty_delta": round(cmp_kpi["total_met_qty"] - base_kpi["total_met_qty"], 3),
+                    "met_status_record_count_delta": int(cmp_kpi["total_records_in_met_status_split"] - base_kpi["total_records_in_met_status_split"]),
+                },
+                "Demand/Supply Delta by Date": demand_delta,
+                "Demand Status Count Delta": {
+                    key: int(cmp_split.get(key, 0) - base_split.get(key, 0))
+                    for key in split_order
+                },
+                "Demand Status Count Delta by Grain": demand_status_delta,
+            },
+            "Confidence and Data Gaps": {
+                "confidence": "Medium" if not data_gaps else "Low-Medium",
+                "data_gaps": data_gaps,
+            },
+        }
+
+    context = _resolve_context(base_dir, week_id, scenario_id)
+    resolved_week = context["week_id"]
+    resolved_scenario = context["scenario_id"]
+    if not resolved_scenario:
+        data_gaps.append("No SIMULATION_NAME found in output data.")
+
+    single_metrics = _collect_for_context(resolved_week, resolved_scenario)
+    return {
+        "Insights Mode": "Single Scenario",
+        "Insights Scope": {
+            "week_id": resolved_week,
+            "scenario_id": resolved_scenario,
+            "week_column": "CAPTURE_WK",
+            "scenario_column": "SIMULATION_NAME",
+            "scope": scope,
+            "context_resolution": context,
+        },
+        "Trend Analysis": single_metrics["Trend Analysis"],
+        "KPI Summary": single_metrics["KPI Summary"],
+        "Confidence and Data Gaps": {
+            "confidence": "Medium" if not data_gaps else "Low-Medium",
+            "data_gaps": data_gaps,
+        },
+    }
+
+
+def _short_table_name(file_name: str) -> str:
+    name = (file_name or "").strip()
+    if not name:
+        return ""
+    if name.lower().endswith(".csv"):
+        name = name[:-4]
+    return re.sub(r"-\d{14}$", "", name)
+
+
+def _chat_table_catalog(base_dir: Path) -> List[Dict]:
+    inventory = dataset_inventory(base_dir)
+    catalog: List[Dict] = []
+    for family, key in [("input", "input_files"), ("output", "output_files")]:
+        for file_info in inventory.get(key, []):
+            full_name = file_info.get("file") or ""
+            table_name = _short_table_name(full_name)
+            catalog.append(
+                {
+                    "family": family,
+                    "file": full_name,
+                    "table": table_name,
+                    "rows": file_info.get("rows", 0),
+                    "columns": file_info.get("columns", []),
+                }
+            )
+    return catalog
+
+
+def _match_tables_for_question(question: str, table_catalog: List[Dict], max_tables: int = 10) -> List[Dict]:
+    q = (question or "").lower()
+    tokens = set(re.findall(r"[a-z_][a-z0-9_]{2,}", q))
+
+    scored: List[Tuple[int, Dict]] = []
+    for table in table_catalog:
+        table_name = (table.get("table") or "").lower()
+        cols = [str(c).lower() for c in table.get("columns", [])]
+        score = 0
+        if table_name and table_name in q:
+            score += 8
+        for token in tokens:
+            if token in table_name:
+                score += 3
+            if any(token == col or token in col for col in cols):
+                score += 1
+        if score > 0:
+            scored.append((score, table))
+
+    ranked = [item for _score, item in sorted(scored, key=lambda x: (x[0], x[1].get("rows", 0)), reverse=True)]
+    return ranked[:max_tables]
+
+
+def _related_linkages(matched_tables: List[Dict]) -> List[Dict]:
+    names = {(item.get("table") or "").lower() for item in matched_tables}
+    if not names:
+        return BY_ESP_DOMAIN_KNOWLEDGE["linkages"][:4]
+
+    related = []
+    for linkage in BY_ESP_DOMAIN_KNOWLEDGE["linkages"]:
+        frm = (linkage.get("from") or "").lower()
+        to = (linkage.get("to") or "").lower()
+        if any(name and (name in frm or name in to) for name in names):
+            related.append(linkage)
+    return related[:6]
+
+
+def _build_chat_grounding(base_dir: Path, question: str, context: Dict, scope: Dict) -> Dict:
+    table_catalog = _chat_table_catalog(base_dir)
+    matched = _match_tables_for_question(question, table_catalog)
+
+    guided_tables = []
+    table_guidance = BY_ESP_DOMAIN_KNOWLEDGE["table_guidance"]
+    for item in matched:
+        table_name = item.get("table") or ""
+        guided_tables.append(
+            {
+                "table": table_name,
+                "family": item.get("family"),
+                "rows": item.get("rows"),
+                "columns": item.get("columns", [])[:25],
+                "definition": table_guidance.get(table_name, "Definition not mapped yet. Use columns and linkage context."),
+            }
+        )
+
+    if not guided_tables:
+        defaults = [
+            "if_snop_sku",
+            "if_snop_billofmaterials",
+            "by_if_snop_out_inddmdview",
+            "by_if_snop_out_inddmdlink",
+            "by_if_snop_out_skuprojstatic",
+        ]
+        quick_lookup = {item.get("table"): item for item in table_catalog}
+        for table_name in defaults:
+            item = quick_lookup.get(table_name, {})
+            guided_tables.append(
+                {
+                    "table": table_name,
+                    "family": item.get("family"),
+                    "rows": item.get("rows"),
+                    "columns": item.get("columns", [])[:25],
+                    "definition": table_guidance.get(table_name, "Definition not mapped yet. Use columns and linkage context."),
+                }
+            )
+
+    return {
+        "context_resolution": context,
+        "scope": scope,
+        "solver_knowledge": BY_ESP_DOMAIN_KNOWLEDGE["solver"],
+        "domain_framework": BY_ESP_DOMAIN_FRAMEWORK,
+        "matched_tables": guided_tables,
+        "key_linkages": _related_linkages(guided_tables),
+    }
+
+
+def _extract_requested_table_name(question: str) -> Optional[str]:
+    q = (question or "").strip()
+    if not q:
+        return None
+
+    patterns = [
+        r"(?:explain|describe|define|show)\s+(?:table\s+)?([a-zA-Z0-9_]+)",
+        r"table\s+([a-zA-Z0-9_]+)",
+        r"for\s+table\s+([a-zA-Z0-9_]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q, flags=re.IGNORECASE)
+        if match:
+            return (match.group(1) or "").strip().lower()
+    return None
+
+
+def _run_table_explain_workflow(base_dir: Path, question: str) -> Dict:
+    requested = _extract_requested_table_name(question)
+    table_catalog = _chat_table_catalog(base_dir)
+
+    if not requested:
+        return {
+            "workflow": "Table Explain",
+            "clarification": {
+                "question": "Which table do you want me to explain?",
+                "examples": [
+                    "Explain table by_if_snop_out_inddmdview",
+                    "Describe if_snop_sku columns and linkage",
+                ],
+            },
+        }
+
+    normalized_requested = requested.replace(".csv", "")
+    matches = []
+    for item in table_catalog:
+        table_name = (item.get("table") or "").lower()
+        file_name = (item.get("file") or "").lower()
+        if (
+            table_name == normalized_requested
+            or table_name.endswith(normalized_requested)
+            or normalized_requested in table_name
+            or normalized_requested in file_name
+        ):
+            matches.append(item)
+
+    if not matches:
+        suggestions = sorted({item.get("table") for item in table_catalog if item.get("table")})[:12]
+        return {
+            "workflow": "Table Explain",
+            "clarification": {
+                "question": f"I could not find table '{normalized_requested}'. Can you confirm the exact table name?",
+                "suggestions": suggestions,
+            },
+        }
+
+    top = sorted(matches, key=lambda item: item.get("rows", 0), reverse=True)[0]
+    table_name = top.get("table") or normalized_requested
+    guidance = BY_ESP_DOMAIN_KNOWLEDGE["table_guidance"].get(table_name, "Definition not mapped yet. Use columns and linkage context.")
+    linkages = []
+    for linkage in BY_ESP_DOMAIN_KNOWLEDGE["linkages"]:
+        frm = (linkage.get("from") or "").lower()
+        to = (linkage.get("to") or "").lower()
+        if table_name.lower() in frm or table_name.lower() in to:
+            linkages.append(linkage)
+
+    return {
+        "workflow": "Table Explain",
+        "result": {
+            "table": table_name,
+            "family": top.get("family"),
+            "file": top.get("file"),
+            "row_count": top.get("rows"),
+            "definition": guidance,
+            "columns": top.get("columns", []),
+            "linkages": linkages[:8],
+        },
+        "note": "Table explanation is grounded on local snapshot schema and configured BY ESP linkage guidance.",
+    }
+
+
+def _run_item_demand_supply_workflow(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    item_id: str,
+    scope: Dict,
+) -> Dict:
+    root = run_root_cause(base_dir, week_id, scenario_id, item_id, scope)
+    summary = root.get("Demand and Supply Summary", {})
+    linkage = root.get("Lineage and Linkage Findings", {})
+    planned = root.get("Planned Supply Evidence", {})
+    constraints = root.get("Constraint and Exception Analysis", {})
+    gaps = (root.get("Hypotheses and Missing Evidence") or {}).get("missing_evidence", [])
+
+    return {
+        "workflow": "Item Demand Supply",
+        "result": {
+            "Item": item_id,
+            "Explainability Scope": root.get("Explainability Scope", {}),
+            "Demand vs Supply Stats": {
+                "demand_qty_total": summary.get("demand_qty_total"),
+                "scheduled_qty_total": summary.get("scheduled_qty_total"),
+                "unmet_qty": summary.get("unmet_qty"),
+                "meet_status": summary.get("meet_status"),
+                "on_time_scheduled_qty": summary.get("on_time_scheduled_qty"),
+                "late_scheduled_qty": summary.get("late_scheduled_qty"),
+                "demand_rows": summary.get("demand_rows"),
+            },
+            "Supply Evidence": {
+                "plan_arrival_qty": planned.get("plan_arrival_qty"),
+                "plan_order_qty": planned.get("plan_order_qty"),
+                "plan_purchase_qty": planned.get("plan_purchase_qty"),
+                "pegged_supply_qty": linkage.get("pegged_supply_qty"),
+                "pegged_demand_qty": linkage.get("pegged_demand_qty"),
+                "inddmdlink_rows": linkage.get("inddmdlink_rows"),
+            },
+            "Constraint Signals": {
+                "sku_exception_rows_for_item": constraints.get("sku_exception_rows_for_item"),
+                "capacity_exception_rows": constraints.get("capacity_exception_rows"),
+                "capacity_overutil_qty": constraints.get("capacity_overutil_qty"),
+                "higher_priority_competing_qty": constraints.get("higher_priority_competing_qty"),
+            },
+            "Data Gaps": gaps,
+            "Reference": {
+                "Root Cause Detail": root,
+            },
+        },
+        "note": "Demand vs supply response is item-specific and grounded in by_if_snop_out_* evidence.",
+    }
+
+
+def _suggest_followups(workflow: str, question: str) -> List[str]:
+    wf = (workflow or "").strip().lower()
+    if wf == "domain focus - fulfillment":
+        return [
+            "Show OTIF and fill-rate trend for latest 12 workweeks",
+            "Which buckets have highest unmet demand and backlog risk?",
+            "Drill down fulfillment domain for a specific item",
+            "What are the strongest service-level gaps by scenario?",
+        ]
+    if wf == "domain focus - generation":
+        return [
+            "Show capacity utilization spikes and likely bottlenecks",
+            "Break down lead-time variability drivers",
+            "Explain generation-domain constraints for a specific item",
+            "Which weeks show calendar/policy stress signals?",
+        ]
+    if wf == "domain focus - data hygiene":
+        return [
+            "List top master-data defects by planning impact",
+            "Show parameter-gap checks for safety stock/MOQ/lot size",
+            "Which fixes should be prioritized first?",
+            "Re-run hygiene checks for a specific week/scenario",
+        ]
+    if wf == "table explain":
+        return [
+            "Show referential integrity checks for this table",
+            "Which output tables link directly to this table?",
+            "What are the business definitions of the top 10 columns?",
+            "How is this table used in root-cause explainability?",
+        ]
+    if wf == "validation gate":
+        return [
+            "List the top critical data quality issues",
+            "Show orphan key counts by table",
+            "Suggest fix order by planning impact",
+            "Re-run validation with specific week and scenario",
+        ]
+    if wf == "scenario comparison":
+        return [
+            "Compare unmet demand and capacity utilization deltas",
+            "Rank top KPI drivers between the two scenarios",
+            "Show data gaps affecting confidence",
+            "What identifiers are required for strict scenario comparison?",
+        ]
+    if wf == "analytics insights":
+        return [
+            "Explain fill rate trend for latest workweeks",
+            "Which buckets have highest unmet demand?",
+            "Drill into capacity utilization by month",
+            "How does demand vs supply gap evolve by quarter?",
+        ]
+    if wf == "root cause":
+        return [
+            "Show primary constraint chain from demand to resource",
+            "Which input tables best explain this unmet demand?",
+            "Quantify the biggest limiting factor",
+            "What checks should I run to validate this root cause?",
+        ]
+    if wf == "root cause clarification":
+        return [
+            "Use ITEM 100000000008 and proceed",
+            "Use the latest week and scenario",
+            "Set plant to 1004 and continue",
+            "Show candidate demand items from current context",
+        ]
+    if wf == "item demand supply":
+        return [
+            "Share more details about demand vs supply for the item",
+            "Show pegged supply and top supply methods",
+            "Break down planned arrival, order, and purchase quantities",
+            "What are the top constraints causing unmet quantity?",
+        ]
+    return [
+        "Explain BY ESP LP optimization objective and constraints",
+        "Explain table by_if_snop_out_inddmdview",
+        "Show linkage from demand to plan orders and resources",
+        "Run validation for latest week and scenario",
+    ]
+
+
+def _strip_quotes(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) >= 2 and ((text[0] == '"' and text[-1] == '"') or (text[0] == "'" and text[-1] == "'")):
+        return text[1:-1]
+    return text
+
+
+def _parse_chat_command(question: str) -> Dict:
+    text = (question or "").strip()
+    if not text.startswith("/"):
+        return {
+            "is_command": False,
+            "command": None,
+            "args": {},
+            "positional": [],
+            "raw": text,
+            "free_text": text,
+        }
+
+    match = re.match(r"^/([a-zA-Z0-9_-]+)\s*(.*)$", text)
+    if not match:
+        return {
+            "is_command": False,
+            "command": None,
+            "args": {},
+            "positional": [],
+            "raw": text,
+            "free_text": text,
+        }
+
+    command = (match.group(1) or "").strip().lower()
+    remainder = (match.group(2) or "").strip()
+    tokens = re.findall(r'"[^"]*"|\S+', remainder)
+
+    args: Dict[str, str] = {}
+    positional: List[str] = []
+    for token in tokens:
+        cleaned = _strip_quotes(token)
+        if "=" in cleaned:
+            key, value = cleaned.split("=", 1)
+            key = key.strip().lower()
+            value = _strip_quotes(value.strip())
+            if key:
+                args[key] = value
+        elif cleaned:
+            positional.append(cleaned)
+
+    return {
+        "is_command": True,
+        "command": command,
+        "args": args,
+        "positional": positional,
+        "raw": text,
+        "free_text": " ".join(positional).strip(),
+    }
+
+
+def _get_arg(args: Dict[str, str], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = (args.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _build_command_scope(base_scope: Dict, args: Dict[str, str]) -> Dict:
+    scope = dict(base_scope or {})
+    site = _get_arg(args, "plant", "site", "loc", "location")
+    if site:
+        scope["site"] = site
+    return scope
+
+
+def _execute_chat_command(base_dir: Path, parsed: Dict, week_id: Optional[str], scenario_id: Optional[str], scope: Dict) -> Dict:
+    cmd = parsed.get("command")
+    args = parsed.get("args") or {}
+    positional = parsed.get("positional") or []
+
+    cmd_week = _get_arg(args, "week", "wk", "capture_wk") or week_id
+    cmd_scenario = _get_arg(args, "scenario", "sc", "simulation", "simulation_name") or scenario_id
+    cmd_scope = _build_command_scope(scope, args)
+
+    if cmd in {"help", "commands"}:
+        return {
+            "workflow": "Command Help",
+            "result": {
+                "commands": {
+                    "/help": "Show command guide.",
+                    "/summary [week=] [scenario=]": "Dataset and context summary.",
+                    "/validate [week=] [scenario=] [plant=]": "Run validation workflow.",
+                    "/compare [week=] [base=] [compare=] [plant=]": "Run scenario comparison.",
+                    "/insights [week=] [scenario=] [plant=]": "Run analytics insights.",
+                    "/rootcause item=<ITEM> [week=] [scenario=] [plant=]": "Run demand-supply root cause.",
+                    "/table <table_name>": "Explain table definition, columns, and linkages.",
+                },
+                "examples": [
+                    "/table by_if_snop_out_inddmdview",
+                    "/validate week=202547 scenario=CONSTRAINED",
+                    "/compare week=202547 base=BASE compare=CONSTRAINED",
+                    "/rootcause item=100000000008 week=202547 scenario=CONSTRAINED plant=1004",
+                ],
+            },
+            "note": "Use commands for power-mode execution while keeping natural language available.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"summary", "datasets"}:
+        inv = dataset_inventory(base_dir)
+        largest_input = max(inv["input_files"], key=lambda x: x["rows"], default=None)
+        largest_output = max(inv["output_files"], key=lambda x: x["rows"], default=None)
+        return {
+            "workflow": "Dataset Summary",
+            "result": {
+                "input_file_count": inv["input_file_count"],
+                "output_file_count": inv["output_file_count"],
+                "largest_input_file": largest_input["file"] if largest_input else None,
+                "largest_output_file": largest_output["file"] if largest_output else None,
+            },
+            "note": "Summary reflects current snapshot files.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"validate", "validation"}:
+        return {
+            "workflow": "Validation Gate",
+            "result": run_validation(
+                base_dir,
+                cmd_week,
+                cmd_scenario,
+                cmd_scope,
+                ["master_data", "bom", "parameters", "output_sanity"],
+            ),
+            "note": "Validation command executed.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"compare", "scenario"}:
+        base_sc = _get_arg(args, "base", "base_scenario")
+        cmp_sc = _get_arg(args, "compare", "cmp", "compare_scenario")
+        return {
+            "workflow": "Scenario Comparison",
+            "result": run_scenario_compare(
+                base_dir,
+                cmd_week,
+                base_sc,
+                cmp_sc,
+                cmd_scope,
+                ["unmet_demand", "capacity_utilization", "lateness"],
+            ),
+            "note": "Scenario comparison command executed.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"insights", "analytics"}:
+        return {
+            "workflow": "Analytics Insights",
+            "result": run_insights(base_dir, cmd_week, cmd_scenario, None, None, cmd_scope),
+            "note": "Insights command executed.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"rootcause", "root", "rca"}:
+        demand_item = _get_arg(args, "item", "demand", "demand_item")
+        if not demand_item and positional:
+            demand_item = positional[0]
+        if not demand_item:
+            return {
+                "workflow": "Root Cause Clarification",
+                "clarification": {
+                    "question": "Provide demand item. Example: /rootcause item=100000000008 week=202547 scenario=CONSTRAINED",
+                },
+                "context_override": {
+                    "week_id": cmd_week,
+                    "scenario_id": cmd_scenario,
+                    "scope": cmd_scope,
+                },
+            }
+        return {
+            "workflow": "Root Cause",
+            "result": run_root_cause(base_dir, cmd_week, cmd_scenario, demand_item, cmd_scope),
+            "note": "Root-cause command executed.",
+            "context_override": {
+                "week_id": cmd_week,
+                "scenario_id": cmd_scenario,
+                "scope": cmd_scope,
+            },
+        }
+
+    if cmd in {"table", "schema"}:
+        table_query = " ".join(positional).strip() or _get_arg(args, "name", "table") or ""
+        query = f"explain table {table_query}".strip()
+        result = _run_table_explain_workflow(base_dir, query)
+        result["context_override"] = {
+            "week_id": cmd_week,
+            "scenario_id": cmd_scenario,
+            "scope": cmd_scope,
+        }
+        return result
+
+    return {
+        "workflow": "Command Clarification",
+        "clarification": {
+            "question": f"Unknown command '/{cmd}'. Use /help to list supported commands.",
+        },
+        "context_override": {
+            "week_id": cmd_week,
+            "scenario_id": cmd_scenario,
+            "scope": cmd_scope,
+        },
+    }
+
+
+def _run_chat_workflow_if_needed(
+    base_dir: Path,
+    question: str,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    scope: Dict,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict:
+    ql = (question or "").lower()
+    item_resolution = _resolve_chat_item(question, history)
+    resolved_item = item_resolution.get("selected_item")
+    domain_candidates = _detect_domain_focus_candidates(question)
+    domain_focus = domain_candidates[0] if domain_candidates else None
+
+    table_explain_terms = ["explain table", "describe table", "table definition", "table schema", "column definition"]
+    summary_terms = ["summary", "dataset", "datasets", "files", "inventory", "what is available", "table list", "tables are available", "available tables"]
+    validation_terms = ["validate", "validation", "quality", "readiness", "referential", "integrity", "orphan"]
+    compare_terms = ["compare", "difference", "delta", "scenario compare", "versus", "vs"]
+    insights_terms = ["insight", "fill rate", "capacity", "trend", "demand supply", "analytics"]
+    root_terms = [
+        "root cause",
+        "why unmet",
+        "unmet",
+        "why demand",
+        "why did demand",
+        "demand miss",
+        "missed demand",
+        "explain demand",
+        "lineage",
+        "genealogy",
+        "pegging",
+    ]
+    item_demand_supply_terms = [
+        "demand and supply",
+        "demand vs supply",
+        "supply situation",
+        "demand situation",
+        "share more details about demand vs supply",
+    ]
+
+    if any(term in ql for term in item_demand_supply_terms) and resolved_item:
+        result = _run_item_demand_supply_workflow(base_dir, week_id, scenario_id, resolved_item, scope)
+        result["parsing_evidence"] = item_resolution
+        return result
+
+    if any(term in ql for term in item_demand_supply_terms) and not resolved_item:
+        return {
+            "workflow": "Root Cause Clarification",
+            "clarification": {
+                "question": "Which ITEM should I use for demand vs supply details?",
+                "examples": [
+                    "Use ITEM 100000000004",
+                    "Use ITEM 100000000004 for plant 1004",
+                ],
+            },
+            "parsing_evidence": item_resolution,
+        }
+
+    if len(domain_candidates) > 1:
+        return {
+            "workflow": "Domain Focus Clarification",
+            "clarification": {
+                "question": "Your question spans multiple domains. Which lens should I prioritize?",
+                "options": domain_candidates,
+                "guidance": {
+                    "Fulfillment": "Use when the core question is service impact: unmet demand, backorders, OTIF/fill-rate.",
+                    "Generation": "Use when the core question is plan creation constraints: capacity, lead-time, calendar, policy.",
+                    "Data Hygiene": "Use when the core question is data quality/input defects driving bad outputs.",
+                },
+            },
+            "parsing_evidence": {
+                "domain_candidates": domain_candidates,
+                "item_resolution": item_resolution,
+            },
+        }
+
+    if domain_focus:
+        return _run_domain_focus_workflow(base_dir, domain_focus, week_id, scenario_id, scope)
+
+    if any(term in ql for term in table_explain_terms):
+        return _run_table_explain_workflow(base_dir, question)
+
+    if any(term in ql for term in validation_terms):
+        return {
+            "workflow": "Validation Gate",
+            "result": run_validation(
+                base_dir,
+                week_id,
+                scenario_id,
+                scope,
+                ["master_data", "bom", "parameters", "output_sanity"],
+            ),
+            "note": "Validation is focused on data quality, referential integrity, and planning readiness.",
+        }
+
+    if any(term in ql for term in summary_terms):
+        inv = dataset_inventory(base_dir)
+        largest_input = max(inv["input_files"], key=lambda x: x["rows"], default=None)
+        largest_output = max(inv["output_files"], key=lambda x: x["rows"], default=None)
+        return {
+            "workflow": "Dataset Summary",
+            "result": {
+                "input_file_count": inv["input_file_count"],
+                "output_file_count": inv["output_file_count"],
+                "largest_input_file": largest_input["file"] if largest_input else None,
+                "largest_output_file": largest_output["file"] if largest_output else None,
+            },
+            "note": "Summary reflects current by_input and by_output snapshots.",
+        }
+
+    if any(term in ql for term in compare_terms):
+        return {
+            "workflow": "Scenario Comparison",
+            "result": run_scenario_compare(
+                base_dir,
+                week_id,
+                None,
+                None,
+                scope,
+                ["unmet_demand", "capacity_utilization", "lateness"],
+            ),
+            "note": "Provide exact base and compare SIMULATION_NAME values for strict scenario deltas.",
+        }
+
+    if any(term in ql for term in insights_terms):
+        return {
+            "workflow": "Analytics Insights",
+            "result": run_insights(base_dir, week_id, scenario_id, None, None, scope),
+            "note": "Insights show trend behavior by workweek, month, and quarter.",
+        }
+
+    if any(term in ql for term in root_terms):
+        context = _resolve_context(base_dir, week_id, scenario_id)
+        demand_item = resolved_item
+
+        if not demand_item:
+            return {
+                "workflow": "Root Cause Clarification",
+                "clarification": {
+                    "question": "Which demand ITEM should I evaluate?",
+                    "expected_fields": ["ITEM", "Week ID (optional)", "Scenario ID (optional)", "Plant (optional)"],
+                    "examples": [
+                        "Check demand ITEM 100000000008",
+                        "Why is ITEM 100000000008 unmet for week 202547 and scenario CONSTRAINED?",
+                    ],
+                },
+                "parsing_evidence": item_resolution,
+                "context": context,
+            }
+
+        demand_evidence = _item_demand_evidence(base_dir, context["week_id"], context["scenario_id"], demand_item, scope)
+        source = item_resolution.get("source") or "question"
+        confidence = (item_resolution.get("question_inference") or {}).get("confidence")
+        if (source == "question" and confidence != "high") or (source == "question" and not demand_evidence["is_demand_item"]):
+            return {
+                "workflow": "Root Cause Clarification",
+                "clarification": {
+                    "question": f"I found ITEM {demand_item}. Should I treat it as the demand item for this context?",
+                    "examples": [
+                        f"Yes, use {demand_item}",
+                        f"Use {demand_item} for plant 1004",
+                        "Use demand ITEM 100000000004 instead",
+                    ],
+                },
+                "parsing_evidence": item_resolution,
+                "demand_evidence": demand_evidence,
+                "context": context,
+            }
+
+        return {
+            "workflow": "Root Cause",
+            "result": run_root_cause(base_dir, week_id, scenario_id, demand_item, scope),
+            "note": "Root-cause analysis uses demand/supply/resource linkage evidence.",
+            "parsing_evidence": item_resolution,
+        }
+
+    return {"workflow": "Conversational Copilot"}
+
+
+def _build_item_demand_supply_reply(workflow_result: Dict) -> Optional[str]:
+    stats = (workflow_result or {}).get("Demand vs Supply Stats") or {}
+    item = (workflow_result or {}).get("Item")
+    demand = stats.get("demand_qty_total")
+    scheduled = stats.get("scheduled_qty_total")
+    unmet = stats.get("unmet_qty")
+    status = stats.get("meet_status")
+
+    if item is None and all(value is None for value in [demand, scheduled, unmet, status]):
+        return None
+
+    return (
+        f"Item {item}: Demand={demand}, Scheduled Supply={scheduled}, Unmet={unmet}, Status={status}. "
+        "I also included pegged supply, planned supply breakdown, and constraint signals in details."
+    )
+
+
 def run_chat_assistant(
     base_dir: Path,
     question: str,
@@ -1422,152 +3260,166 @@ def run_chat_assistant(
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict:
     q = (question or "").strip()
-    ql = q.lower()
-
     if not q:
         return {
             "Assistant Reply": "Please type your question so I can help.",
-            "Suggested Next Step": "Try: 'Validate data for week 2026-W30 scenario S2'.",
+            "Suggested Next Step": "Try: 'Explain linkage between inddmdview and inddmdlink for the latest scenario'.",
         }
 
-    summary_terms = ["summary", "dataset", "datasets", "files", "inventory", "what is available"]
-    validation_terms = ["validate", "validation", "quality", "check data", "readiness", "bom", "master data"]
-    compare_terms = ["compare", "difference", "delta", "scenario compare", "versus", "vs"]
-    root_terms = ["root cause", "why unmet", "unmet", "why demand", "explain demand", "lineage", "genealogy", "met", "meet", "fulfilled"]
-    item_inference = _infer_demand_item_from_question(q)
-    demand_item = item_inference["selected_item"]
+    parsed_command = _parse_chat_command(q)
+    workflow_payload: Dict
+    effective_week = week_id
+    effective_scenario = scenario_id
+    effective_scope = dict(scope or {})
+
+    if parsed_command.get("is_command"):
+        workflow_payload = _execute_chat_command(base_dir, parsed_command, week_id, scenario_id, effective_scope)
+        override = workflow_payload.get("context_override") or {}
+        effective_week = override.get("week_id", effective_week)
+        effective_scenario = override.get("scenario_id", effective_scenario)
+        effective_scope = override.get("scope", effective_scope)
+    else:
+        workflow_payload = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
+
+    context = _resolve_context(base_dir, effective_week, effective_scenario)
     history_window = (history or [])[-10:]
+    grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
 
-    if any(term in ql for term in validation_terms):
-        result = run_validation(
+    rag_evidence = None
+    rag_status = None
+    try:
+        rag_status = ensure_rag_index(base_dir, refresh_hours=24)
+        item_hint = _resolve_chat_item(q, history).get("selected_item")
+        rag_evidence = query_rag(
             base_dir,
-            week_id,
-            scenario_id,
-            scope,
-            ["master_data", "bom", "parameters", "output_sanity"],
+            q,
+            top_k=6,
+            week_id=context.get("week_id"),
+            scenario_id=context.get("scenario_id"),
+            site=(effective_scope or {}).get("site"),
+            item_id=item_hint,
         )
-        fallback = {
-            "Assistant Reply": "I ran validation based on your question.",
-            "Workflow": "Validation Gate",
-            "Result": result,
-        }
-        return (_summarize_with_ollama(q, "Validation Gate", result, llm_model=llm_model) if llm_enabled else None) or fallback
+    except Exception as exc:
+        rag_status = {"status": "error", "detail": str(exc)}
 
-    if any(term in ql for term in summary_terms):
-        inv = dataset_inventory(base_dir)
-        largest_input = max(inv["input_files"], key=lambda x: x["rows"], default=None)
-        largest_output = max(inv["output_files"], key=lambda x: x["rows"], default=None)
-        result = {
-            "input_file_count": inv["input_file_count"],
-            "output_file_count": inv["output_file_count"],
-            "largest_input_file": largest_input["file"] if largest_input else None,
-            "largest_output_file": largest_output["file"] if largest_output else None,
-        }
-        fallback = {
-            "Assistant Reply": "I checked your available planning datasets.",
-            "Findings": result,
-            "Suggested Next Step": "Ask me to run validation, compare scenarios, or explain root cause.",
-        }
-        return (_summarize_with_ollama(q, "Dataset Summary", result, llm_model=llm_model) if llm_enabled else None) or fallback
-
-    if any(term in ql for term in compare_terms):
-        result = run_scenario_compare(
-            base_dir,
-            week_id,
-            None,
-            None,
-            scope,
-            ["unmet_demand", "capacity_utilization", "lateness"],
-        )
-        note = "For exact compare output, provide base and compare scenario IDs."
-        fallback = {
-            "Assistant Reply": "I ran scenario comparison in summary mode.",
-            "Workflow": "Scenario Comparison",
-            "Result": result,
-            "Note": note,
-        }
-        return (_summarize_with_ollama(q, "Scenario Comparison", result, note, llm_model=llm_model) if llm_enabled else None) or fallback
-
-    if any(term in ql for term in root_terms):
-        context = _resolve_context(base_dir, week_id, scenario_id)
-        resolved_week = context["week_id"]
-        resolved_scenario = context["scenario_id"]
-
-        if not demand_item:
-            return {
-                "Assistant Reply": "I can check demand status, but I need the demand ITEM first.",
-                "Workflow": "Root Cause Clarification",
-                "Clarification Needed": {
-                    "question": "Which ITEM should I evaluate as demand?",
-                    "expected_fields": ["ITEM", "Week ID = CAPTURE_WK (optional)", "Scenario ID = SIMULATION_NAME (optional)", "Plant (optional)"],
-                    "examples": [
-                        "Check if the demand for ITEM 100000000008 was met",
-                        "Was demand item 100000000008 met for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED?",
-                    ],
-                },
-                "Parsing Evidence": item_inference,
-                "Context Resolution": context,
-            }
-
-        demand_evidence = _item_demand_evidence(base_dir, resolved_week, resolved_scenario, demand_item, scope)
-        if item_inference["confidence"] != "high" or not demand_evidence["is_demand_item"]:
-            return {
-                "Assistant Reply": f"I found ITEM {demand_item}, but I cannot confirm yet that it is the demand item for the resolved context.",
-                "Workflow": "Root Cause Clarification",
-                "Clarification Needed": {
-                    "question": "Do you want me to treat this ITEM as a demand item, or do you want to provide a different demand ITEM/plant/week/scenario?",
-                    "examples": [
-                        f"Yes, treat {demand_item} as the demand item",
-                        f"Use ITEM {demand_item} for plant 1004",
-                        "Use demand ITEM 100000000004 for CAPTURE_WK 202547 and SIMULATION_NAME CONSTRAINED",
-                    ],
-                },
-                "Parsing Evidence": item_inference,
-                "Demand Evidence Check": demand_evidence,
-                "Context Resolution": context,
-            }
-
-        result = run_root_cause(base_dir, week_id, scenario_id, demand_item, scope)
-        note = "For best accuracy, include week and scenario IDs along with ITEM."
-        fallback = {
-            "Assistant Reply": "I ran root-cause analysis based on your question.",
-            "Workflow": "Root Cause",
-            "Result": result,
-            "Note": note,
-            "Parsing Evidence": item_inference,
-        }
-        return (_summarize_with_ollama(q, "Root Cause", result, note, llm_model=llm_model) if llm_enabled else None) or fallback
-
-    fallback = {
-        "Assistant Reply": "I can help with data summary, validation, scenario comparison, and root-cause checks.",
-        "Your Question": q,
-        "Suggested Prompts": [
-            "Show dataset summary",
-            "Validate data for week 2026-W30 scenario S2",
-            "Compare scenarios S1 and S2 for week 2026-W30",
-            "Why is demand unmet for scenario S2?",
-        ],
+    grounding["rag"] = {
+        "status": rag_status,
+        "hits": (rag_evidence or {}).get("hits", []),
     }
 
+    workflow_name = workflow_payload.get("workflow") or "Conversational Copilot"
+    workflow_result = workflow_payload.get("result")
+    workflow_note = workflow_payload.get("note")
+    clarification = workflow_payload.get("clarification")
+    follow_ups = _suggest_followups(workflow_name, q)
+
     if llm_enabled:
-        conversational_system = (
-            "You are IFSP Planning Copilot for Intel Foundry. "
-            "Behave like a helpful chat assistant: understand follow-up questions, answer concisely, and ask clarifying questions when needed. "
-            "Stay in IFSP/BY ESP planning scope. "
-            "If a request needs specific identifiers (item, week, scenario, plant), ask for them clearly."
+        system_prompt = (
+            "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
+            "Act like an industry-standard chat assistant similar to ChatGPT/Copilot/Claude: natural, precise, and actionable. "
+            "You are deeply knowledgeable in BY ESP LP optimization, data model, input/output table structure, linkage, and referential integrity. "
+            "Apply domain framing when relevant: Fulfillment Domain, Generation Domain, and Data Hygiene Domain. "
+            "Use bounded context language explicitly when matched: Context A (Demand Fulfillment), Context B (Supply Generation), Context C (Data Hygiene). "
+            "When applicable, align answer framing to the planner user story and expected key inputs/outputs for that context. "
+            "Map findings to the requested domain and keep business + data evidence connected. "
+            "Ground all dataset-specific claims on provided evidence. Do not fabricate numbers or table contents. "
+            "When evidence is partial, separate confirmed findings from hypotheses. "
+            "If identifiers are missing (week, scenario, item, plant), ask concise clarifying questions."
         )
+
+        prompt_sections = [
+            f"User question: {q}",
+            f"Command parse: {json.dumps(parsed_command, ensure_ascii=True)}",
+            f"Resolved context: {json.dumps(context, ensure_ascii=True)}",
+            f"Requested scope: {json.dumps(effective_scope, ensure_ascii=True)}",
+            f"Domain grounding: {json.dumps(grounding, ensure_ascii=True)}",
+            f"Workflow classification: {workflow_name}",
+        ]
+        if rag_evidence is not None:
+            prompt_sections.append(f"RAG evidence: {json.dumps(rag_evidence, ensure_ascii=True)}")
+
+        if workflow_result is not None:
+            prompt_sections.append(f"Workflow grounded result JSON: {json.dumps(workflow_result, ensure_ascii=True)}")
+        if workflow_note:
+            prompt_sections.append(f"Workflow note: {workflow_note}")
+        if clarification:
+            prompt_sections.append(f"Clarification payload: {json.dumps(clarification, ensure_ascii=True)}")
+
+        prompt_sections.append(
+            "Respond with a planner-friendly answer containing: "
+            "1) Direct answer, 2) Bounded context and user story alignment (if applicable), "
+            "3) Key evidence (tables/columns/linkages), 4) Confidence and gaps, 5) Next best question. "
+            "If workflow result exists, use it first; otherwise answer using domain grounding."
+        )
+        if workflow_name.lower() == "item demand supply":
+            prompt_sections.append(
+                "For Item Demand Supply workflow, explicitly report these stats: "
+                "demand_qty_total, scheduled_qty_total, unmet_qty, and meet_status."
+            )
+
         conversational_reply = _ollama_chat_with_model(
-            q,
-            conversational_system,
+            "\n\n".join(prompt_sections),
+            system_prompt,
             llm_model,
             history=history_window,
         )
         if conversational_reply:
-            return {
+            judge_review = _judge_llm_output(
+                q,
+                conversational_reply,
+                workflow_name,
+                context,
+                workflow_result if isinstance(workflow_result, dict) else None,
+                llm_model,
+            )
+            response = {
                 "Assistant Reply": conversational_reply,
-                "Workflow": "Conversational Chat",
+                "Workflow": workflow_name,
+                "Context Resolution": context,
+                "Suggested Follow-ups": follow_ups,
                 "LLM Provider": "Ollama",
                 "LLM Model": (llm_model or OLLAMA_MODEL).strip() or OLLAMA_MODEL,
             }
+            if workflow_result is not None:
+                response["Grounded Result"] = workflow_result
+            if clarification is not None:
+                response["Clarification Needed"] = clarification
+            if rag_evidence is not None:
+                response["RAG Evidence"] = rag_evidence
+            if judge_review is not None:
+                response["LLM Judge Review"] = judge_review
+            return response
 
+    fallback_reply = "I can answer BY ESP planning questions in natural language and run validation, compare, root-cause, and insights workflows."
+    if workflow_name.lower() == "item demand supply" and isinstance(workflow_result, dict):
+        fallback_reply = _build_item_demand_supply_reply(workflow_result) or fallback_reply
+
+    fallback = {
+        "Assistant Reply": fallback_reply,
+        "Workflow": workflow_name,
+        "Context Resolution": context,
+        "Suggested Follow-ups": follow_ups,
+        "Knowledge Areas": [
+            "BY ESP LP optimization mechanics",
+            "Input/output table definitions and columns",
+            "Table linkage and referential integrity",
+            "Planner-focused explainability",
+        ],
+        "Suggested Prompts": [
+            "Explain LP optimization objective and constraints in BY ESP",
+            "How are inddmdview, inddmdlink, and planorder linked?",
+            "Check referential integrity between SKU and item/location/customer masters",
+            "Why is demand unmet for ITEM 100000000008?",
+            "/help",
+            "/table by_if_snop_out_inddmdview",
+        ],
+    }
+    if workflow_result is not None:
+        fallback["Grounded Result"] = workflow_result
+    if rag_evidence is not None:
+        fallback["RAG Evidence"] = rag_evidence
+    if clarification is not None:
+        fallback["Clarification Needed"] = clarification
+    if workflow_note:
+        fallback["Note"] = workflow_note
     return fallback

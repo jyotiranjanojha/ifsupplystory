@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -25,10 +26,32 @@ class CompareRequest(BaseModel):
     metrics: List[str] = Field(default_factory=lambda: ["unmet_demand", "capacity_utilization", "lateness"])
 
 
+class DemandEntityType(str, Enum):
+    item = "item"
+    order = "order"
+    forecast = "forecast"
+    transfer = "transfer"
+    dependent = "dependent"
+
+
+class DemandEntity(BaseModel):
+    type: DemandEntityType
+    id: str
+
+
 class RootCauseRequest(BaseModel):
     week_id: Optional[str] = None
     scenario_id: Optional[str] = None
     demand_id: Optional[str] = None
+    demand_entity: Optional[DemandEntity] = None
+    scope: Scope = Field(default_factory=Scope)
+
+
+class InsightsRequest(BaseModel):
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    base_scenario_id: Optional[str] = None
+    compare_scenario_id: Optional[str] = None
     scope: Scope = Field(default_factory=Scope)
 
 
@@ -52,3 +75,17 @@ class ChatRequest(BaseModel):
     llm_model: Optional[str] = None
     history: List[ChatMessage] = Field(default_factory=list)
     scope: Scope = Field(default_factory=Scope)
+
+
+class RagQueryRequest(BaseModel):
+    question: str
+    top_k: int = 8
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    item_id: Optional[str] = None
+    scope: Scope = Field(default_factory=Scope)
+
+
+class RagReindexRequest(BaseModel):
+    force: bool = True
+    max_rows_per_file: int = 2000

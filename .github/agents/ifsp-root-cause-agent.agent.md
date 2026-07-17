@@ -44,9 +44,10 @@ Your job is to build an evidence-grounded narrative for why demand was met, part
 4. Demand and Supply Summary
 5. Lineage and Linkage Findings
 6. Constraint and Exception Analysis
-7. Confirmed Findings
-8. Root Causes
-9. Cause Attribution (BY ESP Expert View)
-10. Hypotheses and Missing Evidence
-11. Confidence Level
-12. Recommended Next Checks
+7. Domain Focus Assessment (Fulfillment, Generation, Data Hygiene)
+8. Confirmed Findings
+9. Root Causes
+10. Cause Attribution (BY ESP Expert View)
+11. Hypotheses and Missing Evidence
+12. Confidence Level
+13. Recommended Next Checks
