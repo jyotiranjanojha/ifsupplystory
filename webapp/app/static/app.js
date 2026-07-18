@@ -1280,7 +1280,7 @@ async function loadLlmModels() {
     const res = await fetch('/api/llm/models');
     const data = await res.json();
     const models = Array.isArray(data.models) ? data.models : [];
-    const defaultModel = data.default_model || 'llama3.2:latest';
+    const defaultModel = data.default_model || 'gemma3:latest';
 
     chatLlmModel.innerHTML = '';
 

@@ -60,6 +60,7 @@ def rag_reindex(req: RagReindexRequest):
         BASE_DIR,
         force=req.force,
         max_rows_per_file=req.max_rows_per_file,
+        max_docs=req.max_docs,
     )
 
 

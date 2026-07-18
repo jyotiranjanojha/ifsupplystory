@@ -112,3 +112,4 @@ class RagQueryRequest(BaseModel):
 class RagReindexRequest(BaseModel):
     force: bool = True
     max_rows_per_file: int = 2000
+    max_docs: int = 250000

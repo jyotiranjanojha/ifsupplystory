@@ -16,10 +16,10 @@ from .rag import ensure_rag_index, query_rag
 INPUT_FOLDER = "by_input"
 OUTPUT_FOLDER = "by_output"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
 OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.1:8b")
 OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2:latest")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "gemma3:latest")
 
 
 class DemandEntityType(str, Enum):
@@ -2034,7 +2034,7 @@ def run_vision_query(
     """
     Analyze a planning screenshot, chart, or visual report using the Ollama vision model.
     image_base64: base64-encoded image string (with or without data URI prefix).
-    Requires a vision-capable model (e.g. llama3.2-vision:latest).
+    Requires a vision-capable model (e.g. gemma3:latest).
     Set OLLAMA_VISION_MODEL in .env.
     """
     context = _resolve_context(base_dir, week_id, scenario_id)
@@ -2055,14 +2055,12 @@ def run_vision_query(
             f"Vision analysis could not be completed. "
             f"Ensure a vision-capable model is available: "
             f"OLLAMA_VISION_MODEL={OLLAMA_VISION_MODEL}. "
-            "Try: ollama pull llama3.2-vision:latest"
+            "Try: ollama pull gemma3:latest"
         ),
         "LLM Provider": "Ollama",
         "Vision Model": OLLAMA_VISION_MODEL,
         "Note": (
             f"Uses {OLLAMA_VISION_MODEL}. "
-            "For best results pull a dedicated vision model: ollama pull llama3.2-vision:latest "
-            "then set OLLAMA_VISION_MODEL=llama3.2-vision:latest in .env"
         ),
     }
 

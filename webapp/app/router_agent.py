@@ -28,7 +28,7 @@ from typing_extensions import TypedDict
 
 # ── Ollama LLM router config (used only as low-confidence fallback) ──────────
 _OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-_OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+_OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
 _ROUTER_CONFIDENCE_THRESHOLD = float(os.getenv("OLLAMA_ROUTER_CONFIDENCE_THRESHOLD", "0.3"))
 
 # ---------------------------------------------------------------------------

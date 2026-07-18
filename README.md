@@ -55,7 +55,7 @@ This system turns those questions into **evidence-based analyses** grounded in p
 
 ### 📊 **Text-to-SQL Engineer**
 - Generates safe SQL from natural-language questions
-- Uses **deepseek-coder** for SQL generation, **llama3.2** for chat
+- Uses **deepseek-coder** for SQL generation, **gemma3:latest** for chat
 - DuckDB backend with schema-based table scoring
 - Security guards: blocks INSERT/UPDATE/DELETE, auto-appends LIMIT 200
 
@@ -66,7 +66,7 @@ This system turns those questions into **evidence-based analyses** grounded in p
 
 ### 👁️ **Vision Query**
 - Accepts base64 images of charts, dashboards, diagrams
-- **llama3.2 with vision capability** for image analysis
+- **gemma3:latest** for image analysis
 - Extracts facts, anomalies, and insights from visual data
 
 ### 💬 **Chat Assistant**
@@ -101,9 +101,9 @@ graph TB
 
     subgraph Agents["🤖 Agent Workflows"]
         SQL["Text-to-SQL<br/>deepseek-coder"]
-        Chat["Chat Orchestrator<br/>llama3.2"]
-        Log["Log Reader<br/>llama3.2"]
-        Vision["Vision Query<br/>llama3.2-vision"]
+        Chat["Chat Orchestrator<br/>gemma3:latest"]
+        Log["Log Reader<br/>gemma3:latest"]
+        Vision["Vision Query<br/>gemma3:latest"]
         BOM["BOM Drill-Down<br/>LangGraph"]
         Domain["Domain Analysis<br/>Root Cause, Validation"]
     end
@@ -120,7 +120,7 @@ graph TB
 
     subgraph LLM["🧠 LLM Infrastructure"]
         Ollama["Ollama Local Service<br/>http://127.0.0.1:11434<br/>180s Timeout"]
-        Model1["llama3.2:latest<br/>Chat, Summarization<br/>Vision Queries"]
+        Model1["gemma3:latest<br/>Chat, Summarization<br/>Vision Queries"]
         Model2["deepseek-coder:latest<br/>SQL Generation"]
     end
 
@@ -256,7 +256,7 @@ sequenceDiagram
         DB->>W: Results
     else Log Reader
         D->>W: run_log_reader()
-        W->>O: Log analysis (llama3.2)
+        W->>O: Log analysis (gemma3:latest)
         O->>W: Structured insights
     else Vision Query
         D->>W: run_vision_query()
@@ -299,7 +299,7 @@ sequenceDiagram
 
 | Model | Purpose | Context |
 |-------|---------|---------|
-| `llama3.2:latest` | Chat, summarization, vision | Default; 8B params |
+| `gemma3:latest` | Chat, summarization, vision | Default |
 | `deepseek-coder:latest` | SQL generation | Specialized code model |
 
 ### Python Dependencies
@@ -477,7 +477,7 @@ SnowflakeBackend
 
 **LLM Integration:**
 - Timeout: **180 seconds** (accommodates CPU-based inference)
-- Models: llama3.2 (chat), deepseek-coder (SQL), llama3.2-vision (images)
+- Models: gemma3:latest (chat, vision), deepseek-coder (SQL)
 
 ### 5️⃣ **main.py** — FastAPI Routes
 
@@ -526,9 +526,9 @@ SnowflakeBackend
 ```bash
 # Ollama LLM Infrastructure
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=llama3.2:latest                 # Default chat/judge model
+OLLAMA_MODEL=gemma3:latest                   # Default chat/judge model
 OLLAMA_SQL_MODEL=deepseek-coder:latest       # SQL generation
-OLLAMA_VISION_MODEL=llama3.2:latest          # Vision queries
+OLLAMA_VISION_MODEL=gemma3:latest            # Vision queries
 OLLAMA_TIMEOUT_SECONDS=180                   # Increased for CPU inference
 
 # Router Configuration
@@ -538,6 +538,7 @@ OLLAMA_FORMAT_SCHEMA_ENABLED=true            # Use JSON schema for intent enum
 # SQL Backend
 SQL_BACKEND=duckdb                           # Options: duckdb, snowflake
 DUCKDB_IN_MEMORY=true                        # Use in-memory for speed
+SQL_USE_PANDAS=false                         # Optional: register CSV tables via pandas DataFrames
 
 # Snowflake (when applicable)
 SNOWFLAKE_ACCOUNT=<your-account>             # Snowflake account ID
@@ -546,6 +547,7 @@ SNOWFLAKE_PASSWORD=<your-password>           # Password (or use SSO)
 SNOWFLAKE_WAREHOUSE=<warehouse>              # Compute cluster
 SNOWFLAKE_DATABASE=PLANNING                  # DB name
 SNOWFLAKE_SCHEMA=PUBLIC                      # Schema name
+SNOWFLAKE_USE_PANDAS=false                   # Optional: execute Snowflake SQL via pandas.read_sql
 
 # Application
 APP_DEBUG=false                              # Debug mode (verbose logging)
@@ -612,7 +614,7 @@ _load_dotenv(Path('.env'))
 
 5. **Download Ollama models (optional):**
    ```bash
-   ollama pull llama3.2:latest
+   ollama pull gemma3:latest
    ollama pull deepseek-coder:latest
    ```
 
@@ -755,7 +757,7 @@ export OLLAMA_BASE_URL=http://ollama-server:11434
 ### Issue: "Model not found"
 
 ```bash
-ollama pull llama3.2:latest
+ollama pull gemma3:latest
 ollama pull deepseek-coder:latest
 ollama list  # Verify installed models
 ```
@@ -1070,7 +1072,7 @@ For issues, questions, or feedback:
 | **Router Agent** | ? Complete | LangGraph + Ollama JSON schema, 15 intents, fallback |
 | **Text-to-SQL** | ? Complete | deepseek-coder, DuckDB backend, security guards |
 | **Log Reader** | ? Complete | Ollama analysis with BY ESP domain knowledge |
-| **Vision Query** | ? Complete | llama3.2-vision support, base64 images |
+| **Vision Query** | ? Complete | gemma3:latest support, base64 images |
 | **Test Suite** | ? 10/10 PASS | All workflows validated, 300s timeout |
 | **Documentation** | ? Complete | Architecture diagrams, API docs, setup guides |
 | **Judge LLM** | ? llama3.1:8b | Updated for improved response validation |

@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+def _as_bool(value: str, default: bool = False) -> bool:
+    """Parse common truthy strings from environment values."""
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Security guard
 # ---------------------------------------------------------------------------
@@ -91,16 +98,42 @@ class DuckDBBackend(SqlBackend):
         import duckdb  # type: ignore
         self._conn = duckdb.connect(":memory:")
         self._registered: List[str] = []
+        self._use_pandas = _as_bool(os.getenv("SQL_USE_PANDAS", "false"), default=False)
+
+    def _register_from_dataframe(self, safe_name: str, file_path: str) -> None:
+        """Register a CSV as a DataFrame-backed DuckDB view."""
+        try:
+            import pandas as pd  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "SQL_USE_PANDAS=true requires pandas. "
+                "Install it with: pip install pandas"
+            ) from exc
+
+        frame = pd.read_csv(
+            file_path,
+            sep="|",
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+            on_bad_lines="skip",
+        )
+        temp_name = f"_df_{safe_name}"
+        self._conn.register(temp_name, frame)
+        self._conn.execute(f"CREATE OR REPLACE VIEW {safe_name} AS SELECT * FROM {temp_name}")
 
     def register_tables(self, table_file_map: Dict[str, str]) -> None:
         for table_name, file_path in table_file_map.items():
             safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", table_name)
-            posix_path = Path(file_path).as_posix()
-            self._conn.execute(
-                f"CREATE OR REPLACE VIEW {safe_name} AS "
-                f"SELECT * FROM read_csv('{posix_path}', "
-                f"delim='|', header=true, ignore_errors=true)"
-            )
+            if self._use_pandas:
+                self._register_from_dataframe(safe_name, file_path)
+            else:
+                posix_path = Path(file_path).as_posix()
+                self._conn.execute(
+                    f"CREATE OR REPLACE VIEW {safe_name} AS "
+                    f"SELECT * FROM read_csv('{posix_path}', "
+                    f"delim='|', header=true, ignore_errors=true)"
+                )
             self._registered.append(safe_name)
 
     def execute(self, sql: str, max_rows: int = 200) -> List[Dict[str, Any]]:
@@ -177,6 +210,7 @@ class SnowflakeBackend(SqlBackend):
             role=os.environ.get("SNOWFLAKE_ROLE", ""),
         )
         self._cursor = self._conn.cursor()
+        self._use_pandas = _as_bool(os.getenv("SNOWFLAKE_USE_PANDAS", "false"), default=False)
 
     def register_tables(self, table_file_map: Dict[str, str]) -> None:
         # Tables already live in Snowflake — no registration needed.
@@ -184,6 +218,17 @@ class SnowflakeBackend(SqlBackend):
 
     def execute(self, sql: str, max_rows: int = 200) -> List[Dict[str, Any]]:
         wrapped = _wrap_with_limit(sql, max_rows)
+        if self._use_pandas:
+            try:
+                import pandas as pd  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "SNOWFLAKE_USE_PANDAS=true requires pandas. "
+                    "Install it with: pip install pandas"
+                ) from exc
+            frame = pd.read_sql(wrapped, self._conn)
+            return frame.to_dict(orient="records")
+
         self._cursor.execute(wrapped)
         cols = [desc[0] for desc in (self._cursor.description or [])]
         rows = self._cursor.fetchall()

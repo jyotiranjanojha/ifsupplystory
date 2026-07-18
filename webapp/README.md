@@ -30,7 +30,15 @@ Default settings:
 
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=llama3.2:latest
+OLLAMA_MODEL=gemma3:latest
+
+# Optional DataFrame-backed SQL execution
+# When true, DuckDB registers CSVs through pandas DataFrames.
+SQL_USE_PANDAS=false
+
+# Optional Snowflake DataFrame execution path
+# Applies only when SQL_BACKEND=snowflake.
+SNOWFLAKE_USE_PANDAS=false
 ```
 
 The application keeps BY workflow logic grounded in local data and uses Ollama only to summarize the computed result.
