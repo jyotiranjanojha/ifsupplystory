@@ -49,29 +49,29 @@ This system turns those questions into **evidence-based analyses** grounded in p
 <a id="sec-key-capabilities"></a>
 ## Key Capabilities
 
-### ðŸ¤– **Multi-Intent Router with LLM**
+### Multi-Intent Router with LLM
 - Classifies planner questions into 15 domain intents
 - Uses **Ollama with JSON schema format constraints** for structured intent classification
 - Fallback to keyword matching (confidence threshold: 0.3)
 - Surfaces intent, confidence, and LLM fallback flag in responses
 
-### ðŸ“Š **Text-to-SQL Engineer**
+### Text-to-SQL Engineer
 - Generates safe SQL from natural-language questions
 - Uses **deepseek-coder** for SQL generation, **gemma3:latest** for chat
 - DuckDB backend with schema-based table scoring
 - Security guards: blocks INSERT/UPDATE/DELETE, auto-appends LIMIT 200
 
-### ðŸ“ **Log Reader**
+### Log Reader
 - Analyzes planning logs and event streams
 - Structured extraction of BY ESP events and insights
 - System prompt tuned for supply planning domain
 
-### ðŸ‘ï¸ **Vision Query**
+### Vision Query
 - Accepts base64 images of charts, dashboards, diagrams
 - **gemma3:latest** for image analysis
 - Extracts facts, anomalies, and insights from visual data
 
-### ðŸ’¬ **Chat Assistant**
+### Chat Assistant
 - Multi-turn conversation with history tracking
 - Supports 10+ command patterns: /validate, /compare, /insights, /rootcause
 - Ollama integration for natural-language response enhancement
@@ -85,20 +85,20 @@ This system turns those questions into **evidence-based analyses** grounded in p
 
 ```mermaid
 graph TB
-    subgraph Client["ðŸ–¥ï¸ Client Layer"]
+    subgraph Client["Client Layer"]
         UI["Web UI<br/>HTML5 + CSS + JS"]
     end
 
-    subgraph API["ðŸŒ API Layer"]
+    subgraph API["API Layer"]
         FastAPI["FastAPI Routes<br/>/api/chat<br/>/api/sql-query<br/>/api/vision-query"]
     end
 
-    subgraph Router["ðŸŽ¯ Intelligent Router"]
+    subgraph Router["Intelligent Router"]
         Intent["Intent Classifier<br/>LangGraph + Ollama<br/>15 Domain Intents"]
         Slots["Slot Resolution<br/>Entity Extraction"]
     end
 
-    subgraph Agents["ðŸ¤– Agent Workflows"]
+    subgraph Agents["Agent Workflows"]
         SQL["Text-to-SQL<br/>deepseek-coder"]
         Chat["Chat Orchestrator<br/>gemma3:latest"]
         Log["Log Reader<br/>gemma3:latest"]
@@ -107,17 +107,17 @@ graph TB
         Domain["Domain Analysis<br/>Root Cause, Validation"]
     end
 
-    subgraph Data["ðŸ“Š Data Layer"]
+    subgraph Data["Data Layer"]
         Input["by_input/*.csv<br/>Master Data, BOM"]
         Output["by_output/*.csv<br/>Demand, Supply, Orders"]
     end
 
-    subgraph Engine["ðŸ”§ Execution Engine"]
+    subgraph Engine["Execution Engine"]
         DuckDB["DuckDB Backend<br/>In-Memory SQL Execution"]
         Snowflake["Snowflake Backend<br/>Pluggable, Credentials Ready"]
     end
 
-    subgraph LLM["ðŸ§  LLM Infrastructure"]
+    subgraph LLM["LLM Infrastructure"]
         Ollama["Ollama Local Service<br/>http://127.0.0.1:11434<br/>180s Timeout"]
         Model1["gemma3:latest<br/>Chat, Summarization<br/>Vision Queries"]
         Model2["deepseek-coder:latest<br/>SQL Generation"]
@@ -166,13 +166,13 @@ graph LR
     LLM -->|enum constraint| Intent
     Intent -->|confidence score| Dispatcher["Intent Dispatcher<br/>Route to Agent"]
     
-    Dispatcher --> S1["sql_query<br/>â†’ Text-to-SQL"]
-    Dispatcher --> S2["validation<br/>â†’ Validation Gate"]
-    Dispatcher --> S3["compare<br/>â†’ Scenario Comparison"]
-    Dispatcher --> S4["root_cause<br/>â†’ Root Cause Analysis"]
-    Dispatcher --> S5["log_reader<br/>â†’ Log Analysis"]
-    Dispatcher --> S6["vision_query<br/>â†’ Image Analysis"]
-    Dispatcher --> S7["conversational<br/>â†’ Chat"]
+    Dispatcher --> S1["sql_query<br/>-> Text-to-SQL"]
+    Dispatcher --> S2["validation<br/>-> Validation Gate"]
+    Dispatcher --> S3["compare<br/>-> Scenario Comparison"]
+    Dispatcher --> S4["root_cause<br/>-> Root Cause Analysis"]
+    Dispatcher --> S5["log_reader<br/>-> Log Analysis"]
+    Dispatcher --> S6["vision_query<br/>-> Image Analysis"]
+    Dispatcher --> S7["conversational<br/>-> Chat"]
     
     style Q fill:#E3F2FD
     style KWRouter fill:#FFF3E0
@@ -301,6 +301,7 @@ sequenceDiagram
 | Model | Purpose | Context |
 |-------|---------|---------|
 | `gemma3:latest` | Chat, summarization, vision | Default |
+| `llama3.1:8b` | Judge/review pass | Response quality checks |
 | `deepseek-coder:latest` | SQL generation | Specialized code model |
 
 ### Python Dependencies
@@ -334,64 +335,62 @@ requests>=2.31.0
 
 ```
 ifspstory/
-â”œâ”€â”€ ðŸ“„ README.md                          # This file
-â”œâ”€â”€ ðŸ“„ PRD.md                             # Product Requirements Document
-â”œâ”€â”€ ðŸ“„ TEAMS_AGENT_DEPLOYMENT.md          # Deployment guide for Teams agents
-â”œâ”€â”€ ðŸ“„ .env                               # Configuration (Ollama, backends)
-â”œâ”€â”€ ðŸ“„ .gitignore
-â”‚
-â”œâ”€â”€ ðŸ—‚ï¸ by_input/                          # Planning input snapshots
-â”‚   â”œâ”€â”€ if_snop_items-*.csv               # Master items
-â”‚   â”œâ”€â”€ if_snop_sku-*.csv                 # SKU definitions
-â”‚   â”œâ”€â”€ if_snop_locations-*.csv           # Location master
-â”‚   â”œâ”€â”€ if_snop_billofmaterials-*.csv     # BOM
-â”‚   â”œâ”€â”€ if_snop_sourcing-*.csv            # Sourcing rules
-â”‚   â”œâ”€â”€ if_snop_inventory-*.csv           # Current inventory
-â”‚   â”œâ”€â”€ if_snop_customerorder-*.csv       # Customer orders
-â”‚   â”œâ”€â”€ if_snop_calendars-*.csv           # Calendar definitions
-â”‚   â””â”€â”€ ...                               # Additional input files
-â”‚
-â”œâ”€â”€ ðŸ—‚ï¸ by_output/                         # Planning output snapshots
-â”‚   â”œâ”€â”€ by_if_snop_out_planorder-*.csv    # Planned orders
-â”‚   â”œâ”€â”€ by_if_snop_out_inddmdview-*.csv   # Demand view
-â”‚   â”œâ”€â”€ by_if_snop_out_planarriv-*.csv    # Planned arrivals
-â”‚   â”œâ”€â”€ by_if_snop_out_skuexception-*.csv # Exceptions
-â”‚   â””â”€â”€ ...                               # Additional output files
-â”‚
-â”œâ”€â”€ ðŸ“ webapp/                            # FastAPI application
-â”‚   â”œâ”€â”€ ðŸ“„ run.py                         # Entry point (loads .env, starts Uvicorn)
-â”‚   â”œâ”€â”€ ðŸ“„ requirements.txt               # Python dependencies
-â”‚   â”œâ”€â”€ ðŸ³ Dockerfile                     # Container image definition
-â”‚   â”‚
-â”‚   â”œâ”€â”€ ðŸ“ app/                           # Application logic
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ main.py                    # FastAPI routes & endpoints
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ models.py                  # Pydantic request/response models
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ router_agent.py            # LangGraph intent router (NEW)
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ text_to_sql_agent.py       # Text-to-SQL pipeline (NEW)
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ sql_backends.py            # DB abstraction layer (NEW)
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ analyzer.py                # Workflow orchestration
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ langgraph_bom.py           # BOM drill-down analysis
-â”‚   â”‚   â”œâ”€â”€ ðŸ“„ rag.py                     # RAG indexing (optional)
-â”‚   â”‚   â”‚
-â”‚   â”‚   â”œâ”€â”€ ðŸ“ templates/                 # Jinja2 HTML templates
-â”‚   â”‚   â”‚   â””â”€â”€ ðŸ“„ index.html             # Main web interface
-â”‚   â”‚   â”‚
-â”‚   â”‚   â””â”€â”€ ðŸ“ static/                    # Static assets
-â”‚   â”‚       â”œâ”€â”€ ðŸ“„ app.js                 # Frontend logic
-â”‚   â”‚       â”œâ”€â”€ ðŸ“„ styles.css             # Styling
-â”‚   â”‚       â””â”€â”€ ðŸ–¼ï¸ intelfoundrylogo.png
-â”‚   â”‚
-â”‚   â””â”€â”€ ðŸ“„ __init__.py
-â”‚
-â”œâ”€â”€ ðŸ“ .github/                           # GitHub configuration
-â”‚   â””â”€â”€ ðŸ“ agents/                        # Custom agent specs
-â”‚       â”œâ”€â”€ ifsp-planning-copilot.agent.md
-â”‚       â”œâ”€â”€ ifsp-data-agent.agent.md
-â”‚       â”œâ”€â”€ ifsp-validation-agent.agent.md
-â”‚       â”œâ”€â”€ ifsp-root-cause-agent.agent.md
-â”‚       â””â”€â”€ ifsp-scenario-agent.agent.md
-â”‚
-â””â”€â”€ ðŸ“„ _test_chat.py                      # End-to-end test suite (NEW)
+|- README.md                          # This file
+|- PRD.md                             # Product Requirements Document
+|- TEAMS_AGENT_DEPLOYMENT.md          # Deployment guide for Teams agents
+|- .env                               # Configuration (Ollama, backends)
+|- .gitignore
+|
+|- by_input/                          # Planning input snapshots
+|  |- if_snop_items-*.csv             # Master items
+|  |- if_snop_sku-*.csv               # SKU definitions
+|  |- if_snop_locations-*.csv         # Location master
+|  |- if_snop_billofmaterials-*.csv   # BOM
+|  |- if_snop_sourcing-*.csv          # Sourcing rules
+|  |- if_snop_inventory-*.csv         # Current inventory
+|  |- if_snop_customerorder-*.csv     # Customer orders
+|  |- if_snop_calendars-*.csv         # Calendar definitions
+|  `- ...                             # Additional input files
+|
+|- by_output/                         # Planning output snapshots
+|  |- by_if_snop_out_planorder-*.csv  # Planned orders
+|  |- by_if_snop_out_inddmdview-*.csv # Demand view
+|  |- by_if_snop_out_planarriv-*.csv  # Planned arrivals
+|  |- by_if_snop_out_skuexception-*.csv # Exceptions
+|  `- ...                             # Additional output files
+|
+|- webapp/                            # FastAPI application
+|  |- run.py                          # Entry point (loads .env, starts Uvicorn)
+|  |- requirements.txt                # Python dependencies
+|  |- Dockerfile                      # Container image definition
+|  |
+|  |- app/                            # Application logic
+|  |  |- main.py                      # FastAPI routes and endpoints
+|  |  |- models.py                    # Pydantic request/response models
+|  |  |- router_agent.py              # LangGraph intent router
+|  |  |- text_to_sql_agent.py         # Text-to-SQL pipeline
+|  |  |- sql_backends.py              # DB abstraction layer
+|  |  |- analyzer.py                  # Workflow orchestration
+|  |  |- langgraph_bom.py             # BOM drill-down analysis
+|  |  `- rag.py                       # RAG indexing
+|  |
+|  |- templates/
+|  |  `- index.html                   # Main web interface
+|  `- static/
+|     |- app.js                       # Frontend logic
+|     |- styles.css                   # Styling
+|     `- intelfoundrylogo.png         # Logo asset
+|  `- __init__.py
+|
+|- .github/                           # GitHub configuration
+|  `- agents/                         # Custom agent specs
+|     |- ifsp-planning-copilot.agent.md
+|     |- ifsp-data-agent.agent.md
+|     |- ifsp-validation-agent.agent.md
+|     |- ifsp-root-cause-agent.agent.md
+|     `- ifsp-scenario-agent.agent.md
+|
+`- _test_chat.py                      # End-to-end test suite
 ```
 
 ---
@@ -399,32 +398,32 @@ ifspstory/
 <a id="sec-component-modules"></a>
 ## Component Modules
 
-### 1ï¸âƒ£ **router_agent.py** â€” Intent Classification
+### 1. router_agent.py - Intent Classification
 
 **Purpose:** Multi-intent router using LangGraph + Ollama JSON schema format
 
 **Key Features:**
 - 15 domain intents: sql_query, validation, compare, root_cause, log_reader, vision_query, bom_drill, etc.
-- **JSON schema format constraints** for structured enum classification (Ollama â‰¥ 0.3.9)
+- **JSON schema format constraints** for structured enum classification (Ollama >= 0.3.9)
 - Keyword-based confidence scoring with LLM fallback
 - Dynamic enum generation from INTENT_CATALOG
 
 **Main Functions:**
 ```python
-route_question(question: str) â†’ IntentMetadata
-  â”œâ”€ Keyword matching
-  â”œâ”€ LLM router (if low confidence)
-  â””â”€ Returns: intent, confidence, llm_fallback_used, entities, missing_slots
+route_question(question: str) -> IntentMetadata
+  |- Keyword matching
+  |- LLM router (if low confidence)
+  `- Returns: intent, confidence, llm_fallback_used, entities, missing_slots
 ```
 
-### 2ï¸âƒ£ **text_to_sql_agent.py** â€” SQL Generation Pipeline
+### 2. text_to_sql_agent.py - SQL Generation Pipeline
 
 **Purpose:** Convert natural-language questions to safe, executable SQL
 
 **Pipeline:**
 ```
-Question â†’ Table Scorer â†’ Schema Builder â†’ SQL Generator â†’ Security Guard â†’ Execute â†’ Validate
-           (rank CSVs)    (top 6 tables)  (deepseek-coder) (is_safe_sql)  (DuckDB)   (rows)
+Question -> Table Scorer -> Schema Builder -> SQL Generator -> Security Guard -> Execute -> Validate
+           (rank CSVs)      (top 6 tables)    (deepseek-coder)  (is_safe_sql)   (DuckDB)   (rows)
 ```
 
 **Security Features:**
@@ -434,56 +433,56 @@ Question â†’ Table Scorer â†’ Schema Builder â†’ SQL Generator â
 
 **Main Functions:**
 ```python
-run_sql_query(question: str, backend: str = "duckdb") â†’ SqlResponse
-  â”œâ”€ select_tables()      # Score CSV relevance
-  â”œâ”€ generate_sql()       # deepseek-coder + retry
-  â”œâ”€ execute_sql()        # Safe execution
-  â””â”€ validate_result()    # Output sanity checks
+run_sql_query(question: str, backend: str = "duckdb") -> SqlResponse
+  |- select_tables()      # Score CSV relevance
+  |- generate_sql()       # deepseek-coder + retry
+  |- execute_sql()        # Safe execution
+  `- validate_result()    # Output sanity checks
 ```
 
-### 3ï¸âƒ£ **sql_backends.py** â€” Pluggable Database Abstraction
+### 3. sql_backends.py - Pluggable Database Abstraction
 
 **Purpose:** Support multiple SQL backends (DuckDB, Snowflake, future)
 
 **Available Backends:**
 | Backend | Status | Use Case |
 |---------|--------|----------|
-| DuckDB | âœ… Active | Local CSV-to-SQL, in-memory, fast |
-| Snowflake | ðŸŸ¡ Ready | Cloud data, requires credentials |
+| DuckDB | Active | Local CSV-to-SQL, in-memory, fast |
+| Snowflake | Ready | Cloud data, requires credentials |
 
 **Main Classes:**
 ```python
 Backend (abstract)
-  â”œâ”€ register_table(name, path_or_query) â†’ None
-  â””â”€ execute(sql) â†’ DataFrame
+  |- register_table(name, path_or_query) -> None
+  `- execute(sql) -> DataFrame
 
 DuckDBBackend
-  â””â”€ Reads CSV files as in-memory VIEWs
+  `- Reads CSV files as in-memory VIEWs
 
 SnowflakeBackend
-  â””â”€ Connects to Snowflake (env vars ready)
+  `- Connects to Snowflake (env vars ready)
 ```
 
-### 4ï¸âƒ£ **analyzer.py** â€” Workflow Orchestration
+### 4. analyzer.py - Workflow Orchestration
 
 **Purpose:** Dispatch routed intents to specialized workflows
 
 **Workflows:**
-- `run_chat_assistant()` â€” Multi-turn conversation
-- `run_sql_query()` â€” Text-to-SQL pipeline
-- `run_log_reader()` â€” Log analysis with Ollama
-- `run_vision_query()` â€” Image analysis with vision model
-- `run_validation()` â€” Data quality gate
-- `run_bom_drill()` â€” Bill-of-materials analysis
-- `run_root_cause()` â€” Demand supply lineage
+- `run_chat_assistant()` - Multi-turn conversation
+- `run_sql_query()` - Text-to-SQL pipeline
+- `run_log_reader()` - Log analysis with Ollama
+- `run_vision_query()` - Image analysis with vision model
+- `run_validation()` - Data quality gate
+- `run_bom_drill()` - Bill-of-materials analysis
+- `run_root_cause()` - Demand supply lineage
 - Domain-specific: insights, summary, compare, etc.
 
 **LLM Integration:**
 - Timeout: **180 seconds** (accommodates CPU-based inference)
-- Models: gemma3:latest (chat, vision), deepseek-coder (SQL)
+- Models: gemma3:latest (chat, vision), llama3.1:8b (judge), deepseek-coder (SQL)
 
 <a id="sec-api-endpoints"></a>
-### 5ï¸âƒ£ **main.py** â€” FastAPI Routes
+### 5. main.py - FastAPI Routes
 
 **Core Endpoints:**
 
@@ -512,12 +511,12 @@ SnowflakeBackend
 }
 ```
 
-### 6ï¸âƒ£ **langgraph_bom.py** â€” BOM Drill-Down
+### 6. langgraph_bom.py - BOM Drill-Down
 
 **Purpose:** Navigate bill-of-materials relationships using LangGraph
 
 **Workflows:**
-- Explore BOM structure (parent â†’ children)
+- Explore BOM structure (parent -> children)
 - Identify sourcing (make vs. buy)
 - Trace production steps
 
@@ -531,7 +530,9 @@ SnowflakeBackend
 ```bash
 # Ollama LLM Infrastructure
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=gemma3:latest                   # Default chat/judge model
+OLLAMA_MODEL=gemma3:latest                   # Default chat and vision model
+OLLAMA_JUDGE_MODEL=llama3.1:8b              # Judge/review model
+OLLAMA_JUDGE_ENABLED=true                    # Enable judge pass on LLM answers
 OLLAMA_SQL_MODEL=deepseek-coder:latest       # SQL generation
 OLLAMA_VISION_MODEL=gemma3:latest            # Vision queries
 OLLAMA_TIMEOUT_SECONDS=180                   # Increased for CPU inference
@@ -663,16 +664,16 @@ python _test_chat.py
 
 | # | Test | Intent | Expected Workflow | Status |
 |---|------|--------|-------------------|--------|
-| 1 | Health check | N/A | Health status | âœ… |
-| 2 | Dataset summary | `summary` | Dataset Summary | âœ… |
-| 3 | Validation gate | `validation` | Validation Gate | âœ… |
-| 4 | Scenario compare | `compare` | Scenario Comparison | âœ… |
-| 5 | Domain fulfillment | `domain_fulfillment` | Domain Focus | âœ… |
-| 6 | Root cause analysis | `root_cause` | Root Cause | âœ… |
-| 7 | Multi-turn history | `item_demand_supply` | Item Demand Supply | âœ… |
-| 8 | Table explanation | `table_explain` | Table Explain | âœ… |
-| 9 | LLM router fallback | `validation` | Validation Gate | âœ… |
-| 10 | Log reader intent | `log_reader` | Log Reader | âœ… |
+| 1 | Health check | N/A | Health status | PASS |
+| 2 | Dataset summary | `summary` | Dataset Summary | PASS |
+| 3 | Validation gate | `validation` | Validation Gate | PASS |
+| 4 | Scenario compare | `compare` | Scenario Comparison | PASS |
+| 5 | Domain fulfillment | `domain_fulfillment` | Domain Focus | PASS |
+| 6 | Root cause analysis | `root_cause` | Root Cause | PASS |
+| 7 | Multi-turn history | `item_demand_supply` | Item Demand Supply | PASS |
+| 8 | Table explanation | `table_explain` | Table Explain | PASS |
+| 9 | LLM router fallback | `validation` | Validation Gate | PASS |
+| 10 | Log reader intent | `log_reader` | Log Reader | PASS |
 
 **Latest Test Results (2026-07-18):**
 ```
@@ -796,7 +797,7 @@ chmod +r by_input/*.csv
 
 ---
 
-## ðŸ“Š Response Format
+## Response Format
 
 ### Standard Chat Response
 
@@ -832,7 +833,7 @@ chmod +r by_input/*.csv
 
 ---
 
-## ðŸ“ Contributing
+## Contributing
 
 Contributions welcome! Please:
 
@@ -844,13 +845,13 @@ Contributions welcome! Please:
 
 ---
 
-## ðŸ“„ License
+## License
 
-Intel Proprietary â€” Authorized use only within Intel Foundry Services
+Intel Proprietary - Authorized use only within Intel Foundry Services
 
 ---
 
-## ðŸ‘¥ Support
+## Support
 
 For issues, questions, or feedback:
 - Open an issue on GitHub
