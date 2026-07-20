@@ -15,6 +15,7 @@ const chatLlmModel = document.getElementById('chatLlmModel');
 const chatLlmStatus = document.getElementById('chatLlmStatus');
 const chatClearBtn = document.getElementById('chatClearBtn');
 const graphBtn = document.getElementById('graphBtn');
+const valActiveGateBadge = document.getElementById('valActiveGateBadge');
 const menuToggle = document.getElementById('menuToggle');
 const workspaceShell = document.querySelector('.workspace-shell');
 const menuButtons = document.querySelectorAll('.menu-btn');
@@ -35,6 +36,48 @@ const INSIGHTS_GRAIN_LABEL = {
   quarter: 'Quarter',
   month: 'Month',
   workweek: 'Workweek',
+};
+const VALIDATION_TAB_META = {
+  data_quality: {
+    label: 'Data Quality Check',
+    focusAreas: ['data_quality_input'],
+  },
+  bom_traversal: {
+    label: 'BOM Traversal Check',
+    focusAreas: ['bom_traversal'],
+  },
+  production_route: {
+    label: 'Production Route Check',
+    focusAreas: ['production_route'],
+  },
+};
+const VALIDATION_TABS = Object.keys(VALIDATION_TAB_META);
+
+function createValidationTabState() {
+  const tabs = {};
+  VALIDATION_TABS.forEach((tabName) => {
+    tabs[tabName] = {
+      weekId: '',
+      scenarioId: '',
+      itemId: '',
+      data: null,
+      loading: false,
+      error: '',
+      actionMessage: '',
+    };
+  });
+  return tabs;
+}
+
+let validationState = {
+  activeTab: 'data_quality',
+  tabs: createValidationTabState(),
+};
+let authProfile = {
+  authenticated: false,
+  login: null,
+  email: null,
+  source: 'none',
 };
 
 function createInsightsTabState() {
@@ -1179,6 +1222,496 @@ function renderInsights(data) {
   renderInsightsLanding();
 }
 
+function renderValidationTabPanel(tabName, tab) {
+  const meta = VALIDATION_TAB_META[tabName];
+  const isActive = tabName === validationState.activeTab;
+  const isDataQuality = tabName === 'data_quality';
+  const isBomTraversal = tabName === 'bom_traversal';
+  const isProductionRoute = tabName === 'production_route';
+
+  const status = tab.loading
+    ? '<div class="insights-empty">Running validation...</div>'
+    : tab.error
+      ? `<div class="insights-error">${escapeHtml(tab.error)}</div>`
+      : '';
+
+  const authText = authProfile.authenticated
+    ? `Signed in as ${escapeHtml(authProfile.email || authProfile.login || 'authenticated user')}.`
+    : 'Signed-in email not detected from SSO headers. Send as Email requires SSO email headers or backend override.';
+
+  let summary = '';
+  if (tab.data) {
+    const scope = tab.data['Validation Scope'] || {};
+    const verdict = tab.data['Readiness Verdict (Pass, Conditional Pass, Fail)'] || 'Unknown';
+    const issues = tab.data['Issues Found (Critical, High, Medium, Low)'] || {};
+    const checks = tab.data['Checks Executed'] || {};
+    const criticalCount = Array.isArray(issues.Critical) ? issues.Critical.length : 0;
+    const highCount = Array.isArray(issues.High) ? issues.High.length : 0;
+    const mediumCount = Array.isArray(issues.Medium) ? issues.Medium.length : 0;
+    const lowCount = Array.isArray(issues.Low) ? issues.Low.length : 0;
+    const checksCount = Object.keys(checks).length;
+    const bomMap = isBomTraversal ? renderBomTraversalMindMap(tab.data, tabName) : '';
+    const resultDetails = isBomTraversal
+      ? renderBomTraversalDetails(tab.data)
+      : `<section class="insights-card"><h3>${meta.label} Results</h3>${renderObject(tab.data)}</section>`;
+    summary = `
+      <section class="insights-kpi-grid">
+        ${renderKeyValueGrid([
+          ['Gate', meta.label],
+          ['Week ID', scope.week_id || 'Latest'],
+          ['Scenario ID', scope.scenario_id || 'Latest'],
+          ['Verdict', verdict],
+        ])}
+      </section>
+      <section class="insights-kpi-grid">
+        ${renderKeyValueGrid([
+          ['Critical Issues', criticalCount],
+          ['High Issues', highCount],
+          ['Medium Issues', mediumCount],
+          ['Low Issues', lowCount],
+          ['Checks Executed', checksCount],
+        ])}
+      </section>
+      ${bomMap}
+      ${resultDetails}
+    `;
+  }
+
+  const reportActions = isDataQuality || isProductionRoute
+    ? `
+          <button class="btn" type="button" data-val-action="download" data-val-tab="${tabName}">Download as HTML</button>
+          <button class="btn" type="button" data-val-action="email" data-val-tab="${tabName}">Send as Email</button>
+      `
+    : '';
+
+  const actionStatus = tab.actionMessage ? `<div class="analytics-note">${escapeHtml(tab.actionMessage)}</div>` : '';
+
+  return `
+    <section class="insights-subtab-panel ${isActive ? 'active' : ''}" data-val-output-tab="${tabName}">
+      <section class="insights-card analytics-input-card">
+        <h3>${meta.label} Inputs</h3>
+        <div class="analytics-form-grid validation-input-grid">
+          <input type="text" data-val-input-week value="${escapeHtml(tab.weekId)}" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
+          <input type="text" data-val-input-scenario value="${escapeHtml(tab.scenarioId)}" placeholder="Scenario ID = SIMULATION_NAME (optional, latest by default)" />
+          ${isBomTraversal ? `<input type="text" data-val-input-item value="${escapeHtml(tab.itemId || '')}" placeholder="Item ID (optional, leave blank for all root BOMs)" />` : ''}
+        </div>
+        <div class="analytics-actions">
+          <button class="btn" type="button" data-val-action="go" data-val-tab="${tabName}">Go</button>
+          <button class="btn" type="button" data-val-action="reset" data-val-tab="${tabName}">Reset</button>
+          ${reportActions}
+        </div>
+        <div class="analytics-note">Week ID and Scenario ID are preferred. If blank, validation defaults to latest CAPTURE_WK and SIMULATION_NAME.</div>
+        ${isDataQuality ? `<div class="analytics-note">${authText}</div>` : ''}
+        ${actionStatus}
+      </section>
+      ${status}
+      ${summary || '<div class="insights-empty">Run this gate to view validation findings.</div>'}
+    </section>
+  `;
+}
+
+function renderValidationLanding() {
+  const pane = paneByPanel.validation;
+  if (!pane) {
+    return;
+  }
+
+  pane.innerHTML = `
+    <div class="insights-wrap validation-wrap">
+      ${VALIDATION_TABS.map((tabName) => renderValidationTabPanel(tabName, getValidationTabData(tabName))).join('')}
+    </div>
+  `;
+
+  const activeTab = validationState.activeTab;
+  const activeTabData = getValidationTabData(activeTab);
+  const activePanel = pane.querySelector(`.insights-subtab-panel[data-val-output-tab="${activeTab}"]`);
+  if (!activePanel || !activeTabData) {
+    return;
+  }
+
+  const weekInput = activePanel.querySelector('[data-val-input-week]');
+  const scenarioInput = activePanel.querySelector('[data-val-input-scenario]');
+  const itemInput = activePanel.querySelector('[data-val-input-item]');
+  const goBtn = activePanel.querySelector(`[data-val-action="go"][data-val-tab="${activeTab}"]`);
+  const resetBtn = activePanel.querySelector(`[data-val-action="reset"][data-val-tab="${activeTab}"]`);
+  const downloadBtn = activePanel.querySelector(`[data-val-action="download"][data-val-tab="${activeTab}"]`);
+  const emailBtn = activePanel.querySelector(`[data-val-action="email"][data-val-tab="${activeTab}"]`);
+
+  if (goBtn && weekInput && scenarioInput) {
+    goBtn.addEventListener('click', () => {
+      activeTabData.weekId = weekInput.value.trim();
+      activeTabData.scenarioId = scenarioInput.value.trim();
+      if (itemInput) {
+        activeTabData.itemId = itemInput.value.trim();
+      }
+      activeTabData.actionMessage = '';
+      runValidationForTab(activeTab);
+    });
+  }
+
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      activeTabData.weekId = '';
+      activeTabData.scenarioId = '';
+      activeTabData.itemId = '';
+      activeTabData.data = null;
+      activeTabData.loading = false;
+      activeTabData.error = '';
+      activeTabData.actionMessage = '';
+      renderValidationLanding();
+    });
+  }
+
+  if (downloadBtn) {
+    downloadBtn.addEventListener('click', async () => {
+      try {
+        activeTabData.actionMessage = 'Preparing HTML report download...';
+        renderValidationLanding();
+        await downloadValidationHtml(activeTabData, activeTab);
+        activeTabData.actionMessage = 'HTML report downloaded.';
+      } catch (err) {
+        activeTabData.error = String(err);
+      }
+      renderValidationLanding();
+    });
+  }
+
+  if (emailBtn) {
+    emailBtn.addEventListener('click', async () => {
+      try {
+        activeTabData.actionMessage = 'Sending report email...';
+        renderValidationLanding();
+        const result = await sendValidationEmail(activeTabData, activeTab);
+        activeTabData.actionMessage = `Email sent to ${result.recipient_email}.`;
+      } catch (err) {
+        activeTabData.error = String(err);
+      }
+      renderValidationLanding();
+    });
+  }
+
+  if (activeTab === 'bom_traversal' && activeTabData && activeTabData.data) {
+    mountBomTraversalGraph(activePanel, activeTabData.data, activeTab);
+  }
+
+}
+
+async function runValidationForTab(tabName) {
+  const tab = getValidationTabData(tabName);
+  const meta = VALIDATION_TAB_META[tabName];
+  if (!tab || !meta) {
+    return;
+  }
+
+  tab.loading = true;
+  tab.error = '';
+  tab.actionMessage = '';
+  updateValidationBadge(true, meta.label);
+  renderValidationLanding();
+
+  try {
+    const res = await fetch('/api/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        week_id: tab.weekId || null,
+        scenario_id: tab.scenarioId || null,
+        scope: {
+          product: tabName === 'bom_traversal' ? tab.itemId || null : null,
+        },
+        focus_areas: meta.focusAreas,
+      }),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    const data = contentType.includes('application/json')
+      ? await res.json()
+      : { Error: `Unexpected response format from /api/validate (${res.status}).` };
+
+    if (!res.ok) {
+      tab.error = `Request failed (${res.status}).`;
+      tab.data = null;
+      tab.loading = false;
+      updateValidationBadge(false, meta.label);
+      renderValidationLanding();
+      return;
+    }
+
+    tab.data = data;
+    tab.loading = false;
+    tab.error = '';
+    updateValidationBadge(false, meta.label);
+    renderValidationLanding();
+  } catch (err) {
+    tab.loading = false;
+    tab.data = null;
+    tab.error = String(err);
+    updateValidationBadge(false, meta.label);
+    renderValidationLanding();
+  }
+}
+
+function renderBomTraversalMindMap(data, tabName) {
+  const map = data && typeof data === 'object' ? data['Mind Map'] || {} : {};
+  const levels = Array.isArray(map.levels) ? map.levels : [];
+  const graphId = `bomGraph-${tabName}`;
+  const detailId = `bomGraphDetail-${tabName}`;
+  const resetId = `bomGraphReset-${tabName}`;
+
+  if (levels.length === 0) {
+    return `
+      <section class="insights-card bom-map-card">
+        <h3>BOM Traversal Knowledge Graph</h3>
+        <div class="insights-empty">No traversal path to render for current filters.</div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="insights-card bom-map-card">
+      <h3>BOM Traversal Knowledge Graph</h3>
+      <div class="bom-kg-wrap">
+        <div id="${graphId}" class="bom-kg-canvas"></div>
+        <aside class="bom-kg-side">
+          <button id="${resetId}" class="btn graph-reset-btn" type="button">Reset Focus</button>
+          <div id="${detailId}" class="graph-node-details bom-kg-detail">Click a node to inspect lineage context.</div>
+        </aside>
+      </div>
+    </section>
+  `;
+}
+
+function renderBomTraversalDetails(data) {
+  const summary = data && typeof data === 'object' ? data['Traversal Summary'] || {} : {};
+  const issues = data && typeof data === 'object' ? data['Issues Found (Critical, High, Medium, Low)'] || {} : {};
+  const rows = data && typeof data === 'object' && Array.isArray(data['Traversal Rows']) ? data['Traversal Rows'] : [];
+  const sampleRows = rows.slice(0, 30).map((row) => ({
+    TRAVERSAL_DEPTH_NBR: row.TRAVERSAL_DEPTH_NBR,
+    INITIAL_ITEM_ID: row.INITIAL_ITEM_ID,
+    ITEM_ID: row.ITEM_ID,
+    PREVIOUS_ITEM_ID: row.PREVIOUS_ITEM_ID,
+    NEXT_ITEM_ID: row.NEXT_ITEM_ID,
+    PREVIOUS_PLANT_CD: row.PREVIOUS_PLANT_CD,
+    NEXT_PLANT_CD: row.NEXT_PLANT_CD,
+    BOMNUM: row.BOMNUM,
+  }));
+
+  return `
+    <section class="insights-card">
+      <h3>BOM Traversal Summary</h3>
+      ${renderKeyValueGrid(Object.entries(summary))}
+    </section>
+    <section class="insights-card">
+      <h3>BOM Traversal Issues</h3>
+      ${renderObject(issues)}
+    </section>
+    <section class="insights-card">
+      <h3>Traversal Rows Sample (30)</h3>
+      ${renderArray(sampleRows)}
+      <div class="analytics-note">Showing 30 of ${rows.length} rows. Full rows remain available in API response.</div>
+    </section>
+  `;
+}
+
+function mountBomTraversalGraph(panelEl, data, tabName) {
+  const map = data && typeof data === 'object' ? data['Mind Map'] || {} : {};
+  const nodes = Array.isArray(map.nodes) ? map.nodes : [];
+  const links = Array.isArray(map.links) ? map.links : [];
+  const graphId = `bomGraph-${tabName}`;
+  const detailId = `bomGraphDetail-${tabName}`;
+  const resetId = `bomGraphReset-${tabName}`;
+  const canvas = panelEl.querySelector(`#${graphId}`);
+  const detail = panelEl.querySelector(`#${detailId}`);
+  const resetBtn = panelEl.querySelector(`#${resetId}`);
+
+  if (!canvas || !detail) {
+    return;
+  }
+  if (!nodes.length) {
+    canvas.innerHTML = '<div class="insights-empty">No graph nodes available for current filters.</div>';
+    return;
+  }
+
+  const byDepth = new Map();
+  nodes.forEach((node) => {
+    const depth = Number(node.depth || 0);
+    if (!byDepth.has(depth)) {
+      byDepth.set(depth, []);
+    }
+    byDepth.get(depth).push(node);
+  });
+
+  const orderedDepths = Array.from(byDepth.keys()).sort((a, b) => a - b);
+  const colGap = 220;
+  const rowGap = 90;
+  const width = Math.max(1000, orderedDepths.length * colGap + 120);
+  const maxRows = Math.max(...orderedDepths.map((d) => byDepth.get(d).length), 1);
+  const height = Math.max(420, maxRows * rowGap + 120);
+  const positions = new Map();
+
+  orderedDepths.forEach((depth, colIdx) => {
+    const colNodes = byDepth.get(depth) || [];
+    colNodes.forEach((node, rowIdx) => {
+      const x = 90 + colIdx * colGap;
+      const y = 80 + rowIdx * rowGap + (height - Math.max(colNodes.length, 1) * rowGap) / 2;
+      positions.set(String(node.id), { x, y, node });
+    });
+  });
+
+  const edgeSvg = links
+    .map((edge) => {
+      const source = positions.get(String(edge.from));
+      const target = positions.get(String(edge.to));
+      if (!source || !target) {
+        return '';
+      }
+      const midX = (source.x + target.x) / 2;
+      const midY = (source.y + target.y) / 2;
+      return `
+        <line class="bom-kg-edge-hit" data-source="${escapeHtml(String(edge.from))}" data-target="${escapeHtml(String(edge.to))}" x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}" />
+        <line class="bom-kg-edge" data-source="${escapeHtml(String(edge.from))}" data-target="${escapeHtml(String(edge.to))}" x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}" />
+        <text x="${midX}" y="${midY - 6}" text-anchor="middle" class="bom-kg-edge-label">BOM</text>
+      `;
+    })
+    .join('');
+
+  const nodeSvg = nodes
+    .map((node) => {
+      const pos = positions.get(String(node.id));
+      if (!pos) {
+        return '';
+      }
+      const itemLabel = String(node.item_id || node.id || '');
+      const locLabel = String(node.loc || '');
+      const ariaLabel = locLabel ? `${itemLabel}@${locLabel}` : itemLabel;
+      return `
+        <g class="bom-kg-node" data-node-id="${escapeHtml(String(node.id))}" tabindex="0" role="button" aria-label="${escapeHtml(ariaLabel)}">
+          <circle cx="${pos.x}" cy="${pos.y}" r="26" />
+          <text x="${pos.x}" y="${pos.y + 42}" text-anchor="middle" class="bom-kg-node-label">${escapeHtml(itemLabel)}</text>
+          <text x="${pos.x}" y="${pos.y + 55}" text-anchor="middle" class="bom-kg-node-sub">${escapeHtml(locLabel)}</text>
+        </g>
+      `;
+    })
+    .join('');
+
+  canvas.innerHTML = `
+    <svg class="bom-kg-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet">
+      ${edgeSvg}
+      ${nodeSvg}
+    </svg>
+  `;
+
+  const nodeMap = new Map(nodes.map((node) => [String(node.id), node]));
+  const neighbors = new Map();
+  links.forEach((edge) => {
+    const s = String(edge.from);
+    const t = String(edge.to);
+    if (!neighbors.has(s)) {
+      neighbors.set(s, new Set());
+    }
+    if (!neighbors.has(t)) {
+      neighbors.set(t, new Set());
+    }
+    neighbors.get(s).add(t);
+    neighbors.get(t).add(s);
+  });
+
+  const nodeEls = Array.from(canvas.querySelectorAll('.bom-kg-node'));
+  const edgeEls = Array.from(canvas.querySelectorAll('.bom-kg-edge'));
+  const edgeHitEls = Array.from(canvas.querySelectorAll('.bom-kg-edge-hit'));
+
+  function reset() {
+    nodeEls.forEach((el) => el.classList.remove('active', 'dim'));
+    edgeEls.forEach((el) => el.classList.remove('active', 'dim'));
+    edgeHitEls.forEach((el) => el.classList.remove('active', 'dim'));
+    detail.innerHTML = 'Click a node to inspect lineage context.';
+  }
+
+  function focusNode(nodeId) {
+    const selected = nodeMap.get(nodeId);
+    if (!selected) {
+      return;
+    }
+    const linked = neighbors.get(nodeId) || new Set();
+
+    nodeEls.forEach((el) => {
+      const id = el.getAttribute('data-node-id') || '';
+      if (id === nodeId || linked.has(id)) {
+        el.classList.add('active');
+        el.classList.remove('dim');
+      } else {
+        el.classList.remove('active');
+        el.classList.add('dim');
+      }
+    });
+
+    edgeEls.forEach((el) => {
+      const source = el.getAttribute('data-source') || '';
+      const target = el.getAttribute('data-target') || '';
+      if (source === nodeId || target === nodeId) {
+        el.classList.add('active');
+        el.classList.remove('dim');
+      } else {
+        el.classList.remove('active');
+        el.classList.add('dim');
+      }
+    });
+
+    edgeHitEls.forEach((el) => {
+      const source = el.getAttribute('data-source') || '';
+      const target = el.getAttribute('data-target') || '';
+      if (source === nodeId || target === nodeId) {
+        el.classList.add('active');
+        el.classList.remove('dim');
+      } else {
+        el.classList.remove('active');
+        el.classList.add('dim');
+      }
+    });
+
+    detail.innerHTML = renderKeyValueGrid([
+      ['Item', selected.item_id || ''],
+      ['Location', selected.loc || ''],
+      ['Class', selected.item_class || ''],
+      ['Depth', selected.depth],
+      ['Is Root', selected.is_root ? 'Yes' : 'No'],
+      ['Connected Nodes', linked.size],
+    ]);
+  }
+
+  nodeEls.forEach((el) => {
+    const nodeId = el.getAttribute('data-node-id') || '';
+    el.addEventListener('click', () => focusNode(nodeId));
+    el.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        focusNode(nodeId);
+      }
+    });
+  });
+
+  edgeHitEls.forEach((el) => {
+    el.addEventListener('click', () => {
+      const source = el.getAttribute('data-source') || '';
+      const target = el.getAttribute('data-target') || '';
+      const sourceNode = nodeMap.get(source);
+      const targetNode = nodeMap.get(target);
+      detail.innerHTML = renderKeyValueGrid([
+        ['Relation', 'BOM'],
+        ['From', sourceNode ? `${sourceNode.item_id}@${sourceNode.loc}` : source],
+        ['To', targetNode ? `${targetNode.item_id}@${targetNode.loc}` : target],
+      ]);
+    });
+  });
+
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      reset();
+    });
+  }
+
+  focusNode(String(nodes[0].id));
+}
+
 function activatePanel(panelName, updateHash = true) {
   if (!validPanels.has(panelName)) {
     panelName = 'chat';
@@ -1223,6 +1756,25 @@ function setMenuCollapsed(collapsed) {
   workspaceShell.classList.toggle('menu-collapsed', collapsed);
   menuToggle.textContent = collapsed ? 'Expand' : 'Collapse';
   menuToggle.setAttribute('aria-label', collapsed ? 'Expand menu' : 'Collapse menu');
+}
+
+function syncValidationControlTabs() {
+  Array.from(document.querySelectorAll('#validationControlTabs [data-val-tab]')).forEach((button) => {
+    const tab = button.getAttribute('data-val-tab') || '';
+    button.classList.toggle('active', tab === validationState.activeTab);
+  });
+}
+
+function getValidationTabData(tabName) {
+  return validationState.tabs[tabName] || null;
+}
+
+function updateValidationBadge(running = false, label = null) {
+  const meta = VALIDATION_TAB_META[validationState.activeTab] || VALIDATION_TAB_META.data_quality;
+  const gateLabel = label || meta.label;
+  if (valActiveGateBadge) {
+    valActiveGateBadge.textContent = running ? `Running Gate: ${gateLabel}` : `Active Gate: ${gateLabel}`;
+  }
 }
 
 async function callApi(path, payload) {
@@ -1310,6 +1862,81 @@ async function loadLlmModels() {
     chatLlmStatus.textContent = 'Could not load Ollama models. Chat can still run with built-in grounded responses.';
   }
   setLlmControls();
+}
+
+async function loadAuthProfile() {
+  try {
+    const res = await fetch('/api/auth/me');
+    const data = await res.json();
+    authProfile = {
+      authenticated: Boolean(data.authenticated),
+      login: data.login || null,
+      email: data.email || null,
+      source: data.source || 'none',
+    };
+  } catch (_err) {
+    authProfile = {
+      authenticated: false,
+      login: null,
+      email: null,
+      source: 'none',
+    };
+  }
+}
+
+async function downloadValidationHtml(tab, tabName) {
+  const meta = VALIDATION_TAB_META[tabName] || VALIDATION_TAB_META.data_quality;
+  const focusArea = Array.isArray(meta.focusAreas) && meta.focusAreas.length > 0 ? meta.focusAreas[0] : 'data_quality_input';
+
+  const res = await fetch('/api/validate/report/html', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      week_id: tab.weekId || null,
+      scenario_id: tab.scenarioId || null,
+      focus_area: focusArea,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Download failed (${res.status}).`);
+  }
+
+  const disposition = res.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match ? match[1] : 'by_input_data_quality_report.html';
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+async function sendValidationEmail(tab, tabName) {
+  const meta = VALIDATION_TAB_META[tabName] || VALIDATION_TAB_META.data_quality;
+  const focusArea = Array.isArray(meta.focusAreas) && meta.focusAreas.length > 0 ? meta.focusAreas[0] : 'data_quality_input';
+
+  const res = await fetch('/api/validate/report/email', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      week_id: tab.weekId || null,
+      scenario_id: tab.scenarioId || null,
+      focus_area: focusArea,
+      recipient_email: authProfile.email || null,
+    }),
+  });
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json') ? await res.json() : {};
+  if (!res.ok || !data.sent) {
+    const err = data.error || data.message || `Email send failed (${res.status}).`;
+    throw new Error(err);
+  }
+  return data;
 }
 
 document.getElementById('summaryBtn').addEventListener('click', () => {
@@ -1442,7 +2069,7 @@ menuButtons.forEach((button) => {
   });
 });
 
-Array.from(document.querySelectorAll('.analytics-control-tab')).forEach((button) => {
+Array.from(document.querySelectorAll('#analyticsControlTabs .analytics-control-tab')).forEach((button) => {
   button.addEventListener('click', () => {
     const tabName = button.getAttribute('data-tab') || 'demand_supply';
     if (!INSIGHTS_TABS.includes(tabName)) {
@@ -1451,6 +2078,20 @@ Array.from(document.querySelectorAll('.analytics-control-tab')).forEach((button)
     insightsState.activeTab = tabName;
     activatePanel('insights');
     renderInsightsLanding();
+  });
+});
+
+Array.from(document.querySelectorAll('#validationControlTabs [data-val-tab]')).forEach((button) => {
+  button.addEventListener('click', () => {
+    const tabName = button.getAttribute('data-val-tab') || 'data_quality';
+    if (!VALIDATION_TAB_META[tabName]) {
+      return;
+    }
+    validationState.activeTab = tabName;
+    activatePanel('validation');
+    syncValidationControlTabs();
+    updateValidationBadge(false, VALIDATION_TAB_META[tabName].label);
+    renderValidationLanding();
   });
 });
 
@@ -1464,20 +2105,6 @@ chatQuestion.addEventListener('keydown', (event) => {
     event.preventDefault();
     submitChat();
   }
-});
-
-document.getElementById('validateBtn').addEventListener('click', () => {
-  activatePanel('validation');
-  paneByPanel.validation.textContent = 'Running validation...';
-  callApi('/api/validate', {
-    week_id: document.getElementById('valWeek').value || null,
-    scenario_id: document.getElementById('valScenario').value || null,
-    scope: {
-      site: document.getElementById('valSite').value || null,
-      product: document.getElementById('valProduct').value || null,
-    },
-    focus_areas: ['master_data', 'bom', 'parameters', 'output_sanity'],
-  });
 });
 
 document.getElementById('compareBtn').addEventListener('click', () => {
@@ -1508,10 +2135,16 @@ document.getElementById('rootCauseBtn').addEventListener('click', () => {
 });
 
 loadLlmModels();
+loadAuthProfile().finally(() => {
+  renderValidationLanding();
+});
 syncPanelFromUrl();
 setMenuCollapsed(false);
 renderChatThread();
 renderInsightsLanding();
+renderValidationLanding();
+syncValidationControlTabs();
+updateValidationBadge();
 
 window.addEventListener('hashchange', syncPanelFromUrl);
 window.addEventListener('popstate', syncPanelFromUrl);

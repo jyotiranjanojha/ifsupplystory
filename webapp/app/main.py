@@ -1,14 +1,17 @@
 from pathlib import Path
+import base64
+import json
+from datetime import datetime
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .analyzer import dataset_inventory, list_ollama_models, run_chat_assistant, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_scenario_compare, run_validation, run_vision_query
+from .analyzer import dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check
 from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
-from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationRequest, VisionQueryRequest
+from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
 from .rag import build_rag_index, get_rag_status, query_rag
 
 
@@ -24,6 +27,53 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
+def _extract_auth_profile(request: Request) -> dict:
+    headers = request.headers
+
+    login = (headers.get("x-ms-client-principal-name") or "").strip() or None
+    email = (
+        headers.get("x-forwarded-email")
+        or headers.get("x-user-email")
+        or headers.get("x-auth-request-email")
+        or headers.get("x-ms-client-principal-name")
+        or ""
+    ).strip() or None
+    source = None
+
+    principal_header = (headers.get("x-ms-client-principal") or "").strip()
+    if principal_header:
+        try:
+            decoded = base64.b64decode(principal_header)
+            principal = json.loads(decoded.decode("utf-8"))
+            source = "x-ms-client-principal"
+            if not login:
+                login = principal.get("userDetails") or principal.get("userId") or login
+            claims = principal.get("claims") or []
+            for claim in claims:
+                typ = (claim.get("typ") or "").lower()
+                val = (claim.get("val") or "").strip()
+                if typ in {"preferred_username", "email", "upn"} and val:
+                    email = email or val
+                    break
+        except Exception:
+            pass
+
+    if not source:
+        if headers.get("x-ms-client-principal-name"):
+            source = "x-ms-client-principal-name"
+        elif headers.get("x-forwarded-email") or headers.get("x-user-email") or headers.get("x-auth-request-email"):
+            source = "forwarded-email-header"
+        elif request.headers.get("remote-user"):
+            source = "remote-user"
+
+    return {
+        "authenticated": bool(login or email),
+        "login": login,
+        "email": email,
+        "source": source or "none",
+    }
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     return RedirectResponse(url="/static/intelfoundrylogo.png")
@@ -37,6 +87,11 @@ async def home(request: Request):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "ifsp-webapp", "base_dir": str(BASE_DIR)}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    return _extract_auth_profile(request)
 
 
 @app.get("/api/datasets/summary")
@@ -80,6 +135,61 @@ def rag_query(req: RagQueryRequest):
 @app.post("/api/validate")
 def validate(req: ValidationRequest):
     return run_validation(BASE_DIR, req.week_id, req.scenario_id, req.scope.model_dump(), req.focus_areas)
+
+
+def _resolve_validation_report(req: ValidationReportRequest):
+    focus = (req.focus_area or "").strip().lower()
+    if focus == "data_quality_input":
+        report = run_input_data_quality(BASE_DIR, req.week_id, req.scenario_id)
+        title = "BY Input Data Quality Report"
+        html_content = generate_input_dq_html_report(report)
+        file_stem = "by_input_data_quality"
+    else:
+        report = run_validation(BASE_DIR, req.week_id, req.scenario_id, {}, [focus])
+        title = f"Validation Report - {focus.replace('_', ' ').title()}"
+        html_content = generate_validation_html_report(report, title=title)
+        file_stem = f"validation_{focus}"
+    return report, title, html_content, file_stem
+
+
+@app.post("/api/validate/report/html")
+def validate_report_html(req: ValidationReportRequest):
+    _report, _title, html_content, file_stem = _resolve_validation_report(req)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"{file_stem}_{timestamp}.html"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=html_content, media_type="text/html", headers=headers)
+
+
+@app.post("/api/validate/report/email")
+def validate_report_email(req: ValidationReportEmailRequest, request: Request):
+    auth = _extract_auth_profile(request)
+    recipient = (req.recipient_email or auth.get("email") or "").strip()
+    if not recipient:
+        return {
+            "sent": False,
+            "error": "Could not determine recipient email from SSO headers. Please configure auth headers or pass recipient_email.",
+            "auth": auth,
+        }
+
+    report, title, html_content, _file_stem = _resolve_validation_report(req)
+    score = ((report.get("Summary") or {}).get("overall_score_pct"))
+    score_suffix = f" - Score {score}%" if score is not None else ""
+    subject = f"{title}{score_suffix}"
+    text = f"{title} generated by IFSP assistant.{(' Overall score: ' + str(score) + '%.') if score is not None else ''}"
+    sent, message = send_html_email_report(recipient, subject, html_content, text)
+    return {
+        "sent": sent,
+        "message": message,
+        "recipient_email": recipient,
+        "auth": auth,
+        "focus_area": req.focus_area,
+    }
+
+
+@app.get("/api/email/smtp/health")
+def email_smtp_health():
+    return smtp_health_check()
 
 
 @app.post("/api/compare")

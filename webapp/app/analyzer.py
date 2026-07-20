@@ -3,8 +3,10 @@ import json
 import math
 import os
 import re
+import smtplib
 from dataclasses import dataclass
 from datetime import datetime
+from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -20,6 +22,76 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
 OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.1:8b")
 OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "gemma3:latest")
+
+INPUT_DQ_VIEW_CONFIG = {
+    "BY_ITEM": {"prefix": "if_snop_items-", "primary_key": ["ITEM"], "not_null_cols": ["ITEM", "DESCR", "ITEMCLASS"]},
+    "BY_LOC": {"prefix": "if_snop_locations-", "primary_key": ["LOC"], "not_null_cols": ["LOC"]},
+    "BY_RES": {"prefix": "if_snop_res-", "primary_key": ["RES", "LOC"], "not_null_cols": ["RES", "LOC"]},
+    "BY_CAL": {"prefix": "if_snop_calendars-", "primary_key": ["CAL"], "not_null_cols": ["CAL"]},
+    "BY_CALPATTERN": {"prefix": "if_snop_calpattern-", "primary_key": ["CAL", "PATTERNSEQNUM"], "not_null_cols": ["CAL", "PATTERNSEQNUM"]},
+    "BY_CALATTRIBUTE": {"prefix": "if_snop_calattribute-", "primary_key": ["CAL", "PATTERNSEQNUM", "ATTRIBUTE"], "not_null_cols": ["CAL", "PATTERNSEQNUM"]},
+    "BY_BOM": {"prefix": "if_snop_billofmaterials-", "primary_key": ["ITEM", "SUBORD", "LOC", "BOMNUM"], "not_null_cols": ["ITEM", "SUBORD", "LOC", "BOMNUM"]},
+    "BY_ALTBOM": {"prefix": "if_snop_altbillofmaterials-", "primary_key": ["ITEM", "SUBORD", "LOC", "BOMNUM", "ALTSUBORD"], "not_null_cols": ["ITEM", "SUBORD", "LOC", "BOMNUM", "ALTSUBORD"]},
+    "BY_NETWORK": {"prefix": "if_snop_network-", "primary_key": ["SOURCE", "DEST", "TRANSMODE"], "not_null_cols": ["SOURCE", "DEST", "TRANSMODE"]},
+    "BY_PRODUCTIONMETHOD": {"prefix": "if_snop_productionmethod-", "primary_key": ["ITEM", "LOC", "PRODUCTIONMETHOD"], "not_null_cols": ["ITEM", "LOC", "PRODUCTIONMETHOD"]},
+    "BY_PRODUCTIONSTEP": {"prefix": "if_snop_productionstep-", "primary_key": ["ITEM", "LOC", "PRODUCTIONMETHOD", "STEPNUM", "EFF"], "not_null_cols": ["ITEM", "LOC", "PRODUCTIONMETHOD", "STEPNUM", "EFF"]},
+    "BY_ALTPRODUCTIONSTEP": {"prefix": "if_snop_altproductionstep-", "primary_key": ["ITEM", "LOC", "PRODUCTIONMETHOD", "PRIMARYSTEPNUM", "EFF"], "not_null_cols": ["ITEM", "LOC", "PRODUCTIONMETHOD", "PRIMARYSTEPNUM", "EFF"]},
+    "BY_INVENTORY": {"prefix": "if_snop_inventory-", "primary_key": ["ITEM", "LOC"], "not_null_cols": ["ITEM", "LOC"]},
+    "BY_SKUALL": {"prefix": "if_snop_sku-", "primary_key": ["ITEM", "LOC"], "not_null_cols": ["ITEM", "LOC"]},
+    "BY_SKUEFFINVENTORYPARAM": {"prefix": "if_snop_skueffinventoryparam-", "primary_key": ["ITEM", "LOC", "EFF"], "not_null_cols": ["ITEM", "LOC", "EFF"]},
+    "BY_CUSTOMERORDER": {"prefix": "if_snop_customerorder-", "primary_key": ["ORDERID", "ITEM", "LOC", "LINEITEMEXTREF"], "not_null_cols": ["ORDERID", "ITEM", "LOC", "QTY", "LINEITEMEXTREF"]},
+    "BY_CUSTOMER_MASTER": {"prefix": "if_snop_customer-", "primary_key": ["CUST"], "not_null_cols": ["CUST"]},
+    "BY_DFUTOSKUFCST": {"prefix": "if_snop_dfutoskufcst-", "primary_key": ["ITEM", "DMDGROUP", "TYPE", "DUR"], "not_null_cols": ["ITEM", "DMDGROUP", "TYPE", "DUR"]},
+    "BY_PURCHMETHOD": {"prefix": "if_snop_purchmethod-", "primary_key": ["ITEM", "LOC", "PURCHMETHOD"], "not_null_cols": ["ITEM", "LOC", "PURCHMETHOD"]},
+    "BY_SCHEDRCPTS": {"prefix": "if_snop_schedrcpts-", "primary_key": ["ITEM", "LOC", "SCHED_DATE", "SEQNUM"], "not_null_cols": ["ITEM", "LOC", "SCHED_DATE", "SEQNUM"]},
+    "BY_SOURCING": {"prefix": "if_snop_sourcing-", "primary_key": ["ITEM", "SOURCE", "DEST", "SOURCING"], "not_null_cols": ["ITEM", "SOURCE", "DEST", "SOURCING"]},
+    "BY_SUPERSESSION": {"prefix": "if_snop_supersession-", "primary_key": ["ITEM", "LOC", "ALTITEM", "DMDGROUP"], "not_null_cols": ["ITEM", "LOC", "ALTITEM", "DMDGROUP"]},
+}
+
+INPUT_DQ_RI_CHECKS = [
+    ("BY_BOM", ["ITEM"], "BY_ITEM", ["ITEM"], "BOM parent item must exist in Item master"),
+    ("BY_BOM", ["SUBORD"], "BY_ITEM", ["ITEM"], "BOM subordinate item must exist in Item master"),
+    ("BY_BOM", ["LOC"], "BY_LOC", ["LOC"], "BOM location must exist in Location master"),
+    ("BY_ALTBOM", ["ITEM"], "BY_ITEM", ["ITEM"], "AltBOM item must exist in Item master"),
+    ("BY_ALTBOM", ["LOC"], "BY_LOC", ["LOC"], "AltBOM location must exist in Location master"),
+    ("BY_ALTBOM", ["ITEM", "SUBORD", "LOC", "BOMNUM"], "BY_BOM", ["ITEM", "SUBORD", "LOC", "BOMNUM"], "AltBOM must reference valid BOM"),
+    ("BY_INVENTORY", ["ITEM"], "BY_ITEM", ["ITEM"], "Inventory item must exist in Item master"),
+    ("BY_INVENTORY", ["LOC"], "BY_LOC", ["LOC"], "Inventory location must exist in Location master"),
+    ("BY_SKUALL", ["ITEM"], "BY_ITEM", ["ITEM"], "SKU item must exist in Item master"),
+    ("BY_SKUALL", ["LOC"], "BY_LOC", ["LOC"], "SKU location must exist in Location master"),
+    ("BY_SKUEFFINVENTORYPARAM", ["ITEM"], "BY_ITEM", ["ITEM"], "SKU Eff Inventory Param item must exist in Item master"),
+    ("BY_SKUEFFINVENTORYPARAM", ["LOC"], "BY_LOC", ["LOC"], "SKU Eff Inventory Param location must exist in Location master"),
+    ("BY_SKUEFFINVENTORYPARAM", ["ITEM", "LOC"], "BY_SKUALL", ["ITEM", "LOC"], "SKU Eff Inventory Param must reference valid SKU"),
+    ("BY_PRODUCTIONMETHOD", ["ITEM"], "BY_ITEM", ["ITEM"], "Production Method item must exist in Item master"),
+    ("BY_PRODUCTIONMETHOD", ["LOC"], "BY_LOC", ["LOC"], "Production Method location must exist in Location master"),
+    ("BY_PRODUCTIONSTEP", ["ITEM"], "BY_ITEM", ["ITEM"], "Production Step item must exist in Item master"),
+    ("BY_PRODUCTIONSTEP", ["LOC"], "BY_LOC", ["LOC"], "Production Step location must exist in Location master"),
+    ("BY_PRODUCTIONSTEP", ["ITEM", "LOC", "PRODUCTIONMETHOD"], "BY_PRODUCTIONMETHOD", ["ITEM", "LOC", "PRODUCTIONMETHOD"], "Production Step must reference valid Production Method"),
+    ("BY_PRODUCTIONSTEP", ["RES"], "BY_RES", ["RES"], "Production Step resource must exist in Resource master"),
+    ("BY_ALTPRODUCTIONSTEP", ["ITEM"], "BY_ITEM", ["ITEM"], "Alt Production Step item must exist in Item master"),
+    ("BY_ALTPRODUCTIONSTEP", ["LOC"], "BY_LOC", ["LOC"], "Alt Production Step location must exist in Location master"),
+    ("BY_ALTPRODUCTIONSTEP", ["ITEM", "LOC", "PRODUCTIONMETHOD"], "BY_PRODUCTIONMETHOD", ["ITEM", "LOC", "PRODUCTIONMETHOD"], "Alt Production Step must reference valid Production Method"),
+    ("BY_NETWORK", ["SOURCE"], "BY_LOC", ["LOC"], "Network source must exist in Location master"),
+    ("BY_NETWORK", ["DEST"], "BY_LOC", ["LOC"], "Network destination must exist in Location master"),
+    ("BY_SOURCING", ["ITEM"], "BY_ITEM", ["ITEM"], "Sourcing item must exist in Item master"),
+    ("BY_SOURCING", ["SOURCE"], "BY_LOC", ["LOC"], "Sourcing source location must exist in Location master"),
+    ("BY_SOURCING", ["DEST"], "BY_LOC", ["LOC"], "Sourcing destination location must exist in Location master"),
+    ("BY_CUSTOMERORDER", ["ITEM"], "BY_ITEM", ["ITEM"], "Customer Order item must exist in Item master"),
+    ("BY_CUSTOMERORDER", ["LOC"], "BY_LOC", ["LOC"], "Customer Order location must exist in Location master"),
+    ("BY_CUSTOMERORDER", ["CUST"], "BY_CUSTOMER_MASTER", ["CUST"], "Customer Order customer must exist in Customer master"),
+    ("BY_DFUTOSKUFCST", ["ITEM"], "BY_ITEM", ["ITEM"], "DFU to SKU Forecast item must exist in Item master"),
+    ("BY_PURCHMETHOD", ["ITEM"], "BY_ITEM", ["ITEM"], "Purchase Method item must exist in Item master"),
+    ("BY_PURCHMETHOD", ["LOC"], "BY_LOC", ["LOC"], "Purchase Method location must exist in Location master"),
+    ("BY_SUPERSESSION", ["ITEM"], "BY_ITEM", ["ITEM"], "Supersession item must exist in Item master"),
+    ("BY_SUPERSESSION", ["ALTITEM"], "BY_ITEM", ["ITEM"], "Supersession alternate item must exist in Item master"),
+    ("BY_SUPERSESSION", ["LOC"], "BY_LOC", ["LOC"], "Supersession location must exist in Location master"),
+    ("BY_SCHEDRCPTS", ["ITEM"], "BY_ITEM", ["ITEM"], "Sched Receipts item must exist in Item master"),
+    ("BY_SCHEDRCPTS", ["LOC"], "BY_LOC", ["LOC"], "Sched Receipts location must exist in Location master"),
+    ("BY_CALPATTERN", ["CAL"], "BY_CAL", ["CAL"], "Calendar Pattern must reference valid Calendar"),
+    ("BY_CALATTRIBUTE", ["CAL"], "BY_CAL", ["CAL"], "Calendar Attribute must reference valid Calendar"),
+    ("BY_RES", ["CAL"], "BY_CAL", ["CAL"], "Resource calendar must exist in Calendar master"),
+    ("BY_CALATTRIBUTE", ["CAL", "PATTERNSEQNUM"], "BY_CALPATTERN", ["CAL", "PATTERNSEQNUM"], "Calendar Attribute must reference valid Calendar Pattern"),
+]
 
 
 class DemandEntityType(str, Enum):
@@ -349,6 +421,542 @@ def dataset_inventory(base_dir: Path) -> Dict:
 def _find_file_by_prefix(folder: Path, prefix: str) -> Optional[Path]:
     candidates = sorted(folder.glob(f"{prefix}*.csv"))
     return candidates[0] if candidates else None
+
+
+def _find_latest_file_by_prefix(folder: Path, prefix: str) -> Optional[Path]:
+    candidates = sorted(folder.glob(f"{prefix}*.csv"))
+    return candidates[-1] if candidates else None
+
+
+def _is_blank(value: Optional[str]) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+def _row_matches_week_scenario(row: Dict, week_id: Optional[str], scenario_id: Optional[str]) -> bool:
+    if week_id:
+        if "CAPTURE_WK" in row and (row.get("CAPTURE_WK") or "").strip() and (row.get("CAPTURE_WK") or "").strip() != week_id:
+            return False
+    if scenario_id:
+        if "SIMULATION_NAME" in row and (row.get("SIMULATION_NAME") or "").strip():
+            if not _scenario_match((row.get("SIMULATION_NAME") or "").strip(), scenario_id):
+                return False
+    return True
+
+
+def _table_rows_by_view(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str]) -> Tuple[Dict[str, Optional[Path]], Dict[str, List[Dict]]]:
+    input_dir = base_dir / INPUT_FOLDER
+    files_by_view: Dict[str, Optional[Path]] = {}
+    rows_by_view: Dict[str, List[Dict]] = {}
+    for view_name, cfg in INPUT_DQ_VIEW_CONFIG.items():
+        file_path = _find_latest_file_by_prefix(input_dir, cfg["prefix"])
+        files_by_view[view_name] = file_path
+        if not file_path:
+            rows_by_view[view_name] = []
+            continue
+        rows = [row for row in _safe_rows(file_path) if _row_matches_week_scenario(row, week_id, scenario_id)]
+        rows_by_view[view_name] = rows
+    return files_by_view, rows_by_view
+
+
+def _dq_status_counts(rows: List[Dict]) -> Dict[str, int]:
+    counts = {"PASS": 0, "FAIL": 0, "ERROR": 0, "SKIP": 0}
+    for row in rows:
+        status = str(row.get("Status", "")).upper()
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def run_input_data_quality(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str]) -> Dict:
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    files_by_view, rows_by_view = _table_rows_by_view(base_dir, week_id, scenario_id)
+
+    duplicate_rows: List[Dict] = []
+    not_null_rows: List[Dict] = []
+    ri_rows: List[Dict] = []
+
+    for view_name, cfg in INPUT_DQ_VIEW_CONFIG.items():
+        file_path = files_by_view.get(view_name)
+        table_rows = rows_by_view.get(view_name, [])
+        key_cols = cfg["primary_key"]
+
+        if not file_path:
+            duplicate_rows.append(
+                {
+                    "View": view_name,
+                    "Key Columns": ", ".join(key_cols),
+                    "Total Rows": 0,
+                    "Duplicate Count": 0,
+                    "Status": "SKIP",
+                    "Details": "Input file not found for this view.",
+                }
+            )
+        elif not table_rows:
+            duplicate_rows.append(
+                {
+                    "View": view_name,
+                    "Key Columns": ", ".join(key_cols),
+                    "Total Rows": 0,
+                    "Duplicate Count": 0,
+                    "Status": "PASS",
+                    "Details": "No rows found for selected filters.",
+                }
+            )
+        else:
+            missing_key_cols = [c for c in key_cols if c not in table_rows[0]]
+            if missing_key_cols:
+                duplicate_rows.append(
+                    {
+                        "View": view_name,
+                        "Key Columns": ", ".join(key_cols),
+                        "Total Rows": len(table_rows),
+                        "Duplicate Count": "ERROR",
+                        "Status": "ERROR",
+                        "Details": f"Missing key columns: {', '.join(missing_key_cols)}",
+                    }
+                )
+            else:
+                seen = {}
+                dup_count = 0
+                for row in table_rows:
+                    key = tuple((row.get(col) or "").strip() for col in key_cols)
+                    seen[key] = seen.get(key, 0) + 1
+                for cnt in seen.values():
+                    if cnt > 1:
+                        dup_count += cnt - 1
+                duplicate_rows.append(
+                    {
+                        "View": view_name,
+                        "Key Columns": ", ".join(key_cols),
+                        "Total Rows": len(table_rows),
+                        "Duplicate Count": dup_count,
+                        "Status": "PASS" if dup_count == 0 else "FAIL",
+                        "Details": "",
+                    }
+                )
+
+        for col_name in cfg["not_null_cols"]:
+            if not file_path:
+                not_null_rows.append(
+                    {
+                        "View": view_name,
+                        "Column": col_name,
+                        "Total Rows": 0,
+                        "Null Count": 0,
+                        "Null %": 0.0,
+                        "Status": "SKIP",
+                        "Details": "Input file not found for this view.",
+                    }
+                )
+                continue
+            if not table_rows:
+                not_null_rows.append(
+                    {
+                        "View": view_name,
+                        "Column": col_name,
+                        "Total Rows": 0,
+                        "Null Count": 0,
+                        "Null %": 0.0,
+                        "Status": "PASS",
+                        "Details": "No rows found for selected filters.",
+                    }
+                )
+                continue
+            if col_name not in table_rows[0]:
+                not_null_rows.append(
+                    {
+                        "View": view_name,
+                        "Column": col_name,
+                        "Total Rows": len(table_rows),
+                        "Null Count": "ERROR",
+                        "Null %": "ERROR",
+                        "Status": "ERROR",
+                        "Details": f"Column {col_name} not found.",
+                    }
+                )
+                continue
+
+            null_count = 0
+            for row in table_rows:
+                if _is_blank(row.get(col_name)):
+                    null_count += 1
+            null_pct = round((null_count / len(table_rows) * 100), 2) if table_rows else 0.0
+            not_null_rows.append(
+                {
+                    "View": view_name,
+                    "Column": col_name,
+                    "Total Rows": len(table_rows),
+                    "Null Count": null_count,
+                    "Null %": null_pct,
+                    "Status": "PASS" if null_count == 0 else "FAIL",
+                    "Details": "",
+                }
+            )
+
+    for child_view, child_cols, parent_view, parent_cols, description in INPUT_DQ_RI_CHECKS:
+        child_file = files_by_view.get(child_view)
+        parent_file = files_by_view.get(parent_view)
+        child_rows = rows_by_view.get(child_view, [])
+        parent_rows = rows_by_view.get(parent_view, [])
+
+        if not child_file or not parent_file:
+            ri_rows.append(
+                {
+                    "Child View": child_view,
+                    "Child Column(s)": ", ".join(child_cols),
+                    "Parent View": parent_view,
+                    "Parent Column(s)": ", ".join(parent_cols),
+                    "Description": description,
+                    "Orphan Records": 0,
+                    "Status": "SKIP",
+                    "Details": "Missing child or parent input file.",
+                }
+            )
+            continue
+
+        if child_rows and any(col not in child_rows[0] for col in child_cols):
+            missing = [col for col in child_cols if col not in child_rows[0]]
+            ri_rows.append(
+                {
+                    "Child View": child_view,
+                    "Child Column(s)": ", ".join(child_cols),
+                    "Parent View": parent_view,
+                    "Parent Column(s)": ", ".join(parent_cols),
+                    "Description": description,
+                    "Orphan Records": "ERROR",
+                    "Status": "ERROR",
+                    "Details": f"Missing child columns: {', '.join(missing)}",
+                }
+            )
+            continue
+
+        if parent_rows and any(col not in parent_rows[0] for col in parent_cols):
+            missing = [col for col in parent_cols if col not in parent_rows[0]]
+            ri_rows.append(
+                {
+                    "Child View": child_view,
+                    "Child Column(s)": ", ".join(child_cols),
+                    "Parent View": parent_view,
+                    "Parent Column(s)": ", ".join(parent_cols),
+                    "Description": description,
+                    "Orphan Records": "ERROR",
+                    "Status": "ERROR",
+                    "Details": f"Missing parent columns: {', '.join(missing)}",
+                }
+            )
+            continue
+
+        parent_keys = set()
+        for row in parent_rows:
+            parent_key = tuple((row.get(col) or "").strip() for col in parent_cols)
+            parent_keys.add(parent_key)
+
+        orphan_count = 0
+        for row in child_rows:
+            child_key = tuple((row.get(col) or "").strip() for col in child_cols)
+            if all(_is_blank(val) for val in child_key):
+                continue
+            if child_key not in parent_keys:
+                orphan_count += 1
+
+        ri_rows.append(
+            {
+                "Child View": child_view,
+                "Child Column(s)": ", ".join(child_cols),
+                "Parent View": parent_view,
+                "Parent Column(s)": ", ".join(parent_cols),
+                "Description": description,
+                "Orphan Records": orphan_count,
+                "Status": "PASS" if orphan_count == 0 else "FAIL",
+                "Details": "",
+            }
+        )
+
+    dup_counts = _dq_status_counts(duplicate_rows)
+    not_null_counts = _dq_status_counts(not_null_rows)
+    ri_counts = _dq_status_counts(ri_rows)
+
+    total_pass = dup_counts["PASS"] + not_null_counts["PASS"] + ri_counts["PASS"]
+    total_fail = dup_counts["FAIL"] + not_null_counts["FAIL"] + ri_counts["FAIL"]
+    total_error = dup_counts["ERROR"] + not_null_counts["ERROR"] + ri_counts["ERROR"]
+    total_skip = dup_counts["SKIP"] + not_null_counts["SKIP"] + ri_counts["SKIP"]
+    score_base = total_pass + total_fail
+    score = round((total_pass / score_base * 100), 1) if score_base > 0 else 100.0
+
+    snapshot_files = []
+    for view_name, cfg in INPUT_DQ_VIEW_CONFIG.items():
+        path = files_by_view.get(view_name)
+        if path:
+            snapshot_files.append({"view": view_name, "file": path.name})
+
+    return {
+        "Report Type": "BY Input Data Quality",
+        "Generated At": generated_at,
+        "Validation Scope": {
+            "week_id": week_id,
+            "scenario_id": scenario_id,
+            "source": "by_input",
+            "notes": [
+                "This report currently evaluates BY input CSV datasets.",
+                "Snowflake-backed validation can be enabled later using the same output format.",
+            ],
+        },
+        "Summary": {
+            "overall_score_pct": score,
+            "total_pass": total_pass,
+            "total_fail": total_fail,
+            "total_error": total_error,
+            "total_skip": total_skip,
+            "duplicate_checks": dup_counts,
+            "not_null_checks": not_null_counts,
+            "referential_integrity_checks": ri_counts,
+        },
+        "Snapshot Files": snapshot_files,
+        "Duplicate Check": duplicate_rows,
+        "Not Null Check": not_null_rows,
+        "Referential Integrity Check": ri_rows,
+    }
+
+
+def generate_input_dq_html_report(report: Dict) -> str:
+    summary = report.get("Summary", {}) if isinstance(report, dict) else {}
+    ri_summary = summary.get("referential_integrity_checks", {}) if isinstance(summary, dict) else {}
+    title = "BY Input Data Quality Report"
+
+    def _table(rows: List[Dict]) -> str:
+        if not rows:
+            return "<p>No rows.</p>"
+        cols = list(rows[0].keys())
+        header = "".join([f"<th>{c}</th>" for c in cols])
+        body_rows = []
+        for row in rows:
+            status = str(row.get("Status", "")).upper()
+            row_style = " style=\"background:#ffeef0;\"" if status in {"FAIL", "ERROR"} else ""
+            cells = "".join([f"<td>{row.get(c, '')}</td>" for c in cols])
+            body_rows.append(f"<tr{row_style}>{cells}</tr>")
+        body = "\n".join(body_rows)
+        return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 20px; background: #f4f7fb; color: #10243a; }}
+    .wrap {{ max-width: 1400px; margin: auto; background: #fff; padding: 24px; border-radius: 12px; border: 1px solid #d9e5f2; }}
+    h1 {{ margin-top: 0; }}
+    h2 {{ margin-top: 28px; }}
+    .kpi {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }}
+    .card {{ background: #f8fbff; border: 1px solid #dbe8f5; border-radius: 10px; padding: 10px 12px; }}
+    .card strong {{ display: block; color: #2a4f77; font-size: 12px; text-transform: uppercase; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }}
+    th {{ text-align: left; background: #0d5f9e; color: #fff; padding: 8px; }}
+    td {{ border-bottom: 1px solid #e6edf5; padding: 7px 8px; }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>{title}</h1>
+    <p>Generated at: {report.get('Generated At', '')}</p>
+    <div class=\"kpi\">
+      <div class=\"card\"><strong>Overall Score %</strong>{summary.get('overall_score_pct', '')}</div>
+      <div class=\"card\"><strong>Total Pass</strong>{summary.get('total_pass', '')}</div>
+      <div class=\"card\"><strong>Total Fail</strong>{summary.get('total_fail', '')}</div>
+      <div class=\"card\"><strong>Total Error</strong>{summary.get('total_error', '')}</div>
+      <div class=\"card\"><strong>Total Skip</strong>{summary.get('total_skip', '')}</div>
+    </div>
+        <h2>Referential Integrity Snapshot</h2>
+        <div class=\"kpi\">
+            <div class=\"card\"><strong>Total RI Checks</strong>{(ri_summary.get('PASS', 0) or 0) + (ri_summary.get('FAIL', 0) or 0) + (ri_summary.get('ERROR', 0) or 0) + (ri_summary.get('SKIP', 0) or 0)}</div>
+            <div class=\"card\"><strong>RI Pass</strong>{ri_summary.get('PASS', 0)}</div>
+            <div class=\"card\"><strong>RI Fail</strong>{ri_summary.get('FAIL', 0)}</div>
+            <div class=\"card\"><strong>RI Error</strong>{ri_summary.get('ERROR', 0)}</div>
+            <div class=\"card\"><strong>RI Skip</strong>{ri_summary.get('SKIP', 0)}</div>
+        </div>
+    <h2>Duplicate Check</h2>
+    {_table(report.get('Duplicate Check', []))}
+    <h2>Not Null Check</h2>
+    {_table(report.get('Not Null Check', []))}
+    <h2>Referential Integrity Check</h2>
+    {_table(report.get('Referential Integrity Check', []))}
+  </div>
+</body>
+</html>
+"""
+
+
+def generate_validation_html_report(report: Dict, title: str = "Validation Report") -> str:
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _escape(value: object) -> str:
+        text = "" if value is None else str(value)
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;")
+        )
+
+    def _render_value(value: object) -> str:
+        if isinstance(value, list):
+            if not value:
+                return "<p>None</p>"
+            if all(isinstance(item, dict) for item in value):
+                return _render_table(value)
+            items = "".join([f"<li>{_escape(item)}</li>" for item in value])
+            return f"<ul>{items}</ul>"
+        if isinstance(value, dict):
+            rows = "".join(
+                [
+                    f"<tr><th>{_escape(k)}</th><td>{_render_value(v)}</td></tr>"
+                    for k, v in value.items()
+                ]
+            )
+            return f"<table><tbody>{rows}</tbody></table>"
+        return _escape(value)
+
+    def _render_table(rows: List[Dict]) -> str:
+        if not rows:
+            return "<p>None</p>"
+        columns = list(rows[0].keys())
+        header = "".join([f"<th>{_escape(col)}</th>" for col in columns])
+        body_rows = []
+        for row in rows:
+            status = str(row.get("Status", "")).upper()
+            row_style = " style=\"background:#ffeef0;\"" if status in {"FAIL", "ERROR"} else ""
+            cells = "".join([f"<td>{_escape(row.get(col, ''))}</td>" for col in columns])
+            body_rows.append(f"<tr{row_style}>{cells}</tr>")
+        body = "\n".join(body_rows)
+        return f"<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+    sections = []
+    if isinstance(report, dict):
+        for key, value in report.items():
+            sections.append(f"<section><h2>{_escape(key)}</h2>{_render_value(value)}</section>")
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <title>{_escape(title)}</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 20px; background: #f4f7fb; color: #10243a; }}
+    .wrap {{ max-width: 1500px; margin: auto; background: #fff; padding: 24px; border-radius: 12px; border: 1px solid #d9e5f2; }}
+    h1 {{ margin-top: 0; }}
+    h2 {{ margin-top: 26px; color: #114876; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }}
+    th {{ text-align: left; background: #0d5f9e; color: #fff; padding: 8px; vertical-align: top; }}
+    td {{ border-bottom: 1px solid #e6edf5; padding: 7px 8px; vertical-align: top; }}
+    ul {{ margin: 6px 0 0 18px; padding: 0; }}
+    p {{ margin: 6px 0; }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>{_escape(title)}</h1>
+    <p>Generated at: {_escape(generated_at)}</p>
+    {''.join(sections)}
+  </div>
+</body>
+</html>
+"""
+
+
+def send_html_email_report(recipient_email: str, subject: str, html_content: str, text_content: str) -> Tuple[bool, str]:
+    configured_hosts = (os.getenv("SMTP_HOST") or "smtp.intel.com,mail.intel.com").strip()
+    smtp_hosts = [host.strip() for host in configured_hosts.split(",") if host.strip()]
+    smtp_port = int((os.getenv("SMTP_PORT") or "25").strip())
+    smtp_user = (os.getenv("SMTP_USER") or "").strip()
+    smtp_password = (os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from = (os.getenv("SMTP_FROM") or recipient_email or smtp_user).strip()
+    smtp_use_tls = (os.getenv("SMTP_USE_TLS") or "false").strip().lower() in {"1", "true", "yes"}
+
+    if not smtp_hosts or not smtp_from:
+        return False, "SMTP configuration is missing. Set SMTP_HOST and SMTP_FROM (and credentials if required)."
+
+    msg = EmailMessage()
+    msg["From"] = smtp_from
+    msg["To"] = recipient_email
+    msg["Subject"] = subject
+    msg.set_content(text_content)
+    msg.add_alternative(html_content, subtype="html")
+
+    last_error = None
+    for smtp_host in smtp_hosts:
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+                if smtp_use_tls:
+                    smtp.starttls()
+                if smtp_user and smtp_password:
+                    smtp.login(smtp_user, smtp_password)
+                smtp.send_message(msg)
+            return True, f"Email sent successfully via {smtp_host}:{smtp_port}."
+        except Exception as exc:
+            last_error = f"{smtp_host}:{smtp_port} -> {str(exc)}"
+
+    return False, f"Email send failed. {last_error or 'No SMTP host succeeded.'}"
+
+
+def smtp_health_check() -> Dict:
+    configured_hosts = (os.getenv("SMTP_HOST") or "smtp.intel.com,mail.intel.com").strip()
+    smtp_hosts = [host.strip() for host in configured_hosts.split(",") if host.strip()]
+    smtp_port = int((os.getenv("SMTP_PORT") or "25").strip())
+    smtp_user = (os.getenv("SMTP_USER") or "").strip()
+    smtp_password = (os.getenv("SMTP_PASSWORD") or "").strip()
+    smtp_from = (os.getenv("SMTP_FROM") or "").strip()
+    smtp_use_tls = (os.getenv("SMTP_USE_TLS") or "false").strip().lower() in {"1", "true", "yes"}
+
+    results: List[Dict[str, object]] = []
+    any_ok = False
+
+    for smtp_host in smtp_hosts:
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as smtp:
+                smtp.ehlo()
+                if smtp_use_tls:
+                    smtp.starttls()
+                    smtp.ehlo()
+                if smtp_user and smtp_password:
+                    smtp.login(smtp_user, smtp_password)
+                code, _ = smtp.noop()
+            ok = int(code) in {250}
+            any_ok = any_ok or ok
+            results.append(
+                {
+                    "host": smtp_host,
+                    "port": smtp_port,
+                    "ok": ok,
+                    "stage": "noop",
+                    "detail": f"SMTP handshake succeeded (NOOP {code}).",
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "host": smtp_host,
+                    "port": smtp_port,
+                    "ok": False,
+                    "stage": "connect_or_handshake",
+                    "detail": str(exc),
+                }
+            )
+
+    return {
+        "healthy": any_ok,
+        "message": "SMTP relay reachable." if any_ok else "SMTP relay not reachable.",
+        "config": {
+            "smtp_hosts": smtp_hosts,
+            "smtp_port": smtp_port,
+            "smtp_use_tls": smtp_use_tls,
+            "smtp_from_configured": bool(smtp_from),
+            "smtp_auth_configured": bool(smtp_user and smtp_password),
+        },
+        "results": results,
+    }
 
 
 def _load_key_set(file_path: Optional[Path], column: str, normalize_decimal: bool = False) -> set:
@@ -1134,26 +1742,39 @@ def _summarize_with_ollama(
 
 
 def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], scope: Dict, focus_areas: List[str]) -> Dict:
+    requested_focus = [str(area or "").strip().lower() for area in (focus_areas or []) if str(area or "").strip()]
+    if "data_quality_input" in requested_focus:
+        return run_input_data_quality(base_dir, _normalize_week_id(week_id), _normalize_scenario_id(scenario_id))
+    if "bom_traversal" in requested_focus:
+        return run_bom_traversal_check(base_dir, _normalize_week_id(week_id), _normalize_scenario_id(scenario_id), scope)
+    if "production_route" in requested_focus:
+        return run_production_route_check(base_dir, _normalize_week_id(week_id), _normalize_scenario_id(scenario_id), scope)
+
     context = _resolve_context(base_dir, week_id, scenario_id)
     week_id = context["week_id"]
     scenario_id = context["scenario_id"]
     input_dir = base_dir / INPUT_FOLDER
     output_dir = base_dir / OUTPUT_FOLDER
 
-    required_input_prefixes = [
-        "if_snop_items-",
-        "if_snop_locations-",
-        "if_snop_customer-",
-        "if_snop_billofmaterials-",
-        "if_snop_sku-",
-        "if_snop_sourcing-",
-        "if_snop_productionmethod-",
-    ]
-    required_output_prefixes = [
-        "by_if_snop_out_planorder-",
-        "by_if_snop_out_skuexception-",
-        "by_if_snop_out_resloaddetail-",
-    ]
+    valid_focus_order = ["master_data", "bom", "parameters", "output_sanity"]
+    selected_focus = [area for area in valid_focus_order if area in requested_focus] or valid_focus_order
+    selected_focus_set = set(selected_focus)
+
+    required_input_by_focus = {
+        "master_data": ["if_snop_items-", "if_snop_locations-", "if_snop_customer-", "if_snop_sku-"],
+        "bom": ["if_snop_billofmaterials-", "if_snop_items-", "if_snop_locations-"],
+        "parameters": ["if_snop_sourcing-", "if_snop_productionmethod-", "if_snop_items-", "if_snop_locations-"],
+        "output_sanity": [],
+    }
+    required_output_by_focus = {
+        "master_data": [],
+        "bom": [],
+        "parameters": [],
+        "output_sanity": ["by_if_snop_out_planorder-", "by_if_snop_out_skuexception-", "by_if_snop_out_resloaddetail-"],
+    }
+
+    required_input_prefixes = sorted({p for area in selected_focus for p in required_input_by_focus.get(area, [])})
+    required_output_prefixes = sorted({p for area in selected_focus for p in required_output_by_focus.get(area, [])})
 
     missing_input = [p for p in required_input_prefixes if _find_file_by_prefix(input_dir, p) is None]
     missing_output = [p for p in required_output_prefixes if _find_file_by_prefix(output_dir, p) is None]
@@ -1183,6 +1804,48 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         "prod_method_missing_location": _count_orphans(prod, "LOC", loc_keys),
     }
 
+    check_focus_map = {
+        "bom_orphan_parent_item": "bom",
+        "bom_orphan_component_item": "bom",
+        "bom_orphan_location": "bom",
+        "sku_missing_item": "master_data",
+        "sku_missing_location": "master_data",
+        "sku_missing_customer": "master_data",
+        "sourcing_missing_source_location": "parameters",
+        "sourcing_missing_dest_location": "parameters",
+        "prod_method_missing_item": "parameters",
+        "prod_method_missing_location": "parameters",
+    }
+
+    checks = {metric: value for metric, value in checks.items() if check_focus_map.get(metric) in selected_focus_set}
+
+    planorder = _find_file_by_prefix(output_dir, "by_if_snop_out_planorder-")
+    skuexception = _find_file_by_prefix(output_dir, "by_if_snop_out_skuexception-")
+    resloaddetail = _find_file_by_prefix(output_dir, "by_if_snop_out_resloaddetail-")
+
+    def _count_rows_in_scope(file_path: Optional[Path]) -> int:
+        if not file_path:
+            return 0
+        total = 0
+        for row in _safe_rows(file_path):
+            row_week = (row.get("CAPTURE_WK") or "").strip()
+            row_scenario = (row.get("SIMULATION_NAME") or "").strip()
+            if week_id and row_week and row_week != week_id:
+                continue
+            if scenario_id and row_scenario and not _scenario_match(row_scenario, scenario_id):
+                continue
+            total += 1
+        return total
+
+    output_sanity_checks = {}
+    if "output_sanity" in selected_focus_set:
+        output_sanity_checks = {
+            "planorder_rows_in_scope": _count_rows_in_scope(planorder),
+            "skuexception_rows_in_scope": _count_rows_in_scope(skuexception),
+            "resloaddetail_rows_in_scope": _count_rows_in_scope(resloaddetail),
+        }
+        checks.update(output_sanity_checks)
+
     critical = []
     high = []
     medium = []
@@ -1200,6 +1863,12 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             else:
                 low.append(f"{metric}: {value}")
 
+    if output_sanity_checks:
+        if output_sanity_checks["planorder_rows_in_scope"] == 0:
+            high.append("planorder_rows_in_scope: 0")
+        if output_sanity_checks["resloaddetail_rows_in_scope"] == 0:
+            medium.append("resloaddetail_rows_in_scope: 0")
+
     if critical:
         verdict = "Fail"
     elif high:
@@ -1213,7 +1882,7 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         "week_column": "CAPTURE_WK",
         "scenario_column": "SIMULATION_NAME",
         "scope": scope,
-        "focus_areas": focus_areas,
+        "focus_areas": selected_focus,
     }
 
     data_gaps = []
@@ -1228,6 +1897,8 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
             "source_priority": ["by_input", "by_output", "Snowflake fallback"],
             "missing_input_prefixes": missing_input,
             "missing_output_prefixes": missing_output,
+            "requested_focus_areas": requested_focus,
+            "selected_focus_areas": selected_focus,
             "context_resolution": context,
         },
         "Checks Executed": checks,
@@ -1251,6 +1922,477 @@ def run_validation(base_dir: Path, week_id: Optional[str], scenario_id: Optional
         "Confidence and Data Gaps": {
             "confidence": "Medium",
             "data_gaps": data_gaps,
+        },
+    }
+
+
+def run_bom_traversal_check(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], scope: Dict) -> Dict:
+    input_dir = base_dir / INPUT_FOLDER
+    context = _resolve_context(base_dir, week_id, scenario_id)
+
+    bom_file = _find_latest_file_by_prefix(input_dir, "if_snop_billofmaterials-")
+    item_file = _find_latest_file_by_prefix(input_dir, "if_snop_items-")
+    item_char_file = _find_latest_file_by_prefix(input_dir, "if_snop_itemcharacteristic-")
+
+    root_item_filter = (scope.get("product") or scope.get("node") or "").strip()
+    site_filter = (scope.get("site") or "").strip()
+    max_depth = 20
+
+    if not bom_file:
+        return {
+            "Validation Scope": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+                "scope": scope,
+                "focus_areas": ["bom_traversal"],
+            },
+            "Traversal Summary": {
+                "total_bom_rows": 0,
+                "roots_considered": 0,
+                "traversal_rows": 0,
+                "max_depth_reached": 0,
+            },
+            "Mind Map": {"nodes": [], "links": [], "levels": [], "root_items": []},
+            "Traversal Rows": [],
+            "Issues Found (Critical, High, Medium, Low)": {
+                "Critical": ["Missing required dataset: if_snop_billofmaterials-*"],
+                "High": [],
+                "Medium": [],
+                "Low": [],
+            },
+            "Readiness Verdict (Pass, Conditional Pass, Fail)": "Fail",
+            "Recommended Fixes": [
+                "Provide by_input BOM extract (if_snop_billofmaterials-*.csv).",
+            ],
+        }
+
+    item_class_map: Dict[str, str] = {}
+    item_die_code_map: Dict[str, str] = {}
+    if item_file:
+        for row in _safe_rows(item_file):
+            item_id = (row.get("ITEM") or "").strip()
+            if not item_id:
+                continue
+            item_class_map[item_id] = (row.get("ITEMCLASS") or row.get("ITEM_CLASS_NM") or "").strip()
+            item_die_code_map[item_id] = (
+                row.get("U_DIE_CODE_NM")
+                or row.get("U_DIE_CODE_NAME")
+                or row.get("U_DIE_CODE")
+                or ""
+            ).strip()
+
+    item_order_point_map: Dict[str, str] = {}
+    if item_char_file:
+        for row in _safe_rows(item_char_file):
+            item_id = (row.get("ITEM") or row.get("item_non_leading_zero_id") or "").strip()
+            if not item_id:
+                continue
+            characteristic_nm = (row.get("CHARACTERISTIC_NM") or row.get("characteristic_nm") or "").strip().upper()
+            if characteristic_nm != "ITEM_ORDER_POINT":
+                continue
+            val = (row.get("CHARACTERISTIC_VALUE_TXT") or row.get("characteristic_value_txt") or "").strip()
+            if val:
+                item_order_point_map[item_id] = val
+
+    bom_rows = [row for row in _safe_rows(bom_file) if _row_matches_week_scenario(row, week_id, scenario_id)]
+    if site_filter:
+        bom_rows = [row for row in bom_rows if (row.get("LOC") or "").strip() == site_filter]
+
+    adjacency: Dict[Tuple[str, str], List[Tuple[str, str, str]]] = {}
+    parent_keys: set = set()
+    component_item_ids: set = set()
+
+    for row in bom_rows:
+        parent = (row.get("ITEM") or "").strip()
+        component = (row.get("SUBORD") or "").strip()
+        loc = (row.get("LOC") or "").strip()
+        bomnum = (row.get("BOMNUM") or "").strip()
+        if not parent or not component or not loc:
+            continue
+
+        key = (parent, loc)
+        adjacency.setdefault(key, []).append((component, loc, bomnum))
+        parent_keys.add((parent, loc))
+        component_item_ids.add(component)
+
+    roots: List[Tuple[str, str]] = []
+    if root_item_filter:
+        roots = sorted([key for key in parent_keys if key[0] == root_item_filter])
+    else:
+        roots = sorted([key for key in parent_keys if key[0] not in component_item_ids])
+
+    if not roots and root_item_filter:
+        return {
+            "Validation Scope": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+                "scope": scope,
+                "focus_areas": ["bom_traversal"],
+            },
+            "Traversal Summary": {
+                "total_bom_rows": len(bom_rows),
+                "roots_considered": 0,
+                "traversal_rows": 0,
+                "max_depth_reached": 0,
+            },
+            "Mind Map": {"nodes": [], "links": [], "levels": [], "root_items": []},
+            "Traversal Rows": [],
+            "Issues Found (Critical, High, Medium, Low)": {
+                "Critical": [],
+                "High": [f"Requested root item '{root_item_filter}' not found as BOM parent in selected scope."],
+                "Medium": [],
+                "Low": [],
+            },
+            "Readiness Verdict (Pass, Conditional Pass, Fail)": "Conditional Pass",
+            "Recommended Fixes": [
+                "Provide a valid parent ITEM in BOM Traversal input.",
+                "Remove item filter to traverse all BOM roots.",
+            ],
+        }
+
+    traversal_rows: List[Dict] = []
+    traversal_id = 0
+    cycle_skips = 0
+    max_depth_reached = 0
+    links: List[Dict[str, str]] = []
+    node_depth: Dict[str, int] = {}
+
+    for root_item, root_loc in roots:
+        traversal_id += 1
+        stack: List[Tuple[str, str, int, Optional[str], Optional[str], str, str, set]] = [
+            (root_item, root_loc, 1, None, None, root_item, root_loc, {(root_item, root_loc)})
+        ]
+
+        while stack:
+            item_id, item_loc, depth, next_item, next_loc, initial_item, initial_loc, path = stack.pop()
+            max_depth_reached = max(max_depth_reached, depth)
+            children = adjacency.get((item_id, item_loc), [])
+
+            for component_id, component_loc, bomnum in children:
+                initial_die_code = item_die_code_map.get(initial_item, "")
+                initial_item_label = f"{initial_item} ({initial_die_code})" if initial_die_code else initial_item
+                row = {
+                    "TRAVERSAL_ID": traversal_id,
+                    "TRAVERSAL_DEPTH_NBR": depth,
+                    "INITIAL_ITEM_ID": initial_item_label,
+                    "ITEM_ORDER_POINT": item_order_point_map.get(initial_item),
+                    "INITIAL_ITEM_KEY": initial_item,
+                    "INITIAL_ITEM_PRODUCT_NAME": initial_die_code or None,
+                    "INITIAL_ITEM_CLASS": item_class_map.get(initial_item, ""),
+                    "INITIAL_PLANT_CD": initial_loc,
+                    "ITEM_ID": item_id,
+                    "ITEM_CLASS": item_class_map.get(item_id, ""),
+                    "PREVIOUS_ITEM_ID": component_id,
+                    "PREVIOUS_ITEM_CLASS": item_class_map.get(component_id, ""),
+                    "PREVIOUS_PLANT_CD": component_loc,
+                    "NEXT_ITEM_ID": next_item or initial_item,
+                    "NEXT_ITEM_CLASS": item_class_map.get(next_item or initial_item, ""),
+                    "NEXT_PLANT_CD": next_loc or "VF",
+                    "LANE_ITEM": component_id,
+                    "LANE_SOURCE": component_loc,
+                    "LANE_DESTINATION": item_loc,
+                    "BOMNUM": bomnum,
+                }
+                traversal_rows.append(row)
+
+                parent_node = f"{item_id}|{item_loc}"
+                child_node = f"{component_id}|{component_loc}"
+                links.append({"from": parent_node, "to": child_node, "label": "BOM"})
+
+                node_depth[parent_node] = min(depth - 1, node_depth.get(parent_node, depth - 1)) if parent_node in node_depth else depth - 1
+                next_depth = depth
+                node_depth[child_node] = min(next_depth, node_depth.get(child_node, next_depth)) if child_node in node_depth else next_depth
+
+                child_key = (component_id, component_loc)
+                if depth >= max_depth:
+                    continue
+                if child_key in path:
+                    cycle_skips += 1
+                    continue
+
+                new_path = set(path)
+                new_path.add(child_key)
+                stack.append((component_id, component_loc, depth + 1, item_id, item_loc, initial_item, initial_loc, new_path))
+
+    unique_links = []
+    seen_link_keys = set()
+    for link in links:
+        key = (link["from"], link["to"], link["label"])
+        if key in seen_link_keys:
+            continue
+        seen_link_keys.add(key)
+        unique_links.append(link)
+
+    nodes: List[Dict[str, object]] = []
+    for node_key, depth in sorted(node_depth.items(), key=lambda kv: (kv[1], kv[0])):
+        item_id, loc = node_key.split("|", 1)
+        nodes.append(
+            {
+                "id": node_key,
+                "item_id": item_id,
+                "loc": loc,
+                "item_class": item_class_map.get(item_id, ""),
+                "depth": int(depth),
+                "is_root": node_key in {f"{i}|{l}" for (i, l) in roots},
+            }
+        )
+
+    levels_map: Dict[int, List[str]] = {}
+    for node in nodes:
+        levels_map.setdefault(int(node["depth"]), []).append(f"{node['item_id']}@{node['loc']}")
+    levels = [
+        {"depth": depth, "items": sorted(items)}
+        for depth, items in sorted(levels_map.items(), key=lambda kv: kv[0])
+    ]
+
+    critical: List[str] = []
+    high: List[str] = []
+    medium: List[str] = []
+    low: List[str] = []
+    if not traversal_rows:
+        high.append("No traversal edges found for selected filters.")
+    if cycle_skips > 0:
+        medium.append(f"Cycle protection skipped {cycle_skips} recursive expansions.")
+
+    verdict = "Pass"
+    if critical:
+        verdict = "Fail"
+    elif high:
+        verdict = "Conditional Pass"
+
+    return {
+        "Validation Scope": {
+            "week_id": context.get("week_id"),
+            "scenario_id": context.get("scenario_id"),
+            "scope": scope,
+            "focus_areas": ["bom_traversal"],
+            "item_filter": root_item_filter or None,
+            "site_filter": site_filter or None,
+            "max_depth": max_depth,
+        },
+        "Traversal Summary": {
+            "total_bom_rows": len(bom_rows),
+            "roots_considered": len(roots),
+            "traversal_rows": len(traversal_rows),
+            "unique_nodes": len(nodes),
+            "unique_links": len(unique_links),
+            "max_depth_reached": max_depth_reached,
+            "cycle_skips": cycle_skips,
+        },
+        "Mind Map": {
+            "nodes": nodes,
+            "links": unique_links,
+            "levels": levels,
+            "root_items": [f"{item}@{loc}" for (item, loc) in roots],
+        },
+        "Traversal Rows": traversal_rows[:1500],
+        "Issues Found (Critical, High, Medium, Low)": {
+            "Critical": critical,
+            "High": high,
+            "Medium": medium,
+            "Low": low,
+        },
+        "Readiness Verdict (Pass, Conditional Pass, Fail)": verdict,
+        "Recommended Next Checks": [
+            "Apply ITEM filter to inspect a specific root-to-component lineage path.",
+            "Cross-check edges with production method and production step for route completeness.",
+        ],
+    }
+
+
+def run_production_route_check(base_dir: Path, week_id: Optional[str], scenario_id: Optional[str], scope: Dict) -> Dict:
+    input_dir = base_dir / INPUT_FOLDER
+    context = _resolve_context(base_dir, week_id, scenario_id)
+
+    bom_file = _find_latest_file_by_prefix(input_dir, "if_snop_billofmaterials-")
+    prod_method_file = _find_latest_file_by_prefix(input_dir, "if_snop_productionmethod-")
+    prod_step_file = _find_latest_file_by_prefix(input_dir, "if_snop_productionstep-")
+    res_file = _find_latest_file_by_prefix(input_dir, "if_snop_res-")
+
+    missing_required = []
+    if not bom_file:
+        missing_required.append("if_snop_billofmaterials-")
+    if not prod_method_file:
+        missing_required.append("if_snop_productionmethod-")
+    if not prod_step_file:
+        missing_required.append("if_snop_productionstep-")
+    if not res_file:
+        missing_required.append("if_snop_res-")
+
+    def _load_rows(file_path: Optional[Path]) -> List[Dict]:
+        if not file_path:
+            return []
+        return [row for row in _safe_rows(file_path) if _row_matches_week_scenario(row, week_id, scenario_id)]
+
+    bom_rows = _load_rows(bom_file)
+    prod_method_rows = _load_rows(prod_method_file)
+    prod_step_rows = _load_rows(prod_step_file)
+    res_rows = _load_rows(res_file)
+
+    bom_keys = {
+        ((row.get("ITEM") or "").strip(), (row.get("LOC") or "").strip(), (row.get("BOMNUM") or "").strip())
+        for row in bom_rows
+        if (row.get("ITEM") or "").strip() and (row.get("LOC") or "").strip() and (row.get("BOMNUM") or "").strip()
+    }
+
+    method_bom_keys = {
+        ((row.get("ITEM") or "").strip(), (row.get("LOC") or "").strip(), (row.get("BOMNUM") or "").strip())
+        for row in prod_method_rows
+        if (row.get("ITEM") or "").strip() and (row.get("LOC") or "").strip() and (row.get("BOMNUM") or "").strip()
+    }
+
+    method_keys = {
+        ((row.get("ITEM") or "").strip(), (row.get("LOC") or "").strip(), (row.get("PRODUCTIONMETHOD") or "").strip())
+        for row in prod_method_rows
+        if (row.get("ITEM") or "").strip() and (row.get("LOC") or "").strip() and (row.get("PRODUCTIONMETHOD") or "").strip()
+    }
+
+    step_method_keys = {
+        ((row.get("ITEM") or "").strip(), (row.get("LOC") or "").strip(), (row.get("PRODUCTIONMETHOD") or "").strip())
+        for row in prod_step_rows
+        if (row.get("ITEM") or "").strip() and (row.get("LOC") or "").strip() and (row.get("PRODUCTIONMETHOD") or "").strip()
+    }
+
+    missing_method_for_bom = sorted(list(bom_keys - method_bom_keys))
+    missing_step_for_method = sorted(list(method_keys - step_method_keys))
+
+    step_count_by_method: Dict[Tuple[str, str, str], set] = {}
+    for row in prod_step_rows:
+        item = (row.get("ITEM") or "").strip()
+        loc = (row.get("LOC") or "").strip()
+        method = (row.get("PRODUCTIONMETHOD") or "").strip()
+        stepnum = (row.get("STEPNUM") or "").strip()
+        if not item or not loc or not method:
+            continue
+        key = (item, loc, method)
+        if key not in step_count_by_method:
+            step_count_by_method[key] = set()
+        if stepnum:
+            step_count_by_method[key].add(stepnum)
+
+    step_count_rows = [
+        {
+            "ITEM": key[0],
+            "LOC": key[1],
+            "PRODUCTIONMETHOD": key[2],
+            "STEP_COUNT": len(stepnums),
+        }
+        for key, stepnums in step_count_by_method.items()
+    ]
+    step_count_rows = sorted(step_count_rows, key=lambda r: (r["ITEM"], r["LOC"], r["PRODUCTIONMETHOD"]))
+    step_counts = [row["STEP_COUNT"] for row in step_count_rows]
+
+    res_keys = {
+        ((row.get("RES") or "").strip(), (row.get("LOC") or "").strip())
+        for row in res_rows
+        if (row.get("RES") or "").strip() and (row.get("LOC") or "").strip()
+    }
+    res_names = {(row.get("RES") or "").strip() for row in res_rows if (row.get("RES") or "").strip()}
+
+    invalid_step_res_loc = []
+    invalid_step_res_only = []
+    for row in prod_step_rows:
+        item = (row.get("ITEM") or "").strip()
+        loc = (row.get("LOC") or "").strip()
+        method = (row.get("PRODUCTIONMETHOD") or "").strip()
+        step = (row.get("STEPNUM") or "").strip()
+        res = (row.get("RES") or "").strip()
+        if not res:
+            continue
+        if (res, loc) not in res_keys:
+            invalid_step_res_loc.append({"ITEM": item, "LOC": loc, "PRODUCTIONMETHOD": method, "STEPNUM": step, "RES": res})
+        if res not in res_names:
+            invalid_step_res_only.append({"ITEM": item, "LOC": loc, "PRODUCTIONMETHOD": method, "STEPNUM": step, "RES": res})
+
+    checks = {
+        "bom_triplets_total": len(bom_keys),
+        "method_bom_triplets_total": len(method_bom_keys),
+        "method_records_total": len(method_keys),
+        "method_with_steps_total": len(step_method_keys),
+        "bom_without_production_method_count": len(missing_method_for_bom),
+        "production_method_without_steps_count": len(missing_step_for_method),
+        "invalid_step_res_loc_links_count": len(invalid_step_res_loc),
+        "invalid_step_res_name_count": len(invalid_step_res_only),
+        "step_count_methods_total": len(step_count_rows),
+        "step_count_min": min(step_counts) if step_counts else 0,
+        "step_count_max": max(step_counts) if step_counts else 0,
+        "step_count_avg": round((sum(step_counts) / len(step_counts)), 2) if step_counts else 0,
+    }
+
+    critical = []
+    high = []
+    medium = []
+    low = []
+
+    if missing_required:
+        critical.append(f"Missing required route datasets: {', '.join(missing_required)}")
+    if checks["bom_without_production_method_count"] > 0:
+        high.append(f"bom_without_production_method_count: {checks['bom_without_production_method_count']}")
+    if checks["production_method_without_steps_count"] > 0:
+        high.append(f"production_method_without_steps_count: {checks['production_method_without_steps_count']}")
+    if checks["invalid_step_res_loc_links_count"] > 0:
+        high.append(f"invalid_step_res_loc_links_count: {checks['invalid_step_res_loc_links_count']}")
+    if checks["invalid_step_res_name_count"] > 0:
+        medium.append(f"invalid_step_res_name_count: {checks['invalid_step_res_name_count']}")
+    if checks["step_count_methods_total"] == 0 and not critical:
+        medium.append("No production methods with step counts were found.")
+
+    verdict = "Pass"
+    if critical:
+        verdict = "Fail"
+    elif high:
+        verdict = "Conditional Pass"
+
+    return {
+        "Validation Scope": {
+            "week_id": context.get("week_id"),
+            "scenario_id": context.get("scenario_id"),
+            "scope": scope,
+            "focus_areas": ["production_route"],
+            "source": "by_input",
+        },
+        "Datasets and Evidence Used": {
+            "source_priority": ["by_input", "Snowflake fallback"],
+            "files": {
+                "if_snop_billofmaterials": bom_file.name if bom_file else None,
+                "if_snop_productionmethod": prod_method_file.name if prod_method_file else None,
+                "if_snop_productionstep": prod_step_file.name if prod_step_file else None,
+                "if_snop_res": res_file.name if res_file else None,
+            },
+            "missing_required_prefixes": missing_required,
+            "context_resolution": context,
+        },
+        "Checks Executed": checks,
+        "Issues Found (Critical, High, Medium, Low)": {
+            "Critical": critical,
+            "High": high,
+            "Medium": medium,
+            "Low": low,
+        },
+        "Route Coverage Details": {
+            "sample_bom_without_production_method": [
+                {"ITEM": item, "LOC": loc, "BOMNUM": bomnum} for (item, loc, bomnum) in missing_method_for_bom[:50]
+            ],
+            "sample_production_method_without_steps": [
+                {"ITEM": item, "LOC": loc, "PRODUCTIONMETHOD": method} for (item, loc, method) in missing_step_for_method[:50]
+            ],
+            "sample_invalid_step_res_loc_links": invalid_step_res_loc[:50],
+            "sample_invalid_step_res_name": invalid_step_res_only[:50],
+            "step_count_by_method_sample": step_count_rows[:200],
+        },
+        "Readiness Verdict (Pass, Conditional Pass, Fail)": verdict,
+        "Recommended Fixes (ordered by impact)": [
+            "Create production methods for all BOM triplets (ITEM, LOC, BOMNUM) missing routing definitions.",
+            "Create production steps for each production method where step coverage is missing.",
+            "Fix production step RES assignments so RES and LOC align with if_snop_res.",
+            "Re-run Production Route Check after route master updates.",
+        ],
+        "Confidence and Data Gaps": {
+            "confidence": "High" if not critical else "Medium",
+            "data_gaps": [
+                "Week/Scenario filters apply only when these columns exist in by_input tables.",
+                "Snowflake parity checks can be enabled later using identical output schema.",
+            ],
         },
     }
 

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Intel Foundry Planning AI Assistant</title>
     <link rel="icon" type="image/png" href="/static/intelfoundrylogo.png" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=4" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -104,13 +104,11 @@
 
           <article class="card feature-panel" data-panel="validation">
             <h2>Validation Gate</h2>
-            <div class="field-grid">
-              <input id="valWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
-              <input id="valScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
-              <input id="valSite" placeholder="Plant (optional)" />
-              <input id="valProduct" placeholder="Product (optional)" />
+            <div class="analytics-control-tabs" id="validationControlTabs" role="tablist" aria-label="Validation tabs">
+              <button class="analytics-control-tab active" type="button" data-val-tab="data_quality">Data Quality Check</button>
+              <button class="analytics-control-tab" type="button" data-val-tab="bom_traversal">BOM Traversal Check</button>
+              <button class="analytics-control-tab" type="button" data-val-tab="production_route">Production Route Check</button>
             </div>
-            <button id="validateBtn" class="btn">Run Validation</button>
           </article>
 
           <article class="card feature-panel" data-panel="comparison">
@@ -167,8 +165,9 @@
                 <h2>Validation Gate Output</h2>
                 <p class="hint">Validation findings, severity, and recommended fixes.</p>
               </div>
+              <div id="valActiveGateBadge" class="validation-active-badge">Active Gate: Data Quality Check</div>
             </div>
-            <div id="validationResultPane" class="result-pane">Run validation to view results...</div>
+            <div id="validationResultPane" class="result-pane">Select a validation sub-tab, enter Week ID and Scenario ID, then click Go.</div>
           </article>
 
           <article class="output insight-page" data-panel="comparison">
@@ -215,6 +214,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=4"></script>
+    <script src="/static/app.js?v=13"></script>
   </body>
 </html>

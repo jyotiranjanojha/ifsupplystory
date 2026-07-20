@@ -335,6 +335,19 @@ body {
   gap: 1rem;
 }
 
+.validation-active-badge {
+  align-self: flex-start;
+  border: 1px solid rgba(142, 210, 255, 0.55);
+  border-radius: 999px;
+  background: rgba(0, 163, 224, 0.18);
+  color: #dff3ff;
+  padding: 0.28rem 0.62rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .hint {
   margin: -0.2rem 0 0.8rem;
   color: var(--ink-soft);
@@ -722,6 +735,24 @@ select:focus {
   color: #ffffff;
 }
 
+.validation-input-wrap {
+  gap: 0.4rem;
+}
+
+.validation-input-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(130px, 220px));
+  gap: 0.45rem;
+  align-items: start;
+}
+
+.validation-input-grid input {
+  min-height: 34px;
+  padding: 0.38rem 0.55rem;
+  font-size: 0.8rem;
+  border-radius: 9px;
+}
+
 .insights-subtabs {
   display: flex;
   flex-wrap: wrap;
@@ -837,10 +868,154 @@ select:focus {
   flex-wrap: wrap;
 }
 
+.validation-wrap .analytics-actions {
+  gap: 0.35rem;
+}
+
+.validation-wrap .analytics-actions .btn {
+  padding: 0.34rem 0.56rem;
+  font-size: 0.76rem;
+  border-radius: 8px;
+  line-height: 1.2;
+}
+
 .analytics-note {
   color: #b7dfff;
   font-size: 0.78rem;
   line-height: 1.35;
+}
+
+.bom-map-card {
+  gap: 0.65rem;
+}
+
+.bom-kg-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.bom-kg-canvas {
+  min-height: 420px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(142, 210, 255, 0.22);
+  border-radius: 12px;
+  padding: 0.5rem;
+}
+
+.bom-kg-svg {
+  width: 100%;
+  min-height: 400px;
+}
+
+.bom-kg-side {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.bom-kg-detail {
+  min-height: 180px;
+}
+
+.bom-kg-edge-hit {
+  stroke: transparent;
+  stroke-width: 15;
+  cursor: pointer;
+}
+
+.bom-kg-edge {
+  stroke: rgba(142, 210, 255, 0.62);
+  stroke-width: 2;
+  transition: opacity 0.16s ease, stroke 0.16s ease, stroke-width 0.16s ease;
+}
+
+.bom-kg-edge-label {
+  fill: #8ed2ff;
+  font-size: 10px;
+}
+
+.bom-kg-node {
+  cursor: pointer;
+}
+
+.bom-kg-node circle {
+  fill: rgba(0, 163, 224, 0.9);
+  stroke: rgba(255, 255, 255, 0.2);
+  stroke-width: 1;
+  transition: opacity 0.16s ease, transform 0.16s ease, stroke 0.16s ease;
+  transform-origin: center;
+}
+
+.bom-kg-node-label {
+  fill: #e8f5ff;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bom-kg-node-sub {
+  fill: #9edcff;
+  font-size: 10px;
+}
+
+.bom-kg-node.active circle {
+  stroke: #ffffff;
+  stroke-width: 2.3;
+  transform: scale(1.05);
+}
+
+.bom-kg-node.dim {
+  opacity: 0.3;
+}
+
+.bom-kg-edge.active {
+  stroke: rgba(0, 212, 255, 0.95);
+  stroke-width: 3;
+}
+
+.bom-kg-edge.dim,
+.bom-kg-edge-hit.dim {
+  opacity: 0.2;
+}
+
+.bom-map-grid {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.bom-map-level {
+  display: grid;
+  gap: 0.35rem;
+  border: 1px solid rgba(142, 210, 255, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 0.5rem 0.55rem;
+}
+
+.bom-map-depth {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #8ed2ff;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.bom-map-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.bom-map-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(158, 220, 255, 0.4);
+  background: rgba(0, 163, 224, 0.16);
+  color: #e8f5ff;
+  font-size: 0.74rem;
+  padding: 0.2rem 0.5rem;
+  line-height: 1.2;
 }
 
 .insights-error {
@@ -1227,6 +1402,10 @@ select:focus {
 
   .compact-toggle {
     justify-content: flex-start;
+  }
+
+  .bom-kg-wrap {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -113,3 +113,22 @@ class RagReindexRequest(BaseModel):
     force: bool = True
     max_rows_per_file: int = 2000
     max_docs: int = 250000
+
+
+class DataQualityReportRequest(BaseModel):
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+
+
+class DataQualityEmailRequest(DataQualityReportRequest):
+    recipient_email: Optional[str] = None
+
+
+class ValidationReportRequest(BaseModel):
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    focus_area: str = "data_quality_input"
+
+
+class ValidationReportEmailRequest(ValidationReportRequest):
+    recipient_email: Optional[str] = None
