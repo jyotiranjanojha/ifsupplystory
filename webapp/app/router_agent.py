@@ -29,7 +29,9 @@ from typing_extensions import TypedDict
 # ── Ollama LLM router config (used only as low-confidence fallback) ──────────
 _OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 _OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
-_ROUTER_CONFIDENCE_THRESHOLD = float(os.getenv("OLLAMA_ROUTER_CONFIDENCE_THRESHOLD", "0.3"))
+# High threshold: only bypass the LLM when keyword confidence is very strong.
+# This makes routing LLM-first for almost all questions.
+_ROUTER_BYPASS_THRESHOLD = float(os.getenv("OLLAMA_ROUTER_CONFIDENCE_THRESHOLD", "0.75"))
 
 # ---------------------------------------------------------------------------
 # Intent catalog
@@ -357,32 +359,53 @@ def _extract_table_name(text: str) -> Optional[str]:
 
 def _call_ollama_router(question: str) -> Optional[str]:
     """
-    Ask Ollama to classify intent when keyword confidence is low.
+    Ask Ollama to classify the planning question intent.
+
+    Now the PRIMARY routing path (not just a fallback).  The LLM is much
+    better than keyword lists at understanding natural language variations.
 
     Strategy (version-safe):
-      1. Try with JSON schema `format` (Ollama >= 0.3.9) — enum-constrained,
-         guarantees response is exactly one valid intent name.
-      2. On any failure (older Ollama, parse error, network) — retry without
-         format and fall back to substring matching.
-
-    The enum is built dynamically from INTENT_CATALOG so it never goes stale.
+      1. Try with JSON schema `format` (Ollama >= 0.3.9) — enum-constrained.
+      2. On failure — retry without format and fall back to substring matching.
     """
     valid_intents = list(INTENT_CATALOG.keys())
     intent_lines = "\n".join(
         f"- {name}: {spec['description']}"
         for name, spec in INTENT_CATALOG.items()
     )
+
+    few_shot_examples = (
+        "Examples of natural language → intent mapping:\n"
+        "- 'was the demand for item 100000000004 met?' → item_demand_supply\n"
+        "- 'check if demand for item 100000000009 was fulfilled' → item_demand_supply\n"
+        "- 'why is item 100000000004 unmet?' → root_cause\n"
+        "- 'what is causing the supply shortage for 100000000009?' → root_cause\n"
+        "- 'show me the BOM for item 100000000004' → bom_drill\n"
+        "- 'compare constrained vs unconstrained scenario this week' → compare\n"
+        "- 'what is the fill rate trend?' → insights\n"
+        "- 'validate master data for latest week' → validation\n"
+        "- 'what does inddmdview contain?' → table_explain\n"
+        "- 'run a SQL query to find all unmet demands' → sql_query\n"
+        "- 'explain data quality issues' → domain_data_hygiene\n"
+        "- 'why didn\\'t we ship customer order X?' → domain_fulfillment\n"
+        "- 'why are there no planned orders for item Y?' → domain_generation\n"
+    )
+
     # With format: no need to say "return only" — schema enforces it
     prompt_structured = (
+        f"You are a supply planning query classifier for Intel Foundry.\n"
         f"Classify this planning question into exactly one intent.\n\n"
         f"Intents:\n{intent_lines}\n\n"
+        f"{few_shot_examples}\n"
         f"Question: {question}"
     )
     # Without format: explicit instruction needed
     prompt_plain = (
+        f"You are a supply planning query classifier for Intel Foundry.\n"
         f"Classify this planning question into exactly one intent.\n"
         f"Return ONLY the intent name, nothing else.\n\n"
         f"Intents:\n{intent_lines}\n\n"
+        f"{few_shot_examples}\n"
         f"Question: {question}\nIntent:"
     )
 
@@ -454,36 +477,47 @@ def _call_ollama_router(question: str) -> Optional[str]:
 
 
 def llm_classify(state: RouterState) -> Dict[str, Any]:
-    """LLM fallback node — fires when keyword confidence is below threshold."""
+    """LLM classification node — now the primary routing path for most questions."""
     matched_intent = _call_ollama_router(state["question"])
-    # _call_ollama_router already validates against INTENT_CATALOG
-    # so no additional substring matching needed here
 
-    if not matched_intent or matched_intent == "conversational":
+    if matched_intent and matched_intent != "conversational":
+        spec = INTENT_CATALOG[matched_intent]
         return {
+            "intent": matched_intent,
+            "domain": spec.get("domain"),
+            "workflow": spec["workflow"],
+            "confidence": 0.65,
+            "conflict": False,
+            "conflicting_intents": [],
             "llm_fallback_used": True,
-            "matched_terms": ["llm_fallback:no_change"],
+            "matched_terms": [f"llm_classified:{matched_intent}"],
         }
 
-    spec = INTENT_CATALOG[matched_intent]
+    # LLM returned conversational or failed.
+    # Promote the keyword result when it found something useful.
+    keyword_intent = state.get("intent", "conversational")
+    keyword_confidence = state.get("confidence", 0.0)
+    if keyword_intent != "conversational" and keyword_confidence > 0.0:
+        return {
+            "llm_fallback_used": True,
+            "matched_terms": [f"keyword_promoted:{keyword_intent}"],
+            # Leave intent/workflow unchanged — keyword result wins
+        }
+
     return {
-        "intent": matched_intent,
-        "domain": spec.get("domain"),
-        "workflow": spec["workflow"],
-        "confidence": 0.5,
-        "conflict": False,
-        "conflicting_intents": [],
         "llm_fallback_used": True,
-        "matched_terms": [f"llm_classified:{matched_intent}"],
+        "matched_terms": ["llm_fallback:no_change"],
     }
 
 
 def _route_after_classify(state: RouterState) -> str:
     confidence = state.get("confidence", 0.0)
     question = state.get("question", "")
-    if confidence < _ROUTER_CONFIDENCE_THRESHOLD and len(question) > 15:
-        return "llm_classify"
-    return "resolve_entities"
+    # LLM-first: skip the LLM only when keyword matching is very confident.
+    # This lets natural language questions bypass rigid keyword lists.
+    if confidence >= _ROUTER_BYPASS_THRESHOLD and len(question) > 0:
+        return "resolve_entities"  # strong keyword match — no LLM needed
+    return "llm_classify"          # everything else goes through the LLM first
 
 
 # ---------------------------------------------------------------------------

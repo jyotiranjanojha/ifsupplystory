@@ -1920,6 +1920,8 @@ async function loadLlmModels() {
     const data = await res.json();
     const models = Array.isArray(data.models) ? data.models : [];
     const defaultModel = data.default_model || 'gemma3:latest';
+    const bestAvailable = data.best_available || defaultModel;
+    const modelInfo = data.model_info || {};
 
     chatLlmModel.innerHTML = '';
 
@@ -1929,11 +1931,18 @@ async function loadLlmModels() {
       option.textContent = defaultModel;
       chatLlmModel.appendChild(option);
     } else {
-      models.forEach((modelName) => {
+      // Sort: recommended first, then rest alphabetically
+      const recommended = models.filter((m) => (modelInfo[m] || {}).recommended);
+      const others = models.filter((m) => !(modelInfo[m] || {}).recommended);
+      const sorted = [...recommended, ...others];
+
+      sorted.forEach((modelName) => {
         const option = document.createElement('option');
         option.value = modelName;
-        option.textContent = modelName;
-        if (modelName === defaultModel) {
+        const info = modelInfo[modelName] || {};
+        const label = info.recommended ? `★ ${modelName}` : modelName;
+        option.textContent = info.note ? `${label}  —  ${info.note}` : label;
+        if (modelName === bestAvailable) {
           option.selected = true;
         }
         chatLlmModel.appendChild(option);
@@ -1943,6 +1952,10 @@ async function loadLlmModels() {
     if (!data.reachable) {
       chatLlmStatus.textContent = 'Ollama is not reachable. Chat will fall back to built-in grounded responses.';
     } else {
+      const best = bestAvailable !== defaultModel
+        ? `Auto-selected best available: ${bestAvailable}`
+        : `Using model: ${bestAvailable}`;
+      chatLlmStatus.textContent = best;
       setLlmControls();
     }
   } catch (err) {

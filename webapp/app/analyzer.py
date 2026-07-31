@@ -1694,6 +1694,24 @@ def _ollama_chat_with_model(
 
 
 def list_ollama_models() -> Dict:
+    # Priority-ordered list of models best suited for planning Q&A.
+    # Earlier entries are preferred; the first available one is auto-selected.
+    _MODEL_PRIORITY: List[Tuple[str, str]] = [
+        ("llama3.1:8b",     "Best instruction-following for planning Q&A"),
+        ("llama3.1:latest", "Best instruction-following for planning Q&A"),
+        ("mistral:7b",      "Strong structured reasoning"),
+        ("mistral:latest",  "Strong structured reasoning"),
+        ("qwen2.5:7b",      "Excellent for logic & domain tasks"),
+        ("qwen2.5:latest",  "Excellent for logic & domain tasks"),
+        ("phi3:medium",     "Compact, highly instruction-aligned"),
+        ("phi3:latest",     "Compact, highly instruction-aligned"),
+        ("llama3:8b",       "Good general-purpose"),
+        ("llama3:latest",   "Good general-purpose"),
+        ("gemma3:4b",       "Lightweight general-purpose"),
+        ("gemma3:latest",   "Lightweight general-purpose"),
+    ]
+    _RECOMMENDED_NAMES = {name for name, _ in _MODEL_PRIORITY}
+
     req = request.Request(f"{OLLAMA_BASE_URL}/api/tags", method="GET")
     try:
         with request.urlopen(req, timeout=15) as response:
@@ -1703,20 +1721,44 @@ def list_ollama_models() -> Dict:
             "provider": "Ollama",
             "reachable": False,
             "default_model": OLLAMA_MODEL,
+            "best_available": OLLAMA_MODEL,
+            "recommended_models": [name for name, _ in _MODEL_PRIORITY],
             "models": [],
+            "model_info": {},
         }
 
-    models = []
+    available: List[str] = []
     for model in body.get("models", []):
         name = (model.get("name") or "").strip()
         if name:
-            models.append(name)
+            available.append(name)
+
+    available_set = set(available)
+
+    # Pick the best model from the priority list that is actually installed
+    best_available = OLLAMA_MODEL
+    for name, _ in _MODEL_PRIORITY:
+        if name in available_set:
+            best_available = name
+            break
+
+    # Build per-model metadata for the UI
+    model_info: Dict[str, Dict] = {}
+    for name in available:
+        rec = next(((n, d) for n, d in _MODEL_PRIORITY if n == name), None)
+        model_info[name] = {
+            "recommended": name in _RECOMMENDED_NAMES,
+            "note": rec[1] if rec else "",
+        }
 
     return {
         "provider": "Ollama",
         "reachable": True,
         "default_model": OLLAMA_MODEL,
-        "models": models,
+        "best_available": best_available,
+        "recommended_models": [name for name, _ in _MODEL_PRIORITY if name in available_set],
+        "models": available,
+        "model_info": model_info,
     }
 
 
