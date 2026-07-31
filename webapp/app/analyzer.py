@@ -3234,6 +3234,273 @@ def _build_fallback_rc_narrative(stats: Dict, root_causes: List[str], findings: 
     return "\n".join(lines)
 
 
+def _compute_rc_deep_evidence(
+    base_dir: Path,
+    demand_item: str,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    site: Optional[str],
+) -> Dict:
+    """
+    Data-computation layer — queries CSV files directly and computes all the
+    specific facts (lateness distribution, period gaps, supply parameters,
+    resource bottlenecks, EOH, fence dates, lot-size impact) that the LLM
+    needs to produce a grounded narrative rather than generic descriptions.
+    """
+    from collections import defaultdict
+
+    input_dir  = base_dir / INPUT_FOLDER
+    output_dir = base_dir / OUTPUT_FOLDER
+
+    evidence: Dict = {}
+
+    # ── 1. DEMAND: per-row lateness & period demand bucket ────────────────
+    dmd_file = _find_file_by_prefix(output_dir, "by_if_snop_out_inddmdview-")
+    late_days_list: List[float] = []
+    early_days_list: List[float] = []
+    period_demand: Dict[str, float]  = defaultdict(float)   # "YYYY-MM" → demand qty
+    period_sched: Dict[str, float]   = defaultdict(float)   # "YYYY-MM" → sched qty
+    unmet_orders: List[Dict] = []
+    if dmd_file:
+        for row in _safe_rows(dmd_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            nd = _parse_date(row.get("NEEDDATE"))
+            sd = _parse_date(row.get("SCHEDDATE"))
+            dq = _safe_float(row.get("QTY"))
+            sq = _safe_float(row.get("SCHEDQTY"))
+            if nd:
+                period_demand[nd.strftime("%Y-%m")] += dq
+            if nd and sd and sq > 0:
+                delta = (sd - nd).days
+                if delta > 0:
+                    late_days_list.append(delta)
+                elif delta < 0:
+                    early_days_list.append(-delta)
+            if nd:
+                period_sched[nd.strftime("%Y-%m")] += sq
+            # flag unmet orders (non-zero demand, zero sched)
+            if dq > 0 and sq == 0:
+                unmet_orders.append({
+                    "order": (row.get("EXTORDERID") or "").strip() or None,
+                    "need_date": _fmt_date(nd),
+                    "qty": dq,
+                    "loc": (row.get("LOC") or "").strip(),
+                })
+
+    # Period balance table (sorted by month)
+    period_balance = []
+    all_periods = sorted(set(list(period_demand.keys()) + list(period_sched.keys())))
+    for p in all_periods:
+        dq = period_demand.get(p, 0.0)
+        sq = period_sched.get(p, 0.0)
+        period_balance.append({
+            "period": p,
+            "demand_qty": round(dq, 1),
+            "sched_qty":  round(sq, 1),
+            "gap":        round(dq - sq, 1),
+            "fill_pct":   round(sq / dq * 100, 1) if dq > 0 else None,
+        })
+
+    lateness = {}
+    if late_days_list:
+        late_days_list.sort()
+        lateness = {
+            "late_rows": len(late_days_list),
+            "avg_days": round(sum(late_days_list) / len(late_days_list), 1),
+            "max_days": int(max(late_days_list)),
+            "median_days": int(late_days_list[len(late_days_list) // 2]),
+            "gt_30_days": sum(1 for d in late_days_list if d > 30),
+            "gt_60_days": sum(1 for d in late_days_list if d > 60),
+        }
+    early = {}
+    if early_days_list:
+        early = {
+            "early_rows": len(early_days_list),
+            "avg_days": round(sum(early_days_list) / len(early_days_list), 1),
+            "max_days": int(max(early_days_list)),
+        }
+
+    evidence["lateness_analysis"]  = lateness
+    evidence["early_analysis"]     = early
+    evidence["period_balance"]     = period_balance[:24]  # cap at 24 months
+    evidence["unmet_orders_sample"] = sorted(unmet_orders, key=lambda x: x.get("need_date") or "")[:10]
+
+    # ── 2. SUPPLY PARAMETERS from input master data ───────────────────────
+    prod_params: List[Dict] = []
+    prod_file = _find_file_by_prefix(input_dir, "if_snop_productionmethod-")
+    if prod_file:
+        for row in _safe_rows(prod_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            lead_min = _safe_float(row.get("LEADTIME"))
+            lead_days = round(lead_min / 1440, 1) if lead_min > 0 else None  # 1440 min/day
+            prod_params.append({
+                "loc":            (row.get("LOC") or "").strip(),
+                "method":         (row.get("PRODUCTIONMETHOD") or "").strip(),
+                "leadtime_min":   int(lead_min) if lead_min else None,
+                "leadtime_days":  lead_days,
+                "incqty":         _safe_float(row.get("INCQTY")),
+                "nonewsupply_date": (row.get("NONEWSUPPLYDATE") or "").strip() or None,
+                "priority":       (row.get("PRIORITY") or "").strip() or None,
+            })
+
+    sku_params: List[Dict] = []
+    sku_file = _find_file_by_prefix(input_dir, "if_snop_sku-")
+    if sku_file:
+        for row in _safe_rows(sku_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            sku_params.append({
+                "loc":                (row.get("LOC") or "").strip(),
+                "order_leadtime_days": _safe_float(row.get("U_ORDER_LEADTIME")) or None,
+                "allocation_horizon_days": _safe_float(row.get("U_ALLOCATION_HORIZON")) or None,
+                "rsp_horizon_days":   _safe_float(row.get("U_RSP_HORIZON")) or None,
+                "infinite_supply":    (row.get("INFINITESUPPLYSW") or "").strip(),
+                "enable_opt":         (row.get("ENABLEOPT") or "").strip(),
+                "ss_rule":            (row.get("SSRULE") or "").strip() or None,
+            })
+
+    evidence["production_parameters"] = prod_params
+    evidence["sku_parameters"]         = sku_params
+
+    # Interpret fence dates and lot-size impact
+    fence_signals: List[str] = []
+    for p in prod_params:
+        fence = p.get("nonewsupply_date")
+        if fence:
+            fence_signals.append(
+                f"Production method {p['method']} at loc {p['loc']} has NONEWSUPPLYDATE={fence} "
+                f"(no new supply orders before this date). "
+                f"Lead time: {p['leadtime_days']} days, lot size: {p['incqty']}."
+            )
+    for s in sku_params:
+        lt = s.get("order_leadtime_days")
+        if lt and lt > 30:
+            fence_signals.append(
+                f"SKU at loc {s['loc']} has ORDER_LEADTIME={lt} days — "
+                f"orders placed today arrive in ~{int(lt)} days."
+            )
+    evidence["supply_constraint_signals"] = fence_signals
+
+    # ── 3. SKUPROJSTATIC: EOH and coverage by period ──────────────────────
+    eoh_data: List[Dict] = []
+    proj_file = _find_file_by_prefix(output_dir, "by_if_snop_out_skuprojstatic-")
+    if proj_file:
+        for row in _safe_rows(proj_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            eoh_data.append({
+                "loc":       (row.get("LOC") or "").strip(),
+                "date":      (row.get("STARTDATE") or "").strip(),
+                "covdur":    (row.get("COVDUR") or "").strip() or None,
+                "all_dmd":   (row.get("ALLDMD") or "").strip() or None,
+                "eoh_qty":   (row.get("EOHPROJQTY") or row.get("EOHAVAIL") or "").strip() or None,
+                "planonhand":(row.get("PLANONHAND") or "").strip() or None,
+                "met_dmd":   (row.get("METDMDQTY") or "").strip() or None,
+                "unmet_dmd": (row.get("UNMETDMDQTY") or "").strip() or None,
+            })
+    evidence["eoh_projection"] = eoh_data[:20]
+
+    # ── 4. RESOURCE BOTTLENECK: top resources by load qty for this item ───
+    res_load: Dict[str, float] = defaultdict(float)
+    res_cust: Dict[str, float] = defaultdict(float)
+    res_fcst: Dict[str, float] = defaultdict(float)
+    res_file = _find_file_by_prefix(output_dir, "by_if_snop_out_resloaddetail-")
+    if res_file:
+        for row in _safe_rows(res_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            res = (row.get("RES") or "").strip()
+            if res:
+                res_load[res] += _safe_float(row.get("LOADQTY"))
+                res_cust[res] += _safe_float(row.get("CUSTORDLOADQTY"))
+                res_fcst[res] += _safe_float(row.get("FCSTORDLOADQTY"))
+
+    top_resources = sorted(
+        [{"resource": r, "total_load": round(res_load[r], 1),
+          "customer_load": round(res_cust[r], 1),
+          "forecast_load": round(res_fcst[r], 1)}
+         for r in res_load],
+        key=lambda x: x["total_load"], reverse=True
+    )[:10]
+    evidence["top_resource_loads"] = top_resources
+
+    # ── 5. COMPETING DEMAND: top competing items by priority ──────────────
+    competing: Dict[str, Dict] = {}
+    if dmd_file and period_demand:
+        # only look at locs where our item has demand
+        demand_locs_set = set()
+        for row in _safe_rows(dmd_file):
+            if (row.get("ITEM") or "").strip() == demand_item and _matches_context(row, week_id, scenario_id):
+                demand_locs_set.add((row.get("LOC") or "").strip())
+
+        # collect items with higher priority (lower number) in same locs
+        our_priorities: List[int] = []
+        for row in _safe_rows(dmd_file):
+            if (row.get("ITEM") or "").strip() == demand_item and _matches_context(row, week_id, scenario_id):
+                p = _safe_int(row.get("CALCPRIORITY") or row.get("PRIORITY"))
+                if p is not None:
+                    our_priorities.append(p)
+        min_our_priority = min(our_priorities) if our_priorities else 9999
+
+        for row in _safe_rows(dmd_file):
+            if (row.get("ITEM") or "").strip() == demand_item:
+                continue
+            loc = (row.get("LOC") or "").strip()
+            if loc not in demand_locs_set:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            p = _safe_int(row.get("CALCPRIORITY") or row.get("PRIORITY"))
+            if p is None or p >= min_our_priority:
+                continue
+            comp_item = (row.get("ITEM") or "").strip()
+            if comp_item not in competing:
+                competing[comp_item] = {"item": comp_item, "priority": p, "qty": 0.0, "rows": 0}
+            competing[comp_item]["qty"] += _safe_float(row.get("QTY"))
+            competing[comp_item]["rows"] += 1
+
+    top_competing = sorted(competing.values(), key=lambda x: x["qty"], reverse=True)[:8]
+    for c in top_competing:
+        c["qty"] = round(c["qty"], 1)
+    evidence["competing_demand_detail"] = top_competing
+
+    # ── 6. EXCEPTION DETAIL ───────────────────────────────────────────────
+    exc_detail: List[Dict] = []
+    exc_file = _find_file_by_prefix(output_dir, "by_if_snop_out_skuexception-")
+    if exc_file:
+        for row in _safe_rows(exc_file):
+            if (row.get("ITEM") or "").strip() != demand_item:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            exc_detail.append({
+                "exception": (row.get("EXCEPTION") or "").strip(),
+                "descr":     (row.get("DESCR") or "").strip(),
+                "loc":       (row.get("LOC") or "").strip(),
+                "when":      (row.get("WHEN") or "").strip() or None,
+                "demand_qty":(row.get("DEMANDQTY") or "").strip() or None,
+            })
+    evidence["exception_detail"] = exc_detail
+
+    return evidence
+
+
 def run_root_cause_explained(
     base_dir: Path,
     week_id: Optional[str],
@@ -3245,8 +3512,15 @@ def run_root_cause_explained(
     demand_entity: Optional[Dict] = None,
 ) -> Dict:
     """
-    Run structured root cause analysis then generate a detailed LLM narrative
-    focused on the selected question type.
+    Enhanced root cause analysis with a data-computation layer.
+
+    Flow:
+      1. run_root_cause()         — structural demand/supply/lineage evidence
+      2. _compute_rc_deep_evidence() — data-analyst layer: period gaps,
+                                       lateness stats, lead-time fences,
+                                       lot-size impact, resource bottlenecks,
+                                       EOH, competing demand details
+      3. LLM narrative             — told to cite ONLY the pre-computed facts
     """
     raw = run_root_cause(base_dir, week_id, scenario_id, demand_id, scope, demand_entity=demand_entity)
 
@@ -3257,14 +3531,19 @@ def run_root_cause_explained(
     planned     = raw.get("Planned Supply Evidence", {})
     item_setup  = raw.get("Item Master and Planning Setup", {})
 
+    demand_item  = scope_info.get("demand_item") or ""
+    resolved_week = scope_info.get("week_id")
+    resolved_scen = scope_info.get("scenario_id")
+    site          = (scope or {}).get("node") or (scope or {}).get("site") or ""
+
     demand_qty = float(ds.get("demand_qty_total") or 0)
     sched_qty  = float(ds.get("scheduled_qty_total") or 0)
     fill_rate  = round(sched_qty / demand_qty * 100, 1) if demand_qty > 0 else 0.0
 
     stats: Dict = {
-        "item":             scope_info.get("demand_item"),
-        "week":             scope_info.get("week_id"),
-        "scenario":         scope_info.get("scenario_id"),
+        "item":             demand_item or None,
+        "week":             resolved_week,
+        "scenario":         resolved_scen,
         "meet_status":      ds.get("meet_status", "unknown"),
         "demand_qty":       demand_qty,
         "scheduled_qty":    sched_qty,
@@ -3287,23 +3566,41 @@ def run_root_cause_explained(
         "competing_demand_qty":  float(constraint.get("higher_priority_competing_qty") or 0),
     }
 
+    # ── Data analyst layer: compute specific facts from CSV data ──────────
+    deep: Dict = {}
+    if demand_item:
+        try:
+            deep = _compute_rc_deep_evidence(
+                base_dir, demand_item, resolved_week, resolved_scen,
+                site or None,
+            )
+            # Backfill lateness stats into the stats card
+            lat = deep.get("lateness_analysis") or {}
+            if lat:
+                stats["avg_lateness_days"] = lat.get("avg_days")
+                stats["max_lateness_days"] = lat.get("max_days")
+        except Exception:
+            pass
+
     focus = RC_QUESTION_FOCUS.get(question_type, RC_QUESTION_FOCUS["full_diagnosis"])
+
+    # ── Compose a rich, fact-dense LLM prompt ─────────────────────────────
     llm_context = {
         "focus":                focus,
-        "item":                 stats["item"],
-        "week":                 stats["week"],
-        "scenario":             stats["scenario"],
+        "item":                 demand_item,
+        "week":                 resolved_week,
+        "scenario":             resolved_scen,
         "demand_supply_summary": ds,
         "confirmed_findings":   raw.get("Confirmed Findings", []),
         "root_causes":          raw.get("Root Causes", []),
         "constraint_analysis":  constraint,
         "lineage_summary": {
-            "pegged_demand_qty":  lineage.get("pegged_demand_qty"),
-            "pegged_supply_qty":  lineage.get("pegged_supply_qty"),
-            "supply_types":       lineage.get("supply_types_seen"),
-            "supply_methods":     lineage.get("supply_methods_seen", [])[:8],
-            "top_supply_items":   lineage.get("top_pegged_supply_items", [])[:5],
-            "genealogy_sample":   lineage.get("genealogy_paths_sample", [])[:6],
+            "pegged_demand_qty": lineage.get("pegged_demand_qty"),
+            "pegged_supply_qty": lineage.get("pegged_supply_qty"),
+            "supply_types":      lineage.get("supply_types_seen"),
+            "supply_methods":    lineage.get("supply_methods_seen", [])[:8],
+            "top_supply_items":  lineage.get("top_pegged_supply_items", [])[:5],
+            "genealogy_sample":  lineage.get("genealogy_paths_sample", [])[:5],
         },
         "planned_supply":       planned,
         "item_setup_flags":     item_setup.get("setup_flags", {}),
@@ -3311,28 +3608,61 @@ def run_root_cause_explained(
         "domain_assessment":    raw.get("Domain Focus Assessment"),
         "primary_cause_tags":   (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("primary_cause_tags", []),
         "by_esp_reasoning":     (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("by_esp_reasoning", []),
+        # ── deep-computed evidence (data analyst layer) ───────────────
+        "period_demand_supply_balance": deep.get("period_balance", []),
+        "lateness_statistics":          deep.get("lateness_analysis") or {},
+        "early_fulfillment_stats":      deep.get("early_analysis") or {},
+        "unmet_orders_sample":          deep.get("unmet_orders_sample", []),
+        "production_parameters":        deep.get("production_parameters", []),
+        "sku_parameters":               deep.get("sku_parameters", []),
+        "supply_constraint_signals":    deep.get("supply_constraint_signals", []),
+        "eoh_projection":               deep.get("eoh_projection", []),
+        "top_resource_loads":           deep.get("top_resource_loads", []),
+        "competing_demand_detail":      deep.get("competing_demand_detail", []),
+        "exception_detail":             deep.get("exception_detail", []),
     }
 
     system_prompt = (
         "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert for Intel Foundry. "
-        "Analyze the demand-supply root cause data and produce a detailed, data-driven narrative. "
-        "ALWAYS cite exact numbers, dates, and quantities from the provided evidence. "
-        "NEVER fabricate data. Clearly separate confirmed facts from hypotheses. "
-        "Use markdown headers (###), bullet lists (-), and **bold** for key numbers. "
-        "Be precise and actionable — this is for an experienced supply planner."
+        "You have been given PRE-COMPUTED, DATA-VERIFIED facts from the BY ESP planning datasets. "
+        "Your job is to build a detailed, evidence-based root cause narrative using ONLY these facts. "
+        "\n\nRULES:"
+        "\n- ALWAYS cite exact numbers, dates, quantities, and percentages from the provided data."
+        "\n- NEVER fabricate or estimate any number not present in the data."
+        "\n- When citing lead times, fence dates (NONEWSUPPLYDATE), lot sizes (INCQTY), or supply parameters, "
+        "explain their impact in plain planning terms."
+        "\n- When citing lateness statistics (avg days, max days), quantify the business impact."
+        "\n- Use the period_demand_supply_balance table to show WHICH periods have the biggest gaps."
+        "\n- Use competing_demand_detail to name specific items that consume priority supply."
+        "\n- Use top_resource_loads to identify which specific resources are bottlenecks."
+        "\n- Use exception_detail to cite specific planning exceptions."
+        "\n- Clearly separate CONFIRMED FACTS (from data) from HYPOTHESES (inferred)."
+        "\n- Format with markdown: ### for headers, - for bullets, **bold** for key numbers."
+        "\n- End with 3-5 specific, actionable next steps the planner can take TODAY."
     )
 
     prompt = (
         f"## Analysis Focus\n{focus}\n\n"
-        f"## Grounded Planning Evidence\n{json.dumps(llm_context, ensure_ascii=True, indent=2)}\n\n"
-        "## Required Output Structure (use these exact markdown headers)\n"
+        f"## Pre-Computed Planning Evidence (cite these exact facts)\n"
+        f"{json.dumps(llm_context, ensure_ascii=True, indent=2)}\n\n"
+        "## Required Output Structure\n"
+        "Respond using EXACTLY these sections:\n"
         "### Executive Summary\n"
-        "### Key Statistics\n"
+        "[2-3 sentences: item, fill rate %, meet status, primary constraint in plain English]\n\n"
+        "### Demand-Supply Gap Analysis\n"
+        "[Use the period_demand_supply_balance table — cite which months have the worst gaps]\n\n"
         "### Confirmed Root Causes\n"
-        "### Evidence Chain\n"
-        "### Domain Assessment\n"
+        "[Numbered list — each cause must cite a specific number from the evidence]\n\n"
+        "### Supply Constraint Details\n"
+        "[Lead times, NONEWSUPPLYDATE fences, lot-size constraints, lateness breakdown]\n\n"
+        "### Resource and Capacity Findings\n"
+        "[Which resources, what loads, customer vs forecast split]\n\n"
+        "### Competing Demand Impact\n"
+        "[Which items take priority, how much quantity they consume]\n\n"
         "### Data Gaps and Hypotheses\n"
+        "[What cannot be confirmed from available data]\n\n"
         "### Recommended Next Steps\n"
+        "[3-5 specific actions — reference exact parameters the planner should change or investigate]\n"
     )
 
     narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or OLLAMA_MODEL)
@@ -3347,6 +3677,7 @@ def run_root_cause_explained(
         "llm_model":      (llm_model or OLLAMA_MODEL),
         "llm_used":       bool(narrative),
         "raw_data":       raw,
+        "deep_evidence":  deep,
     }
 
 
