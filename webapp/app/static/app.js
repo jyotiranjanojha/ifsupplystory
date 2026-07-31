@@ -2331,8 +2331,8 @@ document.getElementById('rootCauseBtn').addEventListener('click', () => {
   const meta = document.getElementById('rcOutputMeta');
   if (meta) meta.textContent = 'Running analysis…';
 
-  const llmModel = chatLlmEnabled.checked ? chatLlmModel.value : null;
-
+  // Root cause always uses the server's configured model (gemma3 by default).
+  // Sending the large chat model (llama3.1:8b) here causes unacceptable wait times.
   fetch('/api/root-cause', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2341,7 +2341,7 @@ document.getElementById('rootCauseBtn').addEventListener('click', () => {
       scenario_id:  document.getElementById('rcScenario').value || null,
       demand_id:    document.getElementById('rcDemand').value || null,
       question_type: document.getElementById('rcQuestion').value || 'full_diagnosis',
-      llm_model:    llmModel,
+      llm_model:    null,   // use server default (OLLAMA_MODEL env var = gemma3)
       scope: { node: document.getElementById('rcNode').value || null },
     }),
   })

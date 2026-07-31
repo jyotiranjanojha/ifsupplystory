@@ -1681,6 +1681,7 @@ def _ollama_chat_with_model(
         "messages": messages,
         "options": {
             "temperature": 0.2,
+            "num_predict": 900,   # cap output to ~90-120s on gemma3
         },
     }
 
@@ -1693,7 +1694,7 @@ def _ollama_chat_with_model(
     )
 
     try:
-        with request.urlopen(req, timeout=180) as response:
+        with request.urlopen(req, timeout=300) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
@@ -3584,85 +3585,156 @@ def run_root_cause_explained(
 
     focus = RC_QUESTION_FOCUS.get(question_type, RC_QUESTION_FOCUS["full_diagnosis"])
 
-    # ── Compose a rich, fact-dense LLM prompt ─────────────────────────────
-    llm_context = {
-        "focus":                focus,
-        "item":                 demand_item,
-        "week":                 resolved_week,
-        "scenario":             resolved_scen,
-        "demand_supply_summary": ds,
-        "confirmed_findings":   raw.get("Confirmed Findings", []),
-        "root_causes":          raw.get("Root Causes", []),
-        "constraint_analysis":  constraint,
-        "lineage_summary": {
-            "pegged_demand_qty": lineage.get("pegged_demand_qty"),
-            "pegged_supply_qty": lineage.get("pegged_supply_qty"),
-            "supply_types":      lineage.get("supply_types_seen"),
-            "supply_methods":    lineage.get("supply_methods_seen", [])[:8],
-            "top_supply_items":  lineage.get("top_pegged_supply_items", [])[:5],
-            "genealogy_sample":  lineage.get("genealogy_paths_sample", [])[:5],
-        },
-        "planned_supply":       planned,
-        "item_setup_flags":     item_setup.get("setup_flags", {}),
-        "item_profile":         item_setup.get("item_profile", {}),
-        "domain_assessment":    raw.get("Domain Focus Assessment"),
-        "primary_cause_tags":   (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("primary_cause_tags", []),
-        "by_esp_reasoning":     (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("by_esp_reasoning", []),
-        # ── deep-computed evidence (data analyst layer) ───────────────
-        "period_demand_supply_balance": deep.get("period_balance", []),
-        "lateness_statistics":          deep.get("lateness_analysis") or {},
-        "early_fulfillment_stats":      deep.get("early_analysis") or {},
-        "unmet_orders_sample":          deep.get("unmet_orders_sample", []),
-        "production_parameters":        deep.get("production_parameters", []),
-        "sku_parameters":               deep.get("sku_parameters", []),
-        "supply_constraint_signals":    deep.get("supply_constraint_signals", []),
-        "eoh_projection":               deep.get("eoh_projection", []),
-        "top_resource_loads":           deep.get("top_resource_loads", []),
-        "competing_demand_detail":      deep.get("competing_demand_detail", []),
-        "exception_detail":             deep.get("exception_detail", []),
-    }
+    # ── Build a compact, pre-formatted evidence brief for the LLM ────────
+    # Converting to readable text (not raw JSON) stays well within the model's
+    # context window and gives the LLM much clearer signals to cite.
+
+    def _fmt(v, decimals=1):
+        if v is None: return "N/A"
+        if isinstance(v, float): return f"{v:.{decimals}f}"
+        return str(v)
+
+    # Period balance as a mini markdown table (worst 8 periods only)
+    pb = deep.get("period_balance", [])
+    worst = sorted(pb, key=lambda r: r.get("gap", 0), reverse=True)[:8]
+    period_table_lines = ["| Period | Demand | Scheduled | Gap | Fill% |",
+                          "|--------|--------|-----------|-----|-------|"]
+    for r in worst:
+        period_table_lines.append(
+            f"| {r['period']} | {_fmt(r.get('demand_qty'))} | "
+            f"{_fmt(r.get('sched_qty'))} | {_fmt(r.get('gap'))} | "
+            f"{_fmt(r.get('fill_pct'))}% |"
+        )
+    period_table = "\n".join(period_table_lines)
+
+    # Lateness summary
+    lat = deep.get("lateness_analysis") or {}
+    lateness_text = (
+        f"Late rows: {lat.get('late_rows',0)}, Avg: {lat.get('avg_days','N/A')} days, "
+        f"Max: {lat.get('max_days','N/A')} days, Median: {lat.get('median_days','N/A')} days, "
+        f">30d: {lat.get('gt_30_days',0)}, >60d: {lat.get('gt_60_days',0)}"
+        if lat else "No lateness data."
+    )
+
+    # Supply constraint signals (key sentences)
+    signals = "\n".join(f"- {s}" for s in deep.get("supply_constraint_signals", []))
+
+    # Top 5 resources
+    res_lines = []
+    for r in deep.get("top_resource_loads", [])[:5]:
+        res_lines.append(
+            f"- {r['resource']}: total={_fmt(r.get('total_load'),0)}, "
+            f"cust={_fmt(r.get('customer_load'),0)}, fcst={_fmt(r.get('forecast_load'),0)}"
+        )
+    resources_text = "\n".join(res_lines) if res_lines else "No resource load data."
+
+    # Top 5 competing demand items
+    comp_lines = []
+    for c in deep.get("competing_demand_detail", [])[:5]:
+        comp_lines.append(f"- Item {c['item']}: priority={c['priority']}, qty={_fmt(c.get('qty'),0)}, rows={c['rows']}")
+    competing_text = "\n".join(comp_lines) if comp_lines else "No competing demand with higher priority found."
+
+    # Exception detail
+    exc_lines = []
+    for e in deep.get("exception_detail", [])[:5]:
+        exc_lines.append(
+            f"- Exception {e['exception']} ({e['descr']}) at {e['loc']}, "
+            f"when={e.get('when','N/A')}, demand_qty={e.get('demand_qty','N/A')}"
+        )
+    exceptions_text = "\n".join(exc_lines) if exc_lines else "No SKU exceptions found."
+
+    # Root causes and attribution
+    root_causes_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(raw.get("Root Causes", [])))
+    attribution_tags = ", ".join((raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("primary_cause_tags", []))
+    by_esp_reasoning = "\n".join(
+        f"- {r}" for r in (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("by_esp_reasoning", [])
+    )
+
+    # Supply methods
+    supply_methods = ", ".join(lineage.get("supply_methods_seen", [])[:5])
+    top_supply_items = "; ".join(
+        f"{s['supply_item']}@{s['supply_loc']} ({_fmt(s['pegged_qty'])})"
+        for s in lineage.get("top_pegged_supply_items", [])[:4]
+    )
+
+    evidence_brief = f"""ITEM: {demand_item} | WEEK: {resolved_week} | SCENARIO: {resolved_scen}
+MEET STATUS: {ds.get('meet_status','unknown')} | FILL RATE: {_fmt(fill_rate)}%
+
+## Demand vs Supply Summary
+- Demand Qty: {_fmt(demand_qty,3)} | Scheduled: {_fmt(sched_qty,3)} | Unmet: {_fmt(stats.get('unmet_qty',0),3)}
+- On-Time Qty: {_fmt(stats.get('on_time_qty',0),3)} | Late Qty: {_fmt(stats.get('late_qty',0),3)}
+- First need date: {ds.get('first_need_date','N/A')} | Last need date: {ds.get('last_need_date','N/A')}
+- First sched date: {ds.get('first_sched_date','N/A')} | Last sched date: {ds.get('last_sched_date','N/A')}
+- Planned arrival: {_fmt(planned.get('plan_arrival_qty',0),0)} (first: {planned.get('plan_arrival_first_date','N/A')})
+- Planned orders: {_fmt(planned.get('plan_order_qty',0),0)} (first: {planned.get('plan_order_first_date','N/A')})
+- Pegged supply qty: {_fmt(lineage.get('pegged_supply_qty',0),0)} vs pegged demand qty: {_fmt(lineage.get('pegged_demand_qty',0),0)}
+
+## Period-by-Period Demand-Supply Balance (worst periods first)
+{period_table}
+
+## Lateness Analysis
+{lateness_text}
+
+## Supply Constraint Signals (NONEWSUPPLYDATE fences, lead times, lot sizes)
+{signals if signals else "No supply constraint signals detected."}
+
+## Top Resources by Load (for this item)
+{resources_text}
+
+## Competing Higher-Priority Demand
+{competing_text}
+
+## Planning Exceptions
+{exceptions_text}
+
+## Item Setup Flags
+{json.dumps(item_setup.get("setup_flags", {}), ensure_ascii=True)}
+
+## Item Profile
+{json.dumps(item_setup.get("item_profile", {}), ensure_ascii=True)}
+
+## Supply Chain
+- Supply types: {", ".join(lineage.get("supply_types_seen", []))}
+- Supply methods: {supply_methods}
+- Top pegged supply items: {top_supply_items or "None found"}
+
+## Root Causes (pre-computed)
+{root_causes_text or "None identified."}
+
+## Attribution Tags
+{attribution_tags or "None."}
+{by_esp_reasoning}
+
+## Constraint Exceptions
+- Capacity exceptions: {constraint.get('capacity_exception_rows',0)}, overutil qty: {_fmt(constraint.get('capacity_overutil_qty',0),0)}
+- SKU exceptions for item: {constraint.get('sku_exception_rows_for_item',0)}
+- Competing demand rows: {constraint.get('higher_priority_competing_rows',0)}, qty: {_fmt(constraint.get('higher_priority_competing_qty',0),0)}
+- Resources loaded: {constraint.get('resource_count',0)}
+"""
 
     system_prompt = (
         "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert for Intel Foundry. "
-        "You have been given PRE-COMPUTED, DATA-VERIFIED facts from the BY ESP planning datasets. "
-        "Your job is to build a detailed, evidence-based root cause narrative using ONLY these facts. "
-        "\n\nRULES:"
-        "\n- ALWAYS cite exact numbers, dates, quantities, and percentages from the provided data."
-        "\n- NEVER fabricate or estimate any number not present in the data."
-        "\n- When citing lead times, fence dates (NONEWSUPPLYDATE), lot sizes (INCQTY), or supply parameters, "
-        "explain their impact in plain planning terms."
-        "\n- When citing lateness statistics (avg days, max days), quantify the business impact."
-        "\n- Use the period_demand_supply_balance table to show WHICH periods have the biggest gaps."
-        "\n- Use competing_demand_detail to name specific items that consume priority supply."
-        "\n- Use top_resource_loads to identify which specific resources are bottlenecks."
-        "\n- Use exception_detail to cite specific planning exceptions."
-        "\n- Clearly separate CONFIRMED FACTS (from data) from HYPOTHESES (inferred)."
-        "\n- Format with markdown: ### for headers, - for bullets, **bold** for key numbers."
-        "\n- End with 3-5 specific, actionable next steps the planner can take TODAY."
+        "You have been given PRE-VERIFIED facts from BY ESP planning data. "
+        "Write a concise, fact-grounded root cause narrative — maximum 500 words total. "
+        "RULES: Only cite numbers present in the evidence. Use **bold** for key quantities. "
+        "Use ### for section headers. Use - for bullet lists. "
+        "Be direct, specific, and actionable. No generic filler. No repetition."
     )
 
     prompt = (
-        f"## Analysis Focus\n{focus}\n\n"
-        f"## Pre-Computed Planning Evidence (cite these exact facts)\n"
-        f"{json.dumps(llm_context, ensure_ascii=True, indent=2)}\n\n"
-        "## Required Output Structure\n"
-        "Respond using EXACTLY these sections:\n"
+        f"ANALYSIS FOCUS: {focus}\n\n"
+        f"PLANNING EVIDENCE:\n{evidence_brief}\n\n"
+        "Write a concise analysis using these sections (2-4 bullets each, no padding):\n"
         "### Executive Summary\n"
-        "[2-3 sentences: item, fill rate %, meet status, primary constraint in plain English]\n\n"
         "### Demand-Supply Gap Analysis\n"
-        "[Use the period_demand_supply_balance table — cite which months have the worst gaps]\n\n"
+        "(name the worst months from the period table with exact fill%)\n"
         "### Confirmed Root Causes\n"
-        "[Numbered list — each cause must cite a specific number from the evidence]\n\n"
+        "(numbered, each citing a specific number)\n"
         "### Supply Constraint Details\n"
-        "[Lead times, NONEWSUPPLYDATE fences, lot-size constraints, lateness breakdown]\n\n"
-        "### Resource and Capacity Findings\n"
-        "[Which resources, what loads, customer vs forecast split]\n\n"
-        "### Competing Demand Impact\n"
-        "[Which items take priority, how much quantity they consume]\n\n"
-        "### Data Gaps and Hypotheses\n"
-        "[What cannot be confirmed from available data]\n\n"
+        "(NONEWSUPPLYDATE fences, lead times, lot sizes, lateness stats)\n"
+        "### Resource Findings\n"
         "### Recommended Next Steps\n"
-        "[3-5 specific actions — reference exact parameters the planner should change or investigate]\n"
+        "(3 specific actions)\n"
     )
 
     narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or OLLAMA_MODEL)
