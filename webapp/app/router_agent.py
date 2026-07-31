@@ -53,14 +53,27 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": None,
     },
     "root_cause": {
-        "description": "Demand-supply root cause and lineage analysis for an item",
+        "description": "Demand-supply root cause and lineage analysis for an item, including late/short demand, early fulfillment, and fill rate drops",
         "terms": [
             "root cause", "why unmet", "unmet", "why demand", "why did demand",
             "demand miss", "missed demand", "explain demand", "lineage",
             "genealogy", "pegging",
-            # additional unmet / not-met phrasing
+            # unmet / not-met phrasing
             "not met", "demand not met", "why was demand", "why demand not",
             "demand shortage", "supply gap", "why did not demand",
+            # lateness / shortness
+            "demand late", "demand short", "late demand", "short demand",
+            "why late", "why short", "demand got late", "demand got short",
+            "demand delayed", "late fulfillment", "short fulfillment",
+            # early fulfillment
+            "demand early", "demand met early", "met early", "why early",
+            "fulfilled early", "demand fulfilled early",
+            # fill rate root cause
+            "fill rate drop", "fill rate dropping", "fill rate low",
+            "why fill rate", "fill rate declining", "fill rate change",
+            # resource / utilization root cause
+            "why res", "res low", "utilization low", "res underload",
+            "why utilization", "why resource",
         ],
         "required_slots": ["item"],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -69,7 +82,7 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": None,
     },
     "item_demand_supply": {
-        "description": "Demand vs supply details for a specific item",
+        "description": "Demand vs supply details, fill rate, EOH (end-of-horizon inventory), and fulfillment status for a specific item",
         "terms": [
             "demand and supply", "demand vs supply", "supply situation",
             "demand situation", "share more details about demand vs supply",
@@ -79,6 +92,10 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
             "check demand", "demand check", "was demand", "demand was",
             "demand for item", "is the demand", "was the demand",
             "demand not fulfilled", "demand not met",
+            # EOH / projected inventory
+            "eoh", "end of horizon", "end-of-horizon", "projected inventory",
+            "inventory position", "horizon inventory", "closing inventory",
+            "projected stock", "eoh for",
         ],
         "required_slots": ["item"],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -99,11 +116,17 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": None,
     },
     "domain_fulfillment": {
-        "description": "Fulfillment domain: unmet demand, OTIF, fill rate, backorders",
+        "description": "Fulfillment domain: fill rate trends, OTIF, late/short demand, unmet demand, backorders",
         "terms": [
             "fulfillment", "why didn't we ship", "why did not we ship",
             "why not shipped", "customer order not met", "fill rate", "otif",
             "stockout", "backorder", "shortage", "lost sales",
+            # fill rate trends / changes
+            "fill rates dropping", "fill rates declining", "fill rate trend",
+            "fill rates changing", "fill rate improving", "fill rate worsening",
+            # late / short demand
+            "demand got late", "demand got short", "late order", "short order",
+            "demand lateness", "demand shortness", "late fulfillment",
         ],
         "required_slots": [],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -112,11 +135,19 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": "Fulfillment",
     },
     "domain_generation": {
-        "description": "Generation domain: why no planned orders, capacity, lead time",
+        "description": "Generation domain: resource utilization, why no planned orders, capacity, lead time, underloaded/overloaded resources",
         "terms": [
             "generation", "why didn't we build", "why did not we build",
             "why didn't we buy", "why did not we buy", "no planned orders",
             "planned order not generated", "lead time", "active forecast",
+            # resource utilization
+            "res utilization", "resource utilization", "res util",
+            "utilization", "capacity utilization", "res load", "resource load",
+            # underloaded / overloaded
+            "underloaded", "overloaded", "res underloaded", "res overloaded",
+            "resource underloaded", "resource overloaded",
+            "underload horizon", "overload horizon",
+            "why res utilization", "res utilization low", "res utilization high",
         ],
         "required_slots": [],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -151,9 +182,16 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": None,
     },
     "compare": {
-        "description": "Scenario comparison and delta analysis",
+        "description": "Scenario comparison and delta analysis, including solve-over-solve and site mix changes",
         "terms": [
             "compare", "difference", "delta", "scenario compare", "versus", "vs",
+            # solve-over-solve / run-over-run
+            "solve over solve", "solve to solve", "run over run", "run to run",
+            "solve run", "week over week", "period over period",
+            "changing solve", "solve comparison", "plan comparison",
+            # site mix
+            "site mix", "site mix changing", "site mix shift", "mix change",
+            "why site", "site shift", "location mix",
         ],
         "required_slots": [],
         "optional_slots": ["week_id", "base_scenario", "compare_scenario", "site"],
@@ -162,10 +200,19 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "domain": None,
     },
     "insights": {
-        "description": "Analytics insights: trends, fill rate, capacity utilization",
+        "description": "Analytics insights: fill rate trends, capacity/resource utilization, EOH, demand-supply trends, underloaded horizons",
         "terms": [
             "insight", "fill rate", "capacity", "trend",
             "demand supply", "analytics",
+            # resource utilization trends
+            "res utilization", "resource utilization", "utilization trend",
+            "capacity trend", "res load trend",
+            # EOH / horizon inventory
+            "eoh", "end of horizon", "end-of-horizon", "projected inventory",
+            "horizon inventory",
+            # underloaded/overloaded horizons
+            "underloaded horizon", "overloaded horizon",
+            "which horizon", "horizons underloaded", "horizons overloaded",
         ],
         "required_slots": [],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -300,14 +347,16 @@ _ITEM_KEYWORD_BLOCKLIST = frozenset({
     "item", "for", "the", "a", "an", "this", "that", "all", "any",
     "some", "met", "not", "was", "check", "demand", "supply",
     "if", "is", "it", "in", "or", "of", "at", "by", "on",
+    "product", "products",  # prevent 'for product' capturing the word itself
 })
 
 _ITEM_PATTERNS = [
     # Must come first — "demand for item XXXX" / "demand item XXXX"
     r"\bdemand\s+for\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
     r"\bdemand\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
-    # Generic "item XXXX"
+    # "item XXXX" or "product XXXX"
     r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)",
+    r"\bproduct\s*[:=]?\s*([A-Za-z0-9\-]+)",
     # "for XXXXXXXX" (long token only)
     r"\bfor\s+([A-Za-z0-9\-]{6,})\b",
 ]
@@ -376,19 +425,43 @@ def _call_ollama_router(question: str) -> Optional[str]:
 
     few_shot_examples = (
         "Examples of natural language → intent mapping:\n"
+        # Core demand / supply queries
         "- 'was the demand for item 100000000004 met?' → item_demand_supply\n"
         "- 'check if demand for item 100000000009 was fulfilled' → item_demand_supply\n"
         "- 'why is item 100000000004 unmet?' → root_cause\n"
         "- 'what is causing the supply shortage for 100000000009?' → root_cause\n"
         "- 'show me the BOM for item 100000000004' → bom_drill\n"
         "- 'compare constrained vs unconstrained scenario this week' → compare\n"
-        "- 'what is the fill rate trend?' → insights\n"
         "- 'validate master data for latest week' → validation\n"
         "- 'what does inddmdview contain?' → table_explain\n"
         "- 'run a SQL query to find all unmet demands' → sql_query\n"
         "- 'explain data quality issues' → domain_data_hygiene\n"
         "- 'why didn\\'t we ship customer order X?' → domain_fulfillment\n"
         "- 'why are there no planned orders for item Y?' → domain_generation\n"
+        # BY Supply Planning natural language queries
+        "- 'what is the fill rate for item 100000000004?' → insights\n"
+        "- 'what is fill rate for the latest scenario?' → insights\n"
+        "- 'why are fill rates dropping for product 100000000009?' → root_cause\n"
+        "- 'why is fill rate declining this week?' → domain_fulfillment\n"
+        "- 'why fill rates are changing solve over solve?' → compare\n"
+        "- 'why did demand get late for item 100000000004?' → root_cause\n"
+        "- 'why did demand get short for item 100000000009?' → root_cause\n"
+        "- 'why demand got late or short?' → domain_fulfillment\n"
+        "- 'what is resource utilization for RES_001?' → insights\n"
+        "- 'show res utilization trend' → insights\n"
+        "- 'why is res utilization low for resource RES_001?' → domain_generation\n"
+        "- 'why is capacity utilization low?' → domain_generation\n"
+        "- 'what are the horizons where res RES_001 is underloaded?' → insights\n"
+        "- 'show periods when resource is underloaded or overloaded' → insights\n"
+        "- 'why was demand met early for item 100000000004?' → root_cause\n"
+        "- 'why is demand getting fulfilled ahead of schedule?' → root_cause\n"
+        "- 'why is the site mix changing for product 100000000009?' → compare\n"
+        "- 'why is site mix shifting between locations?' → compare\n"
+        "- 'what is EOH for product 100000000004?' → item_demand_supply\n"
+        "- 'show end of horizon inventory for item 100000000009' → item_demand_supply\n"
+        "- 'what is the projected closing inventory?' → item_demand_supply\n"
+        "- 'compare fill rate between this week and last week' → compare\n"
+        "- 'is resource RES_001 overloaded in any horizon?' → domain_generation\n"
     )
 
     # With format: no need to say "return only" — schema enforces it

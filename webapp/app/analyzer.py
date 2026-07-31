@@ -1176,6 +1176,7 @@ _ITEM_EXTRACT_KEYWORD_BLOCKLIST = frozenset({
     "item", "for", "the", "a", "an", "this", "that", "all", "any",
     "some", "met", "not", "was", "check", "demand", "supply",
     "if", "is", "it", "in", "or", "of", "at", "by", "on",
+    "product", "products",  # prevent 'for product' capturing the word itself
 })
 
 
@@ -1186,8 +1187,9 @@ def _extract_item_candidates(question: str) -> List[str]:
         # Most specific first: "demand for item XXXX" / "demand item XXXX"
         r"\bdemand\s+for\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
         r"\bdemand\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
-        # Generic "item XXXX"
+        # "item XXXX" or "product XXXX"
         r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        r"\bproduct\s*[:=]?\s*([A-Za-z0-9\-]+)",
         # "for XXXXXXXX" (long token only)
         r"\bfor\s+([A-Za-z0-9\-]{6,})\b",
     ]
@@ -1210,7 +1212,15 @@ def _infer_demand_item_from_question(question: str) -> Dict:
     q = (question or "").strip()
     ql = q.lower()
     candidates = _extract_item_candidates(q)
-    demand_language = any(term in ql for term in ["demand", "met", "meet", "unmet", "fulfilled", "root cause", "lineage"])
+    demand_language = any(term in ql for term in [
+        "demand", "met", "meet", "unmet", "fulfilled",
+        "root cause", "lineage",
+        # EOH / inventory queries
+        "eoh", "end of horizon", "end-of-horizon", "projected inventory",
+        "closing inventory", "horizon inventory",
+        # fill rate / utilization root-cause queries
+        "fill rate", "utilization", "late", "short", "early",
+    ])
 
     selected = candidates[0] if len(candidates) == 1 else None
     if not selected and demand_language and len(candidates) > 0:
