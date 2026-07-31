@@ -45,6 +45,8 @@ class RootCauseRequest(BaseModel):
     demand_id: Optional[str] = None
     demand_entity: Optional[DemandEntity] = None
     scope: Scope = Field(default_factory=Scope)
+    question_type: Optional[str] = "full_diagnosis"
+    llm_model: Optional[str] = None
 
 
 class InsightsRequest(BaseModel):

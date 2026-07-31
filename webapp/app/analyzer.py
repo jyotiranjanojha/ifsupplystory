@@ -3146,6 +3146,211 @@ def run_root_cause(
 
 
 # ---------------------------------------------------------------------------
+# Root Cause — LLM-enhanced explained analysis
+# ---------------------------------------------------------------------------
+
+RC_QUESTION_FOCUS: Dict[str, str] = {
+    "full_diagnosis": (
+        "Provide a comprehensive demand-supply diagnosis: fulfillment status, quantity analysis, "
+        "lateness, root causes, constraint attribution, and planning setup quality."
+    ),
+    "why_unmet": (
+        "Explain specifically WHY demand was not fully met. Focus on: unmet quantity, "
+        "supply shortage signals, missing BOM/sourcing/production setup, capacity exceptions, "
+        "pegging gaps, and competing demand."
+    ),
+    "why_late": (
+        "Explain WHY demand fulfillment was late. Focus on: late scheduled quantity, "
+        "supply availability vs need dates, lead time issues, resource constraints delaying supply."
+    ),
+    "why_short": (
+        "Explain WHY demand quantity was short (scheduled < demanded). Focus on: the quantity gap, "
+        "supply pegging shortfall, capacity overutilization, competing higher-priority demand."
+    ),
+    "why_early": (
+        "Explain WHY demand was fulfilled earlier than need date. Analyze: on-time vs early qty, "
+        "supply availability dates vs need dates, and inventory build-up implications."
+    ),
+    "capacity_constraints": (
+        "Detail the resource and capacity constraints. Focus on: capacity exceptions, overutilized "
+        "quantities, resources affected, resource load by order type (forecast vs customer)."
+    ),
+    "bom_sourcing_gaps": (
+        "Analyze BOM and sourcing master data quality. Focus on: production methods, BOM paths, "
+        "sourcing routes, SKU setup; gaps that block BY ESP from creating feasible supply."
+    ),
+    "priority_conflict": (
+        "Analyze priority conflicts. Focus on: higher-priority competing demand in the same "
+        "location, quantity they consume, and impact on this item's fulfillment."
+    ),
+    "supply_pegging": (
+        "Trace the full supply pegging and lineage chain. Focus on: pegged supply items, "
+        "supply methods, genealogy paths, planned arrivals/orders/purchases, supply timeline."
+    ),
+    "eoh": (
+        "Analyze end-of-horizon (EOH) inventory position. Focus on: planned arrival, "
+        "planned orders, planned purchases, supply timeline, and projected closing stock."
+    ),
+}
+
+_RC_QUESTION_LABELS: Dict[str, str] = {
+    "full_diagnosis":       "Full Demand-Supply Diagnosis",
+    "why_unmet":            "Why is demand unmet?",
+    "why_late":             "Why did demand get late?",
+    "why_short":            "Why did demand get short?",
+    "why_early":            "Why was demand met early?",
+    "capacity_constraints": "Resource / Capacity Constraints",
+    "bom_sourcing_gaps":    "BOM and Sourcing Gaps",
+    "priority_conflict":    "Priority Conflict Impact",
+    "supply_pegging":       "Supply Pegging & Lineage",
+    "eoh":                  "End-of-Horizon Inventory",
+}
+
+
+def _build_fallback_rc_narrative(stats: Dict, root_causes: List[str], findings: List[str]) -> str:
+    item = stats.get("item") or "N/A"
+    lines = [
+        "### Executive Summary",
+        f"Item **{item}** | Week **{stats.get('week', 'N/A')}** | Scenario **{stats.get('scenario', 'N/A')}**  ",
+        f"Fulfillment status: **{stats.get('meet_status', 'unknown')}** | Fill rate: **{stats.get('fill_rate_pct', 0.0):.1f}%**",
+        "",
+        "### Key Statistics",
+        f"- Demand Qty: **{stats.get('demand_qty', 0):.3f}**",
+        f"- Scheduled Qty: **{stats.get('scheduled_qty', 0):.3f}**",
+        f"- Unmet Qty: **{stats.get('unmet_qty', 0):.3f}**",
+        f"- On-Time Qty: **{stats.get('on_time_qty', 0):.3f}**",
+        f"- Late Qty: **{stats.get('late_qty', 0):.3f}**",
+        f"- Capacity Exceptions: **{stats.get('capacity_exceptions', 0)}**",
+        f"- Resources Affected: **{stats.get('resources_affected', 0)}**",
+        "",
+        "### Confirmed Root Causes",
+    ]
+    for i, cause in enumerate(root_causes or ["No explicit root causes identified."], 1):
+        lines.append(f"{i}. {cause}")
+    lines += ["", "### Confirmed Findings"]
+    for finding in findings or []:
+        lines.append(f"- {finding}")
+    lines += ["", "### Note", "LLM narrative unavailable — showing structured evidence summary."]
+    return "\n".join(lines)
+
+
+def run_root_cause_explained(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    demand_id: Optional[str],
+    scope: Dict,
+    question_type: str = "full_diagnosis",
+    llm_model: Optional[str] = None,
+    demand_entity: Optional[Dict] = None,
+) -> Dict:
+    """
+    Run structured root cause analysis then generate a detailed LLM narrative
+    focused on the selected question type.
+    """
+    raw = run_root_cause(base_dir, week_id, scenario_id, demand_id, scope, demand_entity=demand_entity)
+
+    scope_info  = raw.get("Explainability Scope", {})
+    ds          = raw.get("Demand and Supply Summary", {})
+    constraint  = raw.get("Constraint and Exception Analysis", {})
+    lineage     = raw.get("Lineage and Linkage Findings", {})
+    planned     = raw.get("Planned Supply Evidence", {})
+    item_setup  = raw.get("Item Master and Planning Setup", {})
+
+    demand_qty = float(ds.get("demand_qty_total") or 0)
+    sched_qty  = float(ds.get("scheduled_qty_total") or 0)
+    fill_rate  = round(sched_qty / demand_qty * 100, 1) if demand_qty > 0 else 0.0
+
+    stats: Dict = {
+        "item":             scope_info.get("demand_item"),
+        "week":             scope_info.get("week_id"),
+        "scenario":         scope_info.get("scenario_id"),
+        "meet_status":      ds.get("meet_status", "unknown"),
+        "demand_qty":       demand_qty,
+        "scheduled_qty":    sched_qty,
+        "unmet_qty":        float(ds.get("unmet_qty") or 0),
+        "fill_rate_pct":    fill_rate,
+        "on_time_qty":      float(ds.get("on_time_scheduled_qty") or 0),
+        "late_qty":         float(ds.get("late_scheduled_qty") or 0),
+        "first_need_date":  ds.get("first_need_date"),
+        "last_need_date":   ds.get("last_need_date"),
+        "first_sched_date": ds.get("first_sched_date"),
+        "last_sched_date":  ds.get("last_sched_date"),
+        "plan_arrival_qty": float(planned.get("plan_arrival_qty") or 0),
+        "plan_order_qty":   float(planned.get("plan_order_qty") or 0),
+        "plan_purchase_qty":float(planned.get("plan_purchase_qty") or 0),
+        "pegged_supply_qty":float(lineage.get("pegged_supply_qty") or 0),
+        "capacity_exceptions":   int(constraint.get("capacity_exception_rows") or 0),
+        "resources_affected":    int(constraint.get("resource_count") or 0),
+        "sku_exceptions":        int(constraint.get("sku_exception_rows_for_item") or 0),
+        "competing_demand_rows": int(constraint.get("higher_priority_competing_rows") or 0),
+        "competing_demand_qty":  float(constraint.get("higher_priority_competing_qty") or 0),
+    }
+
+    focus = RC_QUESTION_FOCUS.get(question_type, RC_QUESTION_FOCUS["full_diagnosis"])
+    llm_context = {
+        "focus":                focus,
+        "item":                 stats["item"],
+        "week":                 stats["week"],
+        "scenario":             stats["scenario"],
+        "demand_supply_summary": ds,
+        "confirmed_findings":   raw.get("Confirmed Findings", []),
+        "root_causes":          raw.get("Root Causes", []),
+        "constraint_analysis":  constraint,
+        "lineage_summary": {
+            "pegged_demand_qty":  lineage.get("pegged_demand_qty"),
+            "pegged_supply_qty":  lineage.get("pegged_supply_qty"),
+            "supply_types":       lineage.get("supply_types_seen"),
+            "supply_methods":     lineage.get("supply_methods_seen", [])[:8],
+            "top_supply_items":   lineage.get("top_pegged_supply_items", [])[:5],
+            "genealogy_sample":   lineage.get("genealogy_paths_sample", [])[:6],
+        },
+        "planned_supply":       planned,
+        "item_setup_flags":     item_setup.get("setup_flags", {}),
+        "item_profile":         item_setup.get("item_profile", {}),
+        "domain_assessment":    raw.get("Domain Focus Assessment"),
+        "primary_cause_tags":   (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("primary_cause_tags", []),
+        "by_esp_reasoning":     (raw.get("Cause Attribution (BY ESP Expert View)") or {}).get("by_esp_reasoning", []),
+    }
+
+    system_prompt = (
+        "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert for Intel Foundry. "
+        "Analyze the demand-supply root cause data and produce a detailed, data-driven narrative. "
+        "ALWAYS cite exact numbers, dates, and quantities from the provided evidence. "
+        "NEVER fabricate data. Clearly separate confirmed facts from hypotheses. "
+        "Use markdown headers (###), bullet lists (-), and **bold** for key numbers. "
+        "Be precise and actionable — this is for an experienced supply planner."
+    )
+
+    prompt = (
+        f"## Analysis Focus\n{focus}\n\n"
+        f"## Grounded Planning Evidence\n{json.dumps(llm_context, ensure_ascii=True, indent=2)}\n\n"
+        "## Required Output Structure (use these exact markdown headers)\n"
+        "### Executive Summary\n"
+        "### Key Statistics\n"
+        "### Confirmed Root Causes\n"
+        "### Evidence Chain\n"
+        "### Domain Assessment\n"
+        "### Data Gaps and Hypotheses\n"
+        "### Recommended Next Steps\n"
+    )
+
+    narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or OLLAMA_MODEL)
+
+    return {
+        "narrative": narrative or _build_fallback_rc_narrative(
+            stats, raw.get("Root Causes", []), raw.get("Confirmed Findings", [])
+        ),
+        "stats":          stats,
+        "question_type":  question_type,
+        "question_label": _RC_QUESTION_LABELS.get(question_type, question_type),
+        "llm_model":      (llm_model or OLLAMA_MODEL),
+        "llm_used":       bool(narrative),
+        "raw_data":       raw,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Log Reader — parse and summarize planning logs via Ollama
 # ---------------------------------------------------------------------------
 

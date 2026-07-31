@@ -2221,17 +2221,135 @@ document.getElementById('compareBtn').addEventListener('click', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Root Cause — rendering helpers
+// ---------------------------------------------------------------------------
+
+const RC_STATUS_CLASS = {
+  met:           'rc-status-met',
+  met_late:      'rc-status-late',
+  partially_met: 'rc-status-partial',
+  not_met:       'rc-status-unmet',
+};
+
+function renderRootCauseOutput(data) {
+  const stats         = data.stats || {};
+  const narrative     = data.narrative || '';
+  const questionLabel = data.question_label || data.question_type || '';
+  const rawData       = data.raw_data;
+  const llmUsed       = Boolean(data.llm_used);
+
+  // ── meta header ──────────────────────────────────────────────────────────
+  const metaEl = document.getElementById('rcOutputMeta');
+  if (metaEl) {
+    const parts = [];
+    if (stats.item)     parts.push(`Item: <strong>${escapeHtml(String(stats.item))}</strong>`);
+    if (stats.week)     parts.push(`Week: <strong>${escapeHtml(String(stats.week))}</strong>`);
+    if (stats.scenario) parts.push(`Scenario: <strong>${escapeHtml(String(stats.scenario))}</strong>`);
+    parts.push(`Q: <em>${escapeHtml(questionLabel)}</em>`);
+    if (llmUsed)        parts.push(`Model: <em>${escapeHtml(String(data.llm_model || ''))}</em>`);
+    metaEl.innerHTML = parts.join(' &nbsp;|&nbsp; ');
+  }
+
+  // ── status badge ─────────────────────────────────────────────────────────
+  const badgeEl = document.getElementById('rcStatusBadge');
+  if (badgeEl && stats.meet_status) {
+    const status = String(stats.meet_status).toLowerCase().replace(/\s+/g, '_');
+    badgeEl.textContent = stats.meet_status.replace(/_/g, ' ').toUpperCase();
+    badgeEl.className = `rc-status-badge ${RC_STATUS_CLASS[status] || ''}`;
+    badgeEl.style.display = '';
+  }
+
+  // ── statistics strip ─────────────────────────────────────────────────────
+  const strip = document.getElementById('rcStatsStrip');
+  if (strip) {
+    const fillRate = typeof stats.fill_rate_pct === 'number' ? stats.fill_rate_pct : null;
+
+    const setVal = (id, val, decimals = 3) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = typeof val === 'number' ? val.toFixed(decimals) : (val || '—');
+    };
+    setVal('rcStatDemandVal',  stats.demand_qty);
+    setVal('rcStatSchedVal',   stats.scheduled_qty);
+    setVal('rcStatUnmetVal',   stats.unmet_qty);
+    setVal('rcStatFillVal',    fillRate !== null ? `${fillRate.toFixed(1)}%` : '—', 0);
+    setVal('rcStatLateVal',    stats.late_qty);
+    setVal('rcStatCapVal',     stats.capacity_exceptions, 0);
+    setVal('rcStatResVal',     stats.resources_affected, 0);
+    setVal('rcStatCompVal',    stats.competing_demand_rows, 0);
+
+    // colour the fill rate card
+    const fillCard = document.getElementById('rcStatFill');
+    if (fillCard && fillRate !== null) {
+      fillCard.classList.remove('rc-stat-good', 'rc-stat-warn', 'rc-stat-bad');
+      fillCard.classList.add(fillRate >= 95 ? 'rc-stat-good' : fillRate >= 70 ? 'rc-stat-warn' : 'rc-stat-bad');
+    }
+    // colour unmet card
+    const unmetCard = document.getElementById('rcStatUnmet');
+    if (unmetCard) {
+      unmetCard.classList.remove('rc-stat-bad');
+      if ((stats.unmet_qty || 0) > 0) unmetCard.classList.add('rc-stat-bad');
+    }
+
+    strip.style.display = '';
+  }
+
+  // ── narrative ─────────────────────────────────────────────────────────────
+  const pane = document.getElementById('rcNarrativePane');
+  if (pane) {
+    pane.innerHTML = `<div class="rc-narrative-body">${renderMarkdown(narrative)}</div>`;
+  }
+
+  // ── raw data toggle ───────────────────────────────────────────────────────
+  const toggleWrap = document.getElementById('rcRawToggleWrap');
+  const rawDrawer  = document.getElementById('rcRawDrawer');
+  const toggleBtn  = document.getElementById('rcRawToggleBtn');
+  if (toggleWrap && rawDrawer && rawData) {
+    rawDrawer.innerHTML = renderObject(rawData);
+    toggleWrap.style.display = '';
+    toggleBtn.addEventListener('click', () => {
+      const open = rawDrawer.classList.toggle('open');
+      toggleBtn.setAttribute('aria-expanded', String(open));
+      toggleBtn.textContent = open ? 'Hide raw structured data' : 'Show raw structured data';
+    });
+  }
+}
+
 document.getElementById('rootCauseBtn').addEventListener('click', () => {
   activatePanel('rootcause');
-  paneByPanel.rootcause.textContent = 'Running root cause analysis...';
-  callApi('/api/root-cause', {
-    week_id: document.getElementById('rcWeek').value || null,
-    scenario_id: document.getElementById('rcScenario').value || null,
-    demand_id: document.getElementById('rcDemand').value || null,
-    scope: {
-      node: document.getElementById('rcNode').value || null,
-    },
-  });
+
+  // Reset state
+  const strip = document.getElementById('rcStatsStrip');
+  const badge = document.getElementById('rcStatusBadge');
+  const pane  = document.getElementById('rcNarrativePane');
+  const rawWrap = document.getElementById('rcRawToggleWrap');
+  if (strip)   strip.style.display = 'none';
+  if (badge)   badge.style.display = 'none';
+  if (pane)    pane.innerHTML = '<div class="rc-loading"><span class="rc-loading-dot"></span> Analyzing — this may take a moment…</div>';
+  if (rawWrap) rawWrap.style.display = 'none';
+
+  const meta = document.getElementById('rcOutputMeta');
+  if (meta) meta.textContent = 'Running analysis…';
+
+  const llmModel = chatLlmEnabled.checked ? chatLlmModel.value : null;
+
+  fetch('/api/root-cause', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      week_id:      document.getElementById('rcWeek').value || null,
+      scenario_id:  document.getElementById('rcScenario').value || null,
+      demand_id:    document.getElementById('rcDemand').value || null,
+      question_type: document.getElementById('rcQuestion').value || 'full_diagnosis',
+      llm_model:    llmModel,
+      scope: { node: document.getElementById('rcNode').value || null },
+    }),
+  })
+    .then((r) => r.json())
+    .then((data) => renderRootCauseOutput(data))
+    .catch((err) => {
+      if (pane) pane.innerHTML = `<div class="rc-error">Analysis failed: ${escapeHtml(String(err))}</div>`;
+    });
 });
 
 loadLlmModels();

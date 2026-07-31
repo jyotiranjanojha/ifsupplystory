@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Intel Foundry Planning AI Assistant</title>
     <link rel="icon" type="image/png" href="/static/intelfoundrylogo.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=5" />
+    <link rel="stylesheet" href="/static/styles.css?v=6" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -125,14 +125,49 @@
           </article>
 
           <article class="card feature-panel" data-panel="rootcause">
-            <h2>Root Cause</h2>
-            <div class="field-grid">
-              <input id="rcWeek" placeholder="Week ID = CAPTURE_WK (optional, latest by default)" />
-              <input id="rcScenario" placeholder="Scenario ID = SIMULATION_NAME (optional)" />
-              <input id="rcDemand" placeholder="Demand ITEM (with EXTORDERREF or DFUTOSKUFCST)" />
-              <input id="rcNode" placeholder="Node (optional)" />
+            <div class="card-top compact-top">
+              <div>
+                <h2>Root Cause Analyzer</h2>
+                <p class="hint" style="margin:0">AI-powered evidence-based demand-supply diagnosis.</p>
+              </div>
+              <span class="rc-badge">BY ESP</span>
             </div>
-            <button id="rootCauseBtn" class="btn">Run Root Cause</button>
+            <div class="field-grid" style="margin-top:0.75rem">
+              <div class="split-grid rc-context-grid">
+                <div class="rc-field-wrap">
+                  <label class="rc-label" for="rcWeek">Week ID <span class="rc-optional">optional</span></label>
+                  <input id="rcWeek" placeholder="CAPTURE_WK" aria-label="Week ID" />
+                </div>
+                <div class="rc-field-wrap">
+                  <label class="rc-label" for="rcScenario">Scenario ID <span class="rc-optional">optional</span></label>
+                  <input id="rcScenario" placeholder="SIMULATION_NAME" aria-label="Scenario ID" />
+                </div>
+              </div>
+              <div class="rc-field-wrap">
+                <label class="rc-label" for="rcDemand">Item / Product ID <span class="rc-required">required</span></label>
+                <input id="rcDemand" placeholder="e.g. 100000000004" aria-label="Item ID" />
+              </div>
+              <div class="rc-field-wrap">
+                <label class="rc-label" for="rcQuestion">Analysis Question</label>
+                <select id="rcQuestion" aria-label="Analysis question type">
+                  <option value="full_diagnosis">🔍 Full Demand-Supply Diagnosis</option>
+                  <option value="why_unmet">❌ Why is demand unmet?</option>
+                  <option value="why_late">⏰ Why did demand get late?</option>
+                  <option value="why_short">📉 Why did demand get short?</option>
+                  <option value="why_early">⏩ Why was demand met early?</option>
+                  <option value="capacity_constraints">⚙️ Resource / Capacity Constraints</option>
+                  <option value="bom_sourcing_gaps">🔧 BOM and Sourcing Gaps</option>
+                  <option value="priority_conflict">⚡ Priority Conflict Impact</option>
+                  <option value="supply_pegging">🔗 Supply Pegging &amp; Lineage</option>
+                  <option value="eoh">📦 End-of-Horizon (EOH) Inventory</option>
+                </select>
+              </div>
+              <div class="rc-field-wrap">
+                <label class="rc-label" for="rcNode">Plant / Node <span class="rc-optional">optional</span></label>
+                <input id="rcNode" placeholder="Site / location filter" aria-label="Plant or node" />
+              </div>
+            </div>
+            <button id="rootCauseBtn" class="btn primary" type="button">Analyze Root Cause</button>
           </article>
 
           <article class="card feature-panel" data-panel="insights">
@@ -182,14 +217,58 @@
             <div id="comparisonResultPane" class="result-pane">Run comparison to view results...</div>
           </article>
 
-          <article class="output insight-page" data-panel="rootcause">
-            <div class="panel-top">
-              <div>
-                <h2>Root Cause Output</h2>
-                <p class="hint">Demand-supply status, causes, and timing analysis.</p>
+          <article class="output insight-page rc-output-card" data-panel="rootcause">
+            <div class="rc-output-header">
+              <div class="rc-output-title-row">
+                <h2>Root Cause Analysis</h2>
+                <span id="rcStatusBadge" class="rc-status-badge" style="display:none"></span>
+              </div>
+              <p id="rcOutputMeta" class="hint rc-output-meta">Enter an item ID and select a question, then click Analyze.</p>
+            </div>
+            <!-- Statistics card strip -->
+            <div id="rcStatsStrip" class="rc-stats-strip" style="display:none">
+              <div class="rc-stat-card" id="rcStatDemand">
+                <span class="rc-stat-label">Demand Qty</span>
+                <span class="rc-stat-value" id="rcStatDemandVal">—</span>
+              </div>
+              <div class="rc-stat-card" id="rcStatSched">
+                <span class="rc-stat-label">Scheduled Qty</span>
+                <span class="rc-stat-value" id="rcStatSchedVal">—</span>
+              </div>
+              <div class="rc-stat-card rc-stat-unmet" id="rcStatUnmet">
+                <span class="rc-stat-label">Unmet Qty</span>
+                <span class="rc-stat-value" id="rcStatUnmetVal">—</span>
+              </div>
+              <div class="rc-stat-card rc-stat-fill" id="rcStatFill">
+                <span class="rc-stat-label">Fill Rate</span>
+                <span class="rc-stat-value" id="rcStatFillVal">—</span>
+              </div>
+              <div class="rc-stat-card" id="rcStatLate">
+                <span class="rc-stat-label">Late Qty</span>
+                <span class="rc-stat-value" id="rcStatLateVal">—</span>
+              </div>
+              <div class="rc-stat-card rc-stat-warn" id="rcStatCap">
+                <span class="rc-stat-label">Capacity Exceptions</span>
+                <span class="rc-stat-value" id="rcStatCapVal">—</span>
+              </div>
+              <div class="rc-stat-card" id="rcStatRes">
+                <span class="rc-stat-label">Resources</span>
+                <span class="rc-stat-value" id="rcStatResVal">—</span>
+              </div>
+              <div class="rc-stat-card rc-stat-warn" id="rcStatComp">
+                <span class="rc-stat-label">Competing Demand</span>
+                <span class="rc-stat-value" id="rcStatCompVal">—</span>
               </div>
             </div>
-            <div id="rootCauseResultPane" class="result-pane">Run root cause to view results...</div>
+            <!-- Narrative -->
+            <div id="rcNarrativePane" class="rc-narrative-pane">
+              <div class="chat-placeholder">Enter an item ID and select a question to begin analysis.</div>
+            </div>
+            <!-- Raw data toggle -->
+            <div id="rcRawToggleWrap" style="display:none;margin-top:0.6rem">
+              <button class="chat-details-toggle" type="button" id="rcRawToggleBtn">Show raw structured data</button>
+              <div class="chat-details-drawer" id="rcRawDrawer"></div>
+            </div>
           </article>
 
           <article class="output insight-page" data-panel="insights">
@@ -216,6 +295,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=15"></script>
+    <script src="/static/app.js?v=16"></script>
   </body>
 </html>
