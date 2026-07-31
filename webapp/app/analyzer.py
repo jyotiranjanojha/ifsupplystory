@@ -1172,19 +1172,30 @@ def _resolve_compare_context(base_dir: Path, week_id: Optional[str], base_scenar
     }
 
 
+_ITEM_EXTRACT_KEYWORD_BLOCKLIST = frozenset({
+    "item", "for", "the", "a", "an", "this", "that", "all", "any",
+    "some", "met", "not", "was", "check", "demand", "supply",
+    "if", "is", "it", "in", "or", "of", "at", "by", "on",
+})
+
+
 def _extract_item_candidates(question: str) -> List[str]:
     q = question or ""
     candidates: List[str] = []
     patterns = [
-        r"\bdemand\s+(?:for|item)\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        # Most specific first: "demand for item XXXX" / "demand item XXXX"
+        r"\bdemand\s+for\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        r"\bdemand\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        # Generic "item XXXX"
         r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)",
+        # "for XXXXXXXX" (long token only)
         r"\bfor\s+([A-Za-z0-9\-]{6,})\b",
     ]
 
     for pattern in patterns:
         for match in re.finditer(pattern, q, flags=re.IGNORECASE):
             value = (match.group(1) or "").strip(" .,:;!?()[]{}")
-            if value and value not in candidates:
+            if value and value.lower() not in _ITEM_EXTRACT_KEYWORD_BLOCKLIST and value not in candidates:
                 candidates.append(value)
 
     numeric_tokens = re.findall(r"\b\d{6,}\b", q)
@@ -1203,9 +1214,20 @@ def _infer_demand_item_from_question(question: str) -> Dict:
 
     selected = candidates[0] if len(candidates) == 1 else None
     if not selected and demand_language and len(candidates) > 0:
-        demand_for = re.search(r"\bdemand\s+for\s+([A-Za-z0-9\-]+)", q, flags=re.IGNORECASE)
+        # "demand for item XXXX" — skip the word "item" and grab what follows it
+        demand_for = re.search(r"\bdemand\s+for\s+item\s+([A-Za-z0-9\-]+)", q, flags=re.IGNORECASE)
+        if not demand_for:
+            demand_for = re.search(r"\bdemand\s+for\s+([A-Za-z0-9\-]+)", q, flags=re.IGNORECASE)
         if demand_for:
-            selected = demand_for.group(1).strip()
+            val = demand_for.group(1).strip()
+            if val.lower() not in _ITEM_EXTRACT_KEYWORD_BLOCKLIST:
+                selected = val
+        if not selected:
+            # pick the first candidate that looks like an identifier (not a plain word)
+            selected = next(
+                (c for c in candidates if c.lower() not in _ITEM_EXTRACT_KEYWORD_BLOCKLIST),
+                None,
+            )
 
     confidence = "high" if selected else ("low" if candidates else "none")
     reason = ""
@@ -4557,8 +4579,29 @@ def _run_chat_workflow_if_needed(
     from .router_agent import route_question
     meta = route_question(question, history, week_id, scenario_id, scope)
     meta["question"] = question  # make question available to dispatcher
-    # forward optional fields (vision, log) if caller passes them via extra kwargs
-    return _dispatch_by_intent(base_dir, meta, week_id, scenario_id, scope)
+    result = _dispatch_by_intent(base_dir, meta, week_id, scenario_id, scope)
+
+    # Safety-net: if the router produced no workflow result but the question clearly
+    # asks about demand fulfillment for a specific item, run the item_demand_supply
+    # workflow directly rather than returning an empty conversational response.
+    if result.get("workflow") in {None, "Conversational Copilot"} and not result.get("result"):
+        ql = (question or "").lower()
+        demand_terms = [
+            "demand", "met", "unmet", "fulfill", "fulfil", "supply",
+            "was met", "not met", "demand status", "check demand",
+        ]
+        item = (meta.get("entities") or {}).get("item")
+        if not item:
+            item = _resolve_chat_item(question, history).get("selected_item")
+        if item and any(term in ql for term in demand_terms):
+            result = {
+                "workflow": "Item Demand Supply",
+                "result": _run_item_demand_supply_workflow(base_dir, week_id, scenario_id, item, scope).get("result"),
+                "note": "Auto-dispatched to Item Demand Supply based on detected item and demand question.",
+                "router_metadata": result.get("router_metadata"),
+            }
+
+    return result
 
 
 def _build_item_demand_supply_reply(workflow_result: Dict) -> Optional[str]:
@@ -4656,33 +4699,57 @@ def run_chat_assistant(
             "If identifiers are missing (week, scenario, item, plant), ask concise clarifying questions."
         )
 
-        prompt_sections = [
-            f"User question: {q}",
-            f"Command parse: {json.dumps(parsed_command, ensure_ascii=True)}",
-            f"Resolved context: {json.dumps(context, ensure_ascii=True)}",
-            f"Requested scope: {json.dumps(effective_scope, ensure_ascii=True)}",
-            f"Domain grounding: {json.dumps(grounding, ensure_ascii=True)}",
-            f"Workflow classification: {workflow_name}",
-        ]
-        if rag_evidence is not None:
-            prompt_sections.append(f"RAG evidence: {json.dumps(rag_evidence, ensure_ascii=True)}")
+        # Build a focused, grounded prompt.
+        # Priority: question → workflow result (actual data) → context → supporting evidence.
+        # Keep domain grounding brief when a workflow result is already available so
+        # smaller models (e.g. gemma3) can focus on the real data rather than large JSON blobs.
+        prompt_sections: List[str] = []
 
+        prompt_sections.append(f"## User Question\n{q}")
+        prompt_sections.append(f"## Workflow Identified\n{workflow_name}")
+        prompt_sections.append(f"## Resolved Planning Context\nWeek: {context.get('week_id')} | Scenario: {context.get('scenario_id')}")
+
+        # Workflow grounded result — include prominently BEFORE generic context
         if workflow_result is not None:
-            prompt_sections.append(f"Workflow grounded result JSON: {json.dumps(workflow_result, ensure_ascii=True)}")
-        if workflow_note:
-            prompt_sections.append(f"Workflow note: {workflow_note}")
+            prompt_sections.append(
+                f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(workflow_result, ensure_ascii=True)}"
+            )
+
+        # RAG evidence — include top hits only, trimmed
+        if rag_evidence is not None:
+            hits = (rag_evidence or {}).get("hits", [])[:4]
+            if hits:
+                prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(hits, ensure_ascii=True)}")
+
+        # Domain grounding — include only when no workflow result exists (avoid bloating prompt)
+        if workflow_result is None:
+            # Trim grounding: keep only matched_tables and key_linkages (skip heavy solver_knowledge)
+            trimmed_grounding = {
+                "context_resolution": grounding.get("context_resolution"),
+                "matched_tables": grounding.get("matched_tables", [])[:5],
+                "key_linkages": grounding.get("key_linkages", [])[:5],
+            }
+            prompt_sections.append(f"## Domain Grounding\n{json.dumps(trimmed_grounding, ensure_ascii=True)}")
+
         if clarification:
-            prompt_sections.append(f"Clarification payload: {json.dumps(clarification, ensure_ascii=True)}")
+            prompt_sections.append(f"## Clarification Payload\n{json.dumps(clarification, ensure_ascii=True)}")
+        if workflow_note:
+            prompt_sections.append(f"## Workflow Note\n{workflow_note}")
 
         prompt_sections.append(
+            "## Instructions\n"
             "Respond with a planner-friendly answer containing: "
-            "1) Direct answer, 2) Bounded context and user story alignment (if applicable), "
-            "3) Key evidence (tables/columns/linkages), 4) Confidence and gaps, 5) Next best question. "
-            "If workflow result exists, use it first; otherwise answer using domain grounding."
+            "1) Direct answer with specific numbers/status from the Grounded Planning Data (if available), "
+            "2) Bounded context and user story alignment (if applicable), "
+            "3) Key evidence (tables/columns/values/linkages), "
+            "4) Confidence and gaps, "
+            "5) Next best question. "
+            "If Grounded Planning Data exists, use it first and cite the actual values. "
+            "Do NOT say 'I cannot access the data' — the data is provided above."
         )
         if workflow_name.lower() == "item demand supply":
             prompt_sections.append(
-                "For Item Demand Supply workflow, explicitly report these stats: "
+                "For Item Demand Supply workflow, explicitly report these stats from the Grounded Planning Data: "
                 "demand_qty_total, scheduled_qty_total, unmet_qty, and meet_status."
             )
 

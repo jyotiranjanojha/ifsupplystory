@@ -185,6 +185,69 @@ function renderRichText(text) {
     .replace(/\n/g, '<br />');
 }
 
+function renderMarkdown(text) {
+  if (!text) return '';
+
+  const inlineEsc = (s) =>
+    String(s)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;');
+
+  const inlineFmt = (s) =>
+    inlineEsc(s)
+      .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*\n]+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`\n]+?)`/g, '<code class="md-code">$1</code>');
+
+  const lines = text.split('\n');
+  const out = [];
+  let inUl = false;
+  let inOl = false;
+
+  const closeList = () => {
+    if (inUl) { out.push('</ul>'); inUl = false; }
+    if (inOl) { out.push('</ol>'); inOl = false; }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const trimmed = line.trimStart();
+
+    if (trimmed.startsWith('### ')) {
+      closeList();
+      out.push(`<h5 class="md-h5">${inlineFmt(trimmed.slice(4))}</h5>`);
+    } else if (trimmed.startsWith('## ')) {
+      closeList();
+      out.push(`<h4 class="md-h4">${inlineFmt(trimmed.slice(3))}</h4>`);
+    } else if (trimmed.startsWith('# ')) {
+      closeList();
+      out.push(`<h3 class="md-h3">${inlineFmt(trimmed.slice(2))}</h3>`);
+    } else if (/^[-*+] /.test(trimmed)) {
+      if (inOl) { out.push('</ol>'); inOl = false; }
+      if (!inUl) { out.push('<ul class="md-list">'); inUl = true; }
+      out.push(`<li>${inlineFmt(trimmed.slice(2))}</li>`);
+    } else if (/^\d+\.\s/.test(trimmed)) {
+      if (inUl) { out.push('</ul>'); inUl = false; }
+      if (!inOl) { out.push('<ol class="md-list">'); inOl = true; }
+      out.push(`<li>${inlineFmt(trimmed.replace(/^\d+\.\s/, ''))}</li>`);
+    } else if (trimmed === '') {
+      closeList();
+      if (out.length > 0 && out[out.length - 1] !== '<div class="md-spacer"></div>') {
+        out.push('<div class="md-spacer"></div>');
+      }
+    } else {
+      closeList();
+      out.push(`<p class="md-p">${inlineFmt(trimmed)}</p>`);
+    }
+  }
+
+  closeList();
+  return out.join('');
+}
+
 function renderScalarBlock(value) {
   return `<div class="result-list-item">${renderRichText(formatScalar(value))}</div>`;
 }
@@ -290,9 +353,8 @@ function renderChatThread() {
   }
 
   pane.innerHTML = chatMessages
-    .map((message) => {
+    .map((message, idx) => {
       const role = message.role === 'user' ? 'user' : 'assistant';
-      const roleLabel = role === 'user' ? 'You' : 'Assistant';
       const followups =
         role === 'assistant' &&
         message.details &&
@@ -301,14 +363,17 @@ function renderChatThread() {
           ? message.details['Suggested Follow-ups']
           : [];
       let detailPayload = message.details;
-      if (followups.length > 0 && detailPayload && typeof detailPayload === 'object') {
+      if (detailPayload && typeof detailPayload === 'object') {
         detailPayload = { ...detailPayload };
         delete detailPayload['Suggested Follow-ups'];
       }
-      const details =
-        detailPayload && typeof detailPayload === 'object' && Object.keys(detailPayload).length > 0
-          ? `<div class="chat-details">${renderObject(detailPayload)}</div>`
-          : '';
+      const hasDetails = detailPayload && typeof detailPayload === 'object' && Object.keys(detailPayload).length > 0;
+      const drawerHtml = hasDetails
+        ? `<div class="chat-details-drawer" id="chat-drawer-${idx}">${renderObject(detailPayload)}</div>`
+        : '';
+      const toggleHtml = hasDetails
+        ? `<button class="chat-details-toggle" type="button" aria-expanded="false" data-drawer="chat-drawer-${idx}">Show structured data</button>`
+        : '';
       const followupHtml =
         followups.length > 0
           ? `<div class="chat-followups">${followups
@@ -319,12 +384,23 @@ function renderChatThread() {
               .join('')}</div>`
           : '';
 
+      if (role === 'user') {
+        return `
+          <div class="chat-message user">
+            <div class="chat-bubble user-bubble">${escapeHtml(formatScalar(message.content))}</div>
+          </div>
+        `;
+      }
+
       return `
-        <div class="chat-message ${role}">
-          <div class="chat-role">${roleLabel}</div>
-          <div>${renderRichText(formatScalar(message.content))}</div>
-          ${followupHtml}
-          ${details}
+        <div class="chat-message assistant">
+          <div class="chat-avatar" aria-hidden="true">AI</div>
+          <div class="chat-body">
+            <div class="chat-content">${renderMarkdown(formatScalar(message.content))}</div>
+            ${followupHtml}
+            ${toggleHtml}
+            ${drawerHtml}
+          </div>
         </div>
       `;
     })
@@ -335,6 +411,17 @@ function renderChatThread() {
       const text = button.getAttribute('data-followup') || '';
       chatQuestion.value = text;
       submitChat();
+    });
+  });
+
+  Array.from(pane.querySelectorAll('.chat-details-toggle')).forEach((button) => {
+    button.addEventListener('click', () => {
+      const drawerId = button.getAttribute('data-drawer');
+      const drawer = drawerId ? document.getElementById(drawerId) : null;
+      if (!drawer) return;
+      const open = drawer.classList.toggle('open');
+      button.setAttribute('aria-expanded', String(open));
+      button.textContent = open ? 'Hide structured data' : 'Show structured data';
     });
   });
 

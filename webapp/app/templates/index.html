@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Intel Foundry Planning AI Assistant</title>
     <link rel="icon" type="image/png" href="/static/intelfoundrylogo.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=4" />
+    <link rel="stylesheet" href="/static/styles.css?v=5" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -78,10 +78,11 @@
               </div>
               <button id="chatClearBtn" class="btn chat-clear-btn" type="button" aria-label="Clear chat history">
                 <span class="btn-icon" aria-hidden="true">x</span>
-                <span>Clear Chat</span>
+                <span>Clear</span>
               </button>
             </div>
-            <div class="field-grid">
+            <div id="chatResultPane" class="chat-thread"></div>
+            <div class="chat-input-area">
               <div class="split-grid chat-context-grid">
                 <input
                   id="chatWeek"
@@ -96,10 +97,11 @@
                   aria-label="Scenario ID, maps to SIMULATION_NAME"
                 />
               </div>
-              <textarea id="chatQuestion" rows="4" placeholder="Type your IFSP question here..."></textarea>
+              <div class="chat-input-row">
+                <textarea id="chatQuestion" rows="3" placeholder="Type your IFSP question here…"></textarea>
+                <button id="chatBtn" class="btn primary chat-send-btn" type="button">Send</button>
+              </div>
             </div>
-            <button id="chatBtn" class="btn primary">Ask Assistant</button>
-            <div id="chatResultPane" class="result-pane chat-thread chat-inline-thread"></div>
           </article>
 
           <article class="card feature-panel" data-panel="validation">
@@ -214,6 +216,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=13"></script>
+    <script src="/static/app.js?v=14"></script>
   </body>
 </html>

@@ -56,6 +56,9 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
             "root cause", "why unmet", "unmet", "why demand", "why did demand",
             "demand miss", "missed demand", "explain demand", "lineage",
             "genealogy", "pegging",
+            # additional unmet / not-met phrasing
+            "not met", "demand not met", "why was demand", "why demand not",
+            "demand shortage", "supply gap", "why did not demand",
         ],
         "required_slots": ["item"],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -68,6 +71,12 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "terms": [
             "demand and supply", "demand vs supply", "supply situation",
             "demand situation", "share more details about demand vs supply",
+            # fulfillment / met-demand phrasing
+            "was met", "met or not", "demand met", "is demand met",
+            "demand fulfilled", "demand status", "fulfillment status",
+            "check demand", "demand check", "was demand", "demand was",
+            "demand for item", "is the demand", "was the demand",
+            "demand not fulfilled", "demand not met",
         ],
         "required_slots": ["item"],
         "optional_slots": ["site", "week_id", "scenario_id"],
@@ -284,9 +293,20 @@ class RouterState(TypedDict):
 # Entity extraction helpers (no imports from analyzer to avoid circular deps)
 # ---------------------------------------------------------------------------
 
+# Words that must never be treated as an item identifier
+_ITEM_KEYWORD_BLOCKLIST = frozenset({
+    "item", "for", "the", "a", "an", "this", "that", "all", "any",
+    "some", "met", "not", "was", "check", "demand", "supply",
+    "if", "is", "it", "in", "or", "of", "at", "by", "on",
+})
+
 _ITEM_PATTERNS = [
-    r"\bdemand\s+(?:for|item)\s*[:=]?\s*([A-Za-z0-9\-]+)",
+    # Must come first — "demand for item XXXX" / "demand item XXXX"
+    r"\bdemand\s+for\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
+    r"\bdemand\s+item\s*[:=]?\s*([A-Za-z0-9\-]+)",
+    # Generic "item XXXX"
     r"\bitem\s*[:=]?\s*([A-Za-z0-9\-]+)",
+    # "for XXXXXXXX" (long token only)
     r"\bfor\s+([A-Za-z0-9\-]{6,})\b",
 ]
 _NUMERIC_ITEM_RE = re.compile(r"\b\d{6,}\b")
@@ -303,7 +323,7 @@ def _extract_item(text: str) -> Optional[str]:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             val = m.group(1).strip(" .,:;!?()[]{}")
-            if val:
+            if val and val.lower() not in _ITEM_KEYWORD_BLOCKLIST:
                 return val
     m = _NUMERIC_ITEM_RE.search(text)
     return m.group(0) if m else None
