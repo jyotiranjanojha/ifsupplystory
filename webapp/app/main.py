@@ -4,11 +4,11 @@ import json
 from datetime import datetime
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .analyzer import dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_root_cause_explained, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check
+from .analyzer import dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_root_cause_explained, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check, stream_llm
 from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
 from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
@@ -317,3 +317,33 @@ def chat(req: ChatRequest):
         req.llm_model,
         [m.model_dump() for m in req.history],
     )
+
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatRequest):
+    """
+    Streaming chat endpoint — returns SSE (text/event-stream).
+    Tokens arrive word-by-word instead of waiting for the full response.
+    Each SSE event: data: <token>\n\n
+    Terminal event: data: [DONE]\n\n
+    """
+    system_prompt = (
+        "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
+        "Be concise, grounded, and planner-friendly."
+    )
+
+    def _event_stream():
+        try:
+            for chunk in stream_llm(
+                req.question,
+                system_prompt,
+                model_name=req.llm_model,
+                history=[m.model_dump() for m in req.history],
+            ):
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")

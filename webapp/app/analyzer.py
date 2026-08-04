@@ -9,8 +9,11 @@ from datetime import datetime
 from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Generator, Iterable, List, Optional, Tuple
 from urllib import error, request
+import http.client
+import threading
+import urllib.parse
 
 from .rag import ensure_rag_index, query_rag
 
@@ -1754,6 +1757,147 @@ def _build_domain_focus_assessment(
 
 def _ollama_chat(prompt: str, system_prompt: str) -> Optional[str]:
     return _ollama_chat_with_model(prompt, system_prompt, LLM_CONFIG["model"])
+
+
+# ---------------------------------------------------------------------------
+# Streaming LLM — yields text chunks via SSE (all HTTP providers + OpenVINO)
+# ---------------------------------------------------------------------------
+
+def stream_llm(
+    prompt: str,
+    system_prompt: str,
+    model_name: Optional[str] = None,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Generator[str, None, None]:
+    """
+    Yield LLM response text incrementally.
+    HTTP providers: uses 'stream: true' + SSE (text/event-stream).
+    OpenVINO: uses openvino_genai TextStreamer (in-process callback, zero network overhead).
+    Each yielded value is a plain text chunk (delta), not the full response.
+    """
+    selected_model = (model_name or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"]
+    provider = LLM_CONFIG["provider"]
+
+    # ── OpenVINO path: in-process streaming via TextStreamer callback ──────────
+    if provider == "openvino":
+        yield from _stream_openvino(prompt, system_prompt, selected_model)
+        return
+
+    # ── HTTP path: SSE streaming (stream=true) ────────────────────────────────
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in (history or []):
+        role = (msg.get("role") or "").strip().lower()
+        content = (msg.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": selected_model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 900,
+        "stream": True,            # ← key change: enables SSE streaming
+    }
+    data = json.dumps(payload).encode("utf-8")
+
+    base_url = LLM_CONFIG["base_url"]
+    if provider == "azure":
+        endpoint = f"{base_url}/chat/completions?api-version={LLM_CONFIG.get('api_version', '2024-02-01')}"
+    else:
+        endpoint = f"{base_url}/v1/chat/completions"
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_CONFIG.get("api_key"):
+        auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
+        headers[auth_hdr] = f"Bearer {LLM_CONFIG['api_key']}" if auth_hdr == "Authorization" else LLM_CONFIG['api_key']
+    if provider == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
+
+    req = request.Request(endpoint, data=data, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=300) as resp:
+            in_think = False
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line == "data: [DONE]":
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    chunk = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                text  = delta.get("content") or ""
+                if not text:
+                    continue
+                # Strip DeepSeek-R1 think block incrementally
+                if "</think>" in text:
+                    text = text.split("</think>", 1)[-1]
+                    in_think = False
+                if "<think>" in text or in_think:
+                    in_think = True
+                    continue
+                if text:
+                    yield text
+    except (error.URLError, TimeoutError, OSError):
+        return
+
+
+def _stream_openvino(prompt: str, system_prompt: str, selected_model: str) -> Generator[str, None, None]:
+    """Stream tokens from openvino_genai using TextStreamer (zero HTTP overhead)."""
+    import openvino_genai as ov_genai
+    from queue import Queue, Empty
+
+    pipeline = LLM_CONFIG.get("pipeline") or _get_openvino_pipeline()
+    q: Queue = Queue()
+
+    class _QueueStreamer(ov_genai.StreamerBase):
+        def put(self, token_id: int) -> ov_genai.StreamingStatus:  # type: ignore[override]
+            decoded = pipeline.get_tokenizer().decode([token_id])
+            q.put(decoded)
+            return ov_genai.StreamingStatus.RUNNING
+
+        def end(self):
+            q.put(None)  # sentinel
+
+    formatted = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    import threading
+    streamer = _QueueStreamer()
+    t = threading.Thread(
+        target=pipeline.generate,
+        args=(formatted,),
+        kwargs={"max_new_tokens": 900, "temperature": 0.1, "do_sample": False, "streamer": streamer},
+        daemon=True,
+    )
+    t.start()
+
+    in_think = False
+    buffer = ""
+    while True:
+        try:
+            token = q.get(timeout=30)
+        except Empty:
+            break
+        if token is None:
+            break
+        buffer += token
+        # Strip DeepSeek-R1 think block
+        if "</think>" in buffer:
+            buffer = buffer.split("</think>", 1)[-1]
+            in_think = False
+        if "<think>" in buffer or in_think:
+            in_think = True
+            continue
+        if buffer:
+            yield buffer
+            buffer = ""
 
 
 def _env_flag(value: Optional[str], default: bool = False) -> bool:
