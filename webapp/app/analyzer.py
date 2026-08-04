@@ -5652,17 +5652,31 @@ def run_chat_assistant(
     rag_evidence = None
     rag_status = None
     try:
-        rag_status = ensure_rag_index(base_dir, refresh_hours=24)
-        item_hint = _resolve_chat_item(q, history).get("selected_item")
-        rag_evidence = query_rag(
-            base_dir,
-            q,
-            top_k=6,
-            week_id=context.get("week_id"),
-            scenario_id=context.get("scenario_id"),
-            site=(effective_scope or {}).get("site"),
-            item_id=item_hint,
-        )
+        # Use OpenVINO FAISS RAG when provider is openvino and index exists
+        if LLM_CONFIG["provider"] == "openvino":
+            from .rag_openvino import get_openvino_rag_status, query_openvino_rag
+            _ov_status = get_openvino_rag_status(base_dir)
+            if _ov_status.get("status") == "ready":
+                rag_evidence = query_openvino_rag(
+                    base_dir, q,
+                    week_id=context.get("week_id"),
+                    scenario_id=context.get("scenario_id"),
+                    top_k=6,
+                )
+                rag_status = {"status": "ready", "backend": "openvino+faiss",
+                              "doc_count": _ov_status.get("doc_count")}
+            else:
+                rag_status = _ov_status
+        else:
+            rag_status = ensure_rag_index(base_dir, refresh_hours=24)
+            item_hint = _resolve_chat_item(q, history).get("selected_item")
+            rag_evidence = query_rag(
+                base_dir, q, top_k=6,
+                week_id=context.get("week_id"),
+                scenario_id=context.get("scenario_id"),
+                site=(effective_scope or {}).get("site"),
+                item_id=item_hint,
+            )
     except Exception as exc:
         rag_status = {"status": "error", "detail": str(exc)}
 

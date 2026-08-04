@@ -13,7 +13,7 @@ from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
 from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
 from .rag import build_rag_index, get_rag_status, query_rag
-from .rag_openvino import build_openvino_rag_index, export_embedding_model, get_openvino_rag_status, query_openvino_rag
+from .rag_openvino import build_openvino_rag_index, export_embedding_model, export_reranker_model, get_openvino_rag_status, query_openvino_rag
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -142,6 +142,12 @@ def rag_openvino_status():
 def rag_openvino_export_embedding():
     """Export bge-small-en-v1.5 to OpenVINO IR (run once before first reindex)."""
     return export_embedding_model()
+
+
+@app.post("/api/rag/openvino/export-reranker")
+def rag_openvino_export_reranker():
+    """Export bge-reranker-base to OpenVINO IR (optional — improves retrieval quality)."""
+    return export_reranker_model()
 
 
 @app.post("/api/rag/openvino/reindex")

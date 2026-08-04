@@ -1,16 +1,14 @@
 """
 IFSP RAG system backed by OpenVINO GenAI + LangChain.
 
-Replace the TF-IDF/FAISS custom RAG with:
-  - OpenVINO BGE embeddings (bge-small-en-v1.5, GPU)
-  - LangChain FAISS vector store (persisted under .rag/faiss_openvino/)
-  - openvino_genai.LLMPipeline for generation (DeepSeek-R1, GPU, LATENCY)
-  - create_retrieval_chain for the RAG loop
+Providers: CSV files (default) or Snowflake (set RAG_SOURCE=snowflake).
+Pipeline: OpenVINO BGE embeddings → FAISS → optional BGE reranker → DeepSeek-R1 LLM.
 """
 
 from __future__ import annotations
 
 import csv
+import os
 import re
 import warnings
 from pathlib import Path
@@ -21,11 +19,26 @@ warnings.filterwarnings("ignore")
 INPUT_FOLDER  = "by_input"
 OUTPUT_FOLDER = "by_output"
 FAISS_DIR     = ".rag/faiss_openvino"
-MAX_ROWS_PER_FILE = 500
+MAX_ROWS_PER_FILE = int(os.getenv("RAG_MAX_ROWS_PER_FILE", "500"))
+RAG_SOURCE    = os.getenv("RAG_SOURCE", "csv").lower()  # "csv" or "snowflake"
 
 # Paths
-_OV_LLM_PATH = r"C:\Users\jojha\OneDrive - Intel Corporation\Documents\NoLlama\model"
-_OV_EMBEDDING_DIR = Path(__file__).resolve().parents[2] / "embedding_model" / "bge-small-en-v1.5"
+_OV_LLM_PATH      = os.getenv("OPENVINO_MODEL_PATH", r"C:\Users\jojha\OneDrive - Intel Corporation\Documents\NoLlama\model")
+_OV_EMBEDDING_DIR = Path(os.getenv("OPENVINO_EMBEDDING_MODEL_PATH",
+    str(Path(__file__).resolve().parents[2] / "embedding_model" / "bge-small-en-v1.5")))
+_OV_RERANKER_DIR  = Path(os.getenv("OPENVINO_RERANKER_MODEL_PATH",
+    str(Path(__file__).resolve().parents[2] / "embedding_model" / "bge-reranker-base")))
+RERANKER_ENABLED  = os.getenv("OPENVINO_RERANKER_ENABLED", "false").lower() == "true"
+RERANKER_TOP_N    = int(os.getenv("OPENVINO_RERANKER_TOP_N", "3"))
+
+# Snowflake connection settings (used when RAG_SOURCE=snowflake)
+SF_ACCOUNT   = os.getenv("SNOWFLAKE_ACCOUNT", "")
+SF_USER      = os.getenv("SNOWFLAKE_USER", "")
+SF_PASSWORD  = os.getenv("SNOWFLAKE_PASSWORD", "")
+SF_DATABASE  = os.getenv("SNOWFLAKE_DATABASE", "")
+SF_SCHEMA    = os.getenv("SNOWFLAKE_SCHEMA", "")
+SF_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "")
+SF_ROLE      = os.getenv("SNOWFLAKE_ROLE", "")
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +84,7 @@ def _get_vectorstore(base_dir: Path):
             str(faiss_path), embedding, allow_dangerous_deserialization=True
         )
     else:
-        docs = _load_csv_documents(base_dir)
+        docs = _load_snowflake_documents() if RAG_SOURCE == "snowflake" else _load_csv_documents(base_dir)
         _vectorstore = FAISS.from_documents(docs, embedding)
         faiss_path.mkdir(parents=True, exist_ok=True)
         _vectorstore.save_local(str(faiss_path))
@@ -90,7 +103,18 @@ def _get_rag_chain(base_dir: Path):
 
     llm         = _get_openvino_llm()
     vectorstore = _get_vectorstore(base_dir)
-    retriever   = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
+    retriever   = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 8})
+
+    # Wrap with reranker when enabled and model is exported
+    if RERANKER_ENABLED and _OV_RERANKER_DIR.exists():
+        from langchain_community.document_compressors.openvino_rerank import OpenVINOReranker
+        from langchain.retrievers import ContextualCompressionRetriever
+        reranker  = OpenVINOReranker(
+            model_name_or_path=str(_OV_RERANKER_DIR),
+            model_kwargs={"device": os.getenv("OPENVINO_DEVICE", "GPU")},
+            top_n=RERANKER_TOP_N,
+        )
+        retriever = ContextualCompressionRetriever(base_compressor=reranker, base_retriever=retriever)
 
     prompt = PromptTemplate.from_template(
         "You are an Intel Foundry Supply Planning assistant.\n\n"
@@ -217,9 +241,89 @@ def _load_csv_documents(base_dir: Path):
     return splitter.split_documents(docs)
 
 
+def _load_snowflake_documents() -> List:
+    """Load IFSP planning tables from Snowflake as LangChain Documents."""
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    if not SF_ACCOUNT or not SF_USER:
+        raise ValueError("SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER must be set for RAG_SOURCE=snowflake")
+
+    import snowflake.connector
+
+    conn = snowflake.connector.connect(
+        account=SF_ACCOUNT,
+        user=SF_USER,
+        password=SF_PASSWORD,
+        database=SF_DATABASE,
+        schema=SF_SCHEMA,
+        warehouse=SF_WAREHOUSE,
+        role=SF_ROLE or None,
+    )
+
+    # Key IFSP tables to index; extend as needed
+    tables = [
+        ("input",  "IF_SNOP_ITEMS",          "ITEM, DESCR, ITEMCLASS, LOTSIZEMIN, LOTSIZEMAX"),
+        ("input",  "IF_SNOP_INVENTORY",       "ITEM, LOC, QTY, AVAILDATE"),
+        ("input",  "IF_SNOP_CUSTOMERORDER",   "EXTORDERID, ITEM, LOC, QTY, REQDATE"),
+        ("input",  "IF_SNOP_BILLOFMATERIALS", "ITEM, SUBORD, LOC, BOMNUM, QTY"),
+        ("input",  "IF_SNOP_SOURCING",        "ITEM, SOURCE, DEST"),
+        ("output", "BY_IF_SNOP_OUT_PLANORDER","ITEM, LOC, QTY, STARTDATE, DUEDATE"),
+        ("output", "BY_IF_SNOP_OUT_SKUEXCEPTION", "ITEM, LOC, EXCEPTIONTYPE, QTY"),
+        ("output", "BY_IF_SNOP_OUT_SKUPROJSTATIC","ITEM, LOC, CAPTURE_WK, ONHAND, UNMET"),
+    ]
+
+    docs: List[Document] = []
+    cursor = conn.cursor()
+    try:
+        for source, table, cols in tables:
+            try:
+                cursor.execute(f"SELECT {cols} FROM {SF_DATABASE}.{SF_SCHEMA}.{table} LIMIT {MAX_ROWS_PER_FILE}")
+                col_names = [d[0] for d in cursor.description]
+                for row in cursor.fetchall():
+                    text = f"[{table}] " + " | ".join(
+                        f"{k}: {v}" for k, v in zip(col_names, row) if v is not None
+                    )
+                    docs.append(Document(page_content=text, metadata={"source": source, "table": table}))
+            except Exception:
+                continue
+    finally:
+        cursor.close()
+        conn.close()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=400, chunk_overlap=50, separators=[" | ", "\n", " ", ""]
+    )
+    return splitter.split_documents(docs)
+
+
 # ---------------------------------------------------------------------------
 # Public API — drop-in replacement for rag.py's query_rag / build_rag_index
 # ---------------------------------------------------------------------------
+
+def export_reranker_model() -> Dict:
+    """Export bge-reranker-base to OpenVINO IR. Optional — improves retrieval quality."""
+    if _OV_RERANKER_DIR.exists():
+        return {"status": "already_exported", "path": str(_OV_RERANKER_DIR)}
+
+    import subprocess, sys
+    _OV_RERANKER_DIR.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.pop("ALL_PROXY", None)
+    env.pop("all_proxy", None)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "optimum.commands.optimum_cli",
+             "export", "openvino",
+             "--model", "BAAI/bge-reranker-base",
+             "--task", "text-classification",
+             str(_OV_RERANKER_DIR)],
+            check=True, capture_output=True, text=True, env=env,
+        )
+        return {"status": "exported", "path": str(_OV_RERANKER_DIR)}
+    except subprocess.CalledProcessError as e:
+        return {"status": "error", "error": e.stderr[:500]}
+
 
 def export_embedding_model(device: str = "GPU") -> Dict:
     """Export bge-small-en-v1.5 to OpenVINO IR. Run once before first index build."""
