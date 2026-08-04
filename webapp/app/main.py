@@ -18,6 +18,12 @@ from .rag_openvino import build_openvino_rag_index, export_embedding_model, expo
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
+# Global semaphore — Nollama/OpenVINO are single-GPU serial; track queue depth for status messages
+import threading as _threading
+_llm_semaphore = _threading.Semaphore(1)
+_llm_queue_count = 0
+_llm_queue_lock = _threading.Lock()
+
 app = FastAPI(
     title="Intel Foundry Planning AI Assistant",
     version="1.0.0",
@@ -339,8 +345,8 @@ def chat_stream(req: ChatRequest):
     tok_queue: _queue.Queue = _queue.Queue()
 
     def _producer():
+        global _llm_queue_count
         try:
-            # Build the fully grounded prompt (RAG + workflow + context) before streaming
             tok_queue.put(("status", "Analysing your question and querying planning data…"))
             sp, grounded_prompt, _ = build_grounded_chat_prompt(
                 BASE_DIR,
@@ -350,9 +356,21 @@ def chat_stream(req: ChatRequest):
                 req.scope.model_dump(),
                 history=[m.model_dump() for m in req.history],
             )
-            tok_queue.put(("status", "Generating answer…"))
-            for chunk in stream_llm(grounded_prompt, sp, model_name=req.llm_model):
-                tok_queue.put(("token", chunk))
+            # Show queue position if LLM is busy with another request
+            with _llm_queue_lock:
+                _llm_queue_count += 1
+                position = _llm_queue_count
+            if position > 1:
+                tok_queue.put(("status", f"Waiting for GPU — {position - 1} request(s) ahead…"))
+            _llm_semaphore.acquire()
+            try:
+                tok_queue.put(("status", "Generating answer…"))
+                for chunk in stream_llm(grounded_prompt, sp, model_name=req.llm_model):
+                    tok_queue.put(("token", chunk))
+            finally:
+                _llm_semaphore.release()
+                with _llm_queue_lock:
+                    _llm_queue_count -= 1
         except Exception as exc:
             tok_queue.put(("error", str(exc)))
         finally:

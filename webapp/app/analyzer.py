@@ -1796,7 +1796,7 @@ def stream_llm(
         "model": selected_model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 600,
+        "max_tokens": 400,   # shorter = GPU freed faster for next queued request
         "stream": True,            # ← key change: enables SSE streaming
     }
     data = json.dumps(payload).encode("utf-8")
