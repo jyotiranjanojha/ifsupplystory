@@ -5610,6 +5610,24 @@ def _dispatch_by_intent(
 
     # ── clarification needed (missing required slot) ─────────────────────
     if meta.get("needs_clarification"):
+        q_text = (meta.get("question") or "").lower()
+        rc_terms = ("why", "drop", "late", "short", "early", "low", "change", "utiliz", "underload")
+        # Use regex item extraction as fallback when router entities didn't capture the item
+        item = resolved_item or _resolve_chat_item(meta.get("question", ""), None).get("selected_item")
+        # For resource utilization queries, extract resource ID from question (e.g. RES01, RES_ETCH)
+        if not item and any(kw in q_text for kw in ("utiliz", "capac", "underload", "overload", "res")):
+            import re as _re
+            res_match = _re.search(r'\b(RES[_\-]?[A-Z0-9]{1,15}|[A-Z]{2,6}[_\-]?[0-9]{1,6})\b',
+                                   meta.get("question") or "", _re.IGNORECASE)
+            if res_match:
+                item = res_match.group(1).upper()
+        if item and any(kw in q_text for kw in rc_terms):
+            rc_data = run_root_cause(base_dir, week_id, scenario_id, item, scope)
+            return {
+                "workflow": "Root Cause Analysis",
+                "result": rc_data,        # run_root_cause returns flat dict; wrap it here
+                "router_metadata": router_meta,
+            }
         return {
             "workflow": f"{meta.get('workflow', intent)} Clarification",
             "clarification": meta["clarification"],
@@ -5817,6 +5835,20 @@ def _run_chat_workflow_if_needed(
                 "workflow": "Item Demand Supply",
                 "result": _run_item_demand_supply_workflow(base_dir, week_id, scenario_id, item, scope).get("result"),
                 "note": "Auto-dispatched to Item Demand Supply based on detected item and demand question.",
+                "router_metadata": result.get("router_metadata"),
+            }
+
+    # Safety-net for root cause clarification — if item is known, run root cause directly
+    if "Clarification" in (result.get("workflow") or "") and not result.get("result"):
+        ql = (question or "").lower()
+        rc_terms = ["why", "drop", "late", "short", "early", "low", "change", "utiliz", "underload"]
+        item = (meta.get("entities") or {}).get("item") or _resolve_chat_item(question, history).get("selected_item")
+        if item and any(term in ql for term in rc_terms):
+            rc_data = run_root_cause(base_dir, week_id, scenario_id, item, scope)
+            result = {
+                "workflow": "Root Cause Analysis",
+                "result": rc_data,
+                "note": "Auto-dispatched to Root Cause analysis.",
                 "router_metadata": result.get("router_metadata"),
             }
 
