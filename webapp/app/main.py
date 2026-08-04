@@ -323,16 +323,21 @@ def chat(req: ChatRequest):
 def chat_stream(req: ChatRequest):
     """
     Streaming chat endpoint — returns SSE (text/event-stream).
-    Tokens arrive word-by-word instead of waiting for the full response.
-    Each SSE event: data: <token>\n\n
-    Terminal event: data: [DONE]\n\n
+    Sends ': keepalive' pings every 5 s while the LLM is thinking so the
+    browser never drops the connection on slow models (e.g. 30 s TTFT).
+    Each data event: data: <json-encoded token chunk>\n\n
+    Terminal event:  data: [DONE]\n\n
     """
+    import queue as _queue
+    import threading as _threading
+
     system_prompt = (
         "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
         "Be concise, grounded, and planner-friendly."
     )
+    tok_queue: _queue.Queue = _queue.Queue()
 
-    def _event_stream():
+    def _producer():
         try:
             for chunk in stream_llm(
                 req.question,
@@ -340,10 +345,28 @@ def chat_stream(req: ChatRequest):
                 model_name=req.llm_model,
                 history=[m.model_dump() for m in req.history],
             ):
-                yield f"data: {json.dumps(chunk)}\n\n"
+                tok_queue.put(("token", chunk))
         except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            tok_queue.put(("error", str(exc)))
         finally:
-            yield "data: [DONE]\n\n"
+            tok_queue.put(("done", None))
+
+    _threading.Thread(target=_producer, daemon=True).start()
+
+    def _event_stream():
+        while True:
+            try:
+                kind, val = tok_queue.get(timeout=5)
+            except _queue.Empty:
+                yield ": keepalive\n\n"   # SSE comment keeps browser connection alive
+                continue
+            if kind == "done":
+                yield "data: [DONE]\n\n"
+                return
+            if kind == "error":
+                yield f"data: {json.dumps({'error': val})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            yield f"data: {json.dumps(val)}\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")

@@ -2063,6 +2063,15 @@ async function submitChat() {
 
   let fullText = '';
   let rafPending = false;
+  let firstToken = false;
+  let elapsed = 0;
+  // Tick elapsed seconds until first token arrives so user knows it's working
+  const elapsedTimer = setInterval(() => {
+    if (firstToken) { clearInterval(elapsedTimer); return; }
+    elapsed++;
+    chatMessages[streamIdx].content = `▍  thinking… ${elapsed}s`;
+    renderChatThread();
+  }, 1000);
 
   function flushRender() {
     rafPending = false;
@@ -2112,7 +2121,10 @@ async function submitChat() {
           const payload = line.slice(6).trim();
           if (payload === '[DONE]') { buf = ''; break; }
           try {
-            fullText += JSON.parse(payload);
+            const token = JSON.parse(payload);
+            if (typeof token === 'string') {
+              if (!firstToken) { firstToken = true; clearInterval(elapsedTimer); }
+              fullText += token;
             if (!rafPending) {
               rafPending = true;
               requestAnimationFrame(flushRender);  // throttle re-renders to ~60fps
@@ -2122,8 +2134,10 @@ async function submitChat() {
       }
     }
   } catch (err) {
+    clearInterval(elapsedTimer);
     fullText = `Error: ${err.message}`;
   } finally {
+    clearInterval(elapsedTimer);
     // Remove typing cursor, show final text
     chatMessages[streamIdx].content = fullText || 'No response received.';
     renderChatThread();
