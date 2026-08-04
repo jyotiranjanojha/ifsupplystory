@@ -21,7 +21,7 @@ OUTPUT_FOLDER = "by_output"
 # =====================================================================
 # LLM PROVIDER CONFIGURATION (Production-Ready)
 # =====================================================================
-# Supported providers: 'nollama', 'openai', 'anthropic', 'custom', 'openvino'
+# Supported providers: 'nollama', 'openai', 'azure', 'anthropic', 'custom', 'openvino'
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "nollama").lower()
 
 # Nollama Configuration (Local, OpenAI-compatible v1 API)
@@ -43,6 +43,15 @@ ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 ANTHROPIC_JUDGE_MODEL = os.getenv("ANTHROPIC_JUDGE_MODEL", "claude-3-5-haiku-20241022")
 ANTHROPIC_VISION_MODEL = os.getenv("ANTHROPIC_VISION_MODEL", "claude-3-5-sonnet-20241022")
+
+# Azure OpenAI Configuration
+# Endpoint format: https://{resource}.openai.azure.com/openai/deployments/{deployment}
+AZURE_OPENAI_API_KEY     = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_ENDPOINT    = os.getenv("AZURE_OPENAI_ENDPOINT", "")   # e.g. https://myresource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT  = os.getenv("AZURE_OPENAI_DEPLOYMENT", "") # deployment name (= model alias)
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+AZURE_OPENAI_JUDGE_DEPLOYMENT  = os.getenv("AZURE_OPENAI_JUDGE_DEPLOYMENT", AZURE_OPENAI_DEPLOYMENT or "")
+AZURE_OPENAI_VISION_DEPLOYMENT = os.getenv("AZURE_OPENAI_VISION_DEPLOYMENT", AZURE_OPENAI_DEPLOYMENT or "")
 
 # Generic OpenAI-compatible API Configuration (for other providers)
 CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "")
@@ -120,6 +129,21 @@ def _get_active_llm_config():
             "model": ANTHROPIC_MODEL,
             "judge_model": ANTHROPIC_JUDGE_MODEL,
             "vision_model": ANTHROPIC_VISION_MODEL,
+        }
+    elif LLM_PROVIDER == "azure":
+        if not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT:
+            raise ValueError("AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_DEPLOYMENT are all required for Azure provider.")
+        # Azure base_url encodes the deployment; chat completions appended without /v1/
+        azure_base = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}"
+        return {
+            "provider": "azure",
+            "base_url": azure_base,
+            "api_key": AZURE_OPENAI_API_KEY,
+            "auth_header": "api-key",  # Azure uses api-key, not Authorization Bearer
+            "api_version": AZURE_OPENAI_API_VERSION,
+            "model": AZURE_OPENAI_DEPLOYMENT,      # Azure uses deployment name as model
+            "judge_model": AZURE_OPENAI_JUDGE_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT,
+            "vision_model": AZURE_OPENAI_VISION_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT,
         }
     elif LLM_PROVIDER == "custom":
         if not CUSTOM_LLM_BASE_URL or not CUSTOM_LLM_MODEL:
@@ -1849,7 +1873,7 @@ def _ollama_chat_with_model(
 
     messages.append({"role": "user", "content": prompt})
 
-    # Build request for OpenAI-compatible API (works for Nollama, OpenAI, custom)
+    # Build request for OpenAI-compatible API (works for Nollama, OpenAI, Anthropic, Azure, custom)
     payload = {
         "model": selected_model,
         "messages": messages,
@@ -1859,11 +1883,14 @@ def _ollama_chat_with_model(
 
     data = json.dumps(payload).encode("utf-8")
     
-    # Construct endpoint URL
+    # Azure uses /chat/completions?api-version=... (no /v1/ prefix); all others use /v1/chat/completions
     base_url = LLM_CONFIG["base_url"]
-    endpoint = f"{base_url}/v1/chat/completions"
+    if LLM_CONFIG.get("provider") == "azure":
+        endpoint = f"{base_url}/chat/completions?api-version={LLM_CONFIG.get('api_version', '2024-02-01')}"
+    else:
+        endpoint = f"{base_url}/v1/chat/completions"
     
-    # Prepare headers
+    # Prepare headers — auth_header key controls whether to use Bearer, x-api-key, or api-key
     headers = {"Content-Type": "application/json"}
     if LLM_CONFIG.get("api_key"):
         auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
@@ -1966,14 +1993,20 @@ def list_ollama_models() -> Dict:
     
     # Handle OpenAI provider
     if provider == "openai":
-        base_url = LLM_CONFIG["base_url"]
-        _MODEL_PRIORITY: List[Tuple[str, str]] = [
-            ("gpt-4", "GPT-4 - Most capable model"),
-            ("gpt-4-turbo-preview", "GPT-4 Turbo - Fast and capable"),
-            ("gpt-3.5-turbo", "GPT-3.5 Turbo - Fast and economical"),
-        ]
         return {
             "provider": "OpenAI",
+            "reachable": True,
+            "default_model": model,
+            "best_available": model,
+            "recommended_models": [model],
+            "models": [model],
+            "model_info": {model: {"recommended": True, "note": "Configured OpenAI model"}},
+        }
+
+    # Handle Azure OpenAI — return deployment name, no model list call needed
+    if provider == "azure":
+        return {
+            "provider": "Azure OpenAI",
             "reachable": True,
             "default_model": model,
             "best_available": model,
@@ -1982,9 +2015,21 @@ def list_ollama_models() -> Dict:
             "model_info": {
                 model: {
                     "recommended": True,
-                    "note": "Configured OpenAI model",
+                    "note": f"Azure deployment: {model}, api-version: {LLM_CONFIG.get('api_version')}",
                 }
             },
+        }
+
+    # Handle Anthropic — return configured model, no model list call needed
+    if provider == "anthropic":
+        return {
+            "provider": "Anthropic",
+            "reachable": True,
+            "default_model": model,
+            "best_available": model,
+            "recommended_models": [model],
+            "models": [model],
+            "model_info": {model: {"recommended": True, "note": "Configured Anthropic model"}},
         }
     
     # Handle Nollama and Custom providers (use v1 API)
@@ -4193,8 +4238,13 @@ def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
     if LLM_CONFIG.get("provider") == "anthropic":
         headers["anthropic-version"] = "2023-06-01"
     
+    if LLM_CONFIG.get("provider") == "azure":
+        vision_endpoint = f"{LLM_CONFIG['base_url']}/chat/completions?api-version={LLM_CONFIG.get('api_version', '2024-02-01')}"
+    else:
+        vision_endpoint = f"{LLM_CONFIG['base_url']}/v1/chat/completions"
+    
     req = request.Request(
-        f"{LLM_CONFIG['base_url']}/v1/chat/completions",
+        vision_endpoint,
         data=data,
         headers=headers,
         method="POST",
