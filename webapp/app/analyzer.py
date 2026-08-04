@@ -21,7 +21,7 @@ OUTPUT_FOLDER = "by_output"
 # =====================================================================
 # LLM PROVIDER CONFIGURATION (Production-Ready)
 # =====================================================================
-# Supported providers: 'nollama', 'openai', 'custom'
+# Supported providers: 'nollama', 'openai', 'custom', 'openvino'
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "nollama").lower()
 
 # Nollama Configuration (Local, OpenAI-compatible v1 API)
@@ -42,8 +42,50 @@ CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "")
 CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", "")
 CUSTOM_LLM_MODEL = os.getenv("CUSTOM_LLM_MODEL", "")
 
+# OpenVINO Configuration (Optimized local inference with latency hints)
+_OV_DEFAULT_PATH = r"C:\Users\jojha\OneDrive - Intel Corporation\Documents\NoLlama\model"
+OPENVINO_MODEL_PATH = os.getenv("OPENVINO_MODEL_PATH", _OV_DEFAULT_PATH)
+OPENVINO_DEVICE = os.getenv("OPENVINO_DEVICE", "GPU")  # GPU, CPU, NPU, etc.
+OPENVINO_PERFORMANCE_HINT = os.getenv("OPENVINO_PERFORMANCE_HINT", "LATENCY")  # LATENCY or THROUGHPUT
+OPENVINO_NUM_STREAMS = int(os.getenv("OPENVINO_NUM_STREAMS", "1"))  # For THROUGHPUT mode
+OPENVINO_MODEL = os.getenv("OPENVINO_MODEL", "DeepSeek-R1-Distill-Qwen-7B")
+OPENVINO_JUDGE_MODEL = os.getenv("OPENVINO_JUDGE_MODEL", "DeepSeek-R1-Distill-Qwen-7B")
+OPENVINO_VISION_MODEL = os.getenv("OPENVINO_VISION_MODEL", "DeepSeek-R1-Distill-Qwen-7B")
+
 # Judge/Review LLM Enable Flag
 JUDGE_LLM_ENABLED = os.getenv("JUDGE_LLM_ENABLED", "true")
+
+# Global OpenVINO pipeline (cached)
+_OPENVINO_PIPELINE = None
+
+def _get_openvino_pipeline():
+    """Lazy-load OpenVINO pipeline with performance hints."""
+    global _OPENVINO_PIPELINE
+    if _OPENVINO_PIPELINE is not None:
+        return _OPENVINO_PIPELINE
+    
+    try:
+        import openvino_genai as ov_genai
+        
+        # Configure performance hint
+        config_dict = {"PERFORMANCE_HINT": OPENVINO_PERFORMANCE_HINT}
+        if OPENVINO_PERFORMANCE_HINT == "THROUGHPUT":
+            config_dict["NUM_STREAMS"] = OPENVINO_NUM_STREAMS
+        
+        print(f"[OpenVINO] Loading model from: {OPENVINO_MODEL_PATH}")
+        print(f"[OpenVINO] Device: {OPENVINO_DEVICE}, Hint: {OPENVINO_PERFORMANCE_HINT}")
+        
+        _OPENVINO_PIPELINE = ov_genai.LLMPipeline(
+            OPENVINO_MODEL_PATH,
+            OPENVINO_DEVICE,
+            config_dict
+        )
+        print(f"[OpenVINO] Pipeline loaded successfully")
+        return _OPENVINO_PIPELINE
+    except ImportError:
+        raise ImportError("openvino_genai not installed. Install with: pip install openvino-genai")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load OpenVINO model: {e}")
 
 # Determine active provider and configuration
 def _get_active_llm_config():
@@ -69,6 +111,21 @@ def _get_active_llm_config():
             "model": CUSTOM_LLM_MODEL,
             "judge_model": CUSTOM_LLM_MODEL,
             "vision_model": CUSTOM_LLM_MODEL,
+        }
+    elif LLM_PROVIDER == "openvino":
+        # Verify OpenVINO is available
+        try:
+            _get_openvino_pipeline()
+        except Exception as e:
+            raise ValueError(f"OpenVINO provider unavailable: {e}")
+        return {
+            "provider": "openvino",
+            "base_url": None,
+            "api_key": None,
+            "model": OPENVINO_MODEL,
+            "judge_model": OPENVINO_JUDGE_MODEL,
+            "vision_model": OPENVINO_VISION_MODEL,
+            "pipeline": _get_openvino_pipeline(),
         }
     else:  # Default to Nollama
         return {
@@ -1751,9 +1808,15 @@ def _ollama_chat_with_model(
 ) -> Optional[str]:
     """
     Call the configured LLM provider with a chat message.
-    Supports: Nollama (local), OpenAI, and other OpenAI-compatible APIs.
+    Supports: Nollama (local), OpenAI, Custom, and OpenVINO (optimized local).
     """
     selected_model = (model_name or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"]
+    
+    # Handle OpenVINO provider (local optimized inference)
+    if LLM_CONFIG["provider"] == "openvino":
+        return _openvino_chat_with_model(prompt, system_prompt, selected_model)
+    
+    # Handle OpenAI-compatible providers (Nollama, OpenAI, Custom)
     messages = [{"role": "system", "content": system_prompt}]
 
     for msg in (history or []):
@@ -1805,33 +1868,85 @@ def _ollama_chat_with_model(
     return None
 
 
+def _openvino_chat_with_model(prompt: str, system_prompt: str, selected_model: str) -> Optional[str]:
+    """
+    Send a chat request to OpenVINO-optimized local LLM with latency hints.
+    Supports GPU acceleration with performance tuning for low-latency inference.
+    
+    Configuration:
+    - OPENVINO_MODEL_PATH: Path to quantized model (e.g., ./DeepSeek-R1-Distill-Qwen-7B-int4-ov)
+    - OPENVINO_DEVICE: GPU, CPU, NPU (default: GPU)
+    - OPENVINO_PERFORMANCE_HINT: LATENCY or THROUGHPUT (default: LATENCY)
+    - OPENVINO_NUM_STREAMS: Number of streams for THROUGHPUT mode (default: 1)
+    """
+    try:
+        pipeline = LLM_CONFIG.get("pipeline")
+        if not pipeline:
+            pipeline = _get_openvino_pipeline()
+        
+        # Format messages for OpenVINO chat format
+        formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        
+        # Generate response - cap max_new_tokens to limit reasoning chain length
+        response = pipeline.generate(
+            formatted_prompt,
+            max_new_tokens=1200,
+            temperature=0.2,
+            top_p=0.9,
+            do_sample=True
+        )
+        
+        if response:
+            # DeepSeek-R1 omits the opening <think> tag; split on </think> to get final answer
+            if "</think>" in response:
+                result = response.split("</think>", 1)[-1]
+            else:
+                result = response
+            result = result.split("<|im_end|>")[0].strip()
+            return result if result else None
+        return None
+        
+    except Exception as e:
+        print(f"[OpenVINO] Chat error: {e}")
+        return None
+
+
 def list_ollama_models() -> Dict:
     """
     List available models from the configured LLM provider.
-    Supports: Nollama (local OpenAI v1 API), OpenAI, and other OpenAI-compatible APIs.
+    Supports: Nollama, OpenAI, Custom, and OpenVINO (optimized local).
     """
     provider = LLM_CONFIG["provider"]
-    base_url = LLM_CONFIG["base_url"]
     model = LLM_CONFIG["model"]
     
-    # Provider-specific model priorities
+    # Handle OpenVINO provider (local optimized models)
+    if provider == "openvino":
+        return {
+            "provider": "OpenVINO",
+            "reachable": True,
+            "default_model": model,
+            "best_available": model,
+            "recommended_models": [model],
+            "models": [model],
+            "model_info": {
+                model: {
+                    "recommended": True,
+                    "note": "OpenVINO-optimized local model (GPU-accelerated, latency-optimized)",
+                    "device": OPENVINO_DEVICE,
+                    "performance_hint": OPENVINO_PERFORMANCE_HINT,
+                    "model_path": OPENVINO_MODEL_PATH,
+                }
+            },
+        }
+    
+    # Handle OpenAI provider
     if provider == "openai":
+        base_url = LLM_CONFIG["base_url"]
         _MODEL_PRIORITY: List[Tuple[str, str]] = [
             ("gpt-4", "GPT-4 - Most capable model"),
             ("gpt-4-turbo-preview", "GPT-4 Turbo - Fast and capable"),
             ("gpt-3.5-turbo", "GPT-3.5 Turbo - Fast and economical"),
         ]
-    elif provider == "custom":
-        _MODEL_PRIORITY = [(model, "Custom LLM model")]
-    else:  # Nollama (default)
-        _MODEL_PRIORITY: List[Tuple[str, str]] = [
-            ("qwen2@GPU", "Qwen2 - High performance reasoning model"),
-        ]
-    
-    _RECOMMENDED_NAMES = {name for name, _ in _MODEL_PRIORITY}
-    
-    # For OpenAI, return configured model without trying to fetch list
-    if provider == "openai":
         return {
             "provider": "OpenAI",
             "reachable": True,
@@ -1845,6 +1960,77 @@ def list_ollama_models() -> Dict:
                     "note": "Configured OpenAI model",
                 }
             },
+        }
+    
+    # Handle Nollama and Custom providers (use v1 API)
+    base_url = LLM_CONFIG["base_url"]
+    if provider == "custom":
+        _MODEL_PRIORITY = [(model, "Custom LLM model")]
+    else:  # Nollama (default)
+        _MODEL_PRIORITY: List[Tuple[str, str]] = [
+            ("qwen2@GPU", "Qwen2 - High performance reasoning model"),
+        ]
+    
+    _RECOMMENDED_NAMES = {name for name, _ in _MODEL_PRIORITY}
+    
+    # Try to fetch models via v1 API
+    headers = {"Content-Type": "application/json"}
+    if LLM_CONFIG.get("api_key"):
+        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+    
+    req = request.Request(
+        f"{base_url}/v1/models",
+        headers=headers,
+        method="GET"
+    )
+    
+    try:
+        with request.urlopen(req, timeout=15) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return {
+            "provider": provider.capitalize(),
+            "reachable": False,
+            "default_model": model,
+            "best_available": model,
+            "recommended_models": [name for name, _ in _MODEL_PRIORITY],
+            "models": [],
+            "model_info": {},
+        }
+
+    available: List[str] = []
+    # Parse OpenAI v1 format response (standard for all v1 API providers)
+    for model_data in body.get("data", []):
+        model_id = (model_data.get("id") or "").strip()
+        if model_id:
+            available.append(model_id)
+
+    available_set = set(available)
+
+    # Pick the best model from the priority list that is actually available
+    best_available = model
+    for name, _ in _MODEL_PRIORITY:
+        if name in available_set:
+            best_available = name
+            break
+
+    # Build per-model metadata for the UI
+    model_info: Dict[str, Dict] = {}
+    for name in available:
+        rec = next(((n, d) for n, d in _MODEL_PRIORITY if n == name), None)
+        model_info[name] = {
+            "recommended": name in _RECOMMENDED_NAMES,
+            "note": rec[1] if rec else "",
+        }
+
+    return {
+        "provider": provider.capitalize(),
+        "reachable": True,
+        "default_model": model,
+        "best_available": best_available,
+        "recommended_models": [name for name, _ in _MODEL_PRIORITY if name in available_set],
+        "models": available,
+        "model_info": model_info,
         }
     
     # For other providers (Nollama, custom), try to fetch models via v1 API

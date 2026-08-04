@@ -2,7 +2,7 @@
 
 ## Overview
 
-The IFSP application now supports multiple LLM providers through a flexible configuration system. You can easily switch between local (Nollama), cloud (OpenAI), or custom OpenAI-compatible APIs.
+The IFSP application now supports multiple LLM providers through a flexible configuration system. You can easily switch between local (Nollama, OpenVINO), cloud (OpenAI), or custom OpenAI-compatible APIs.
 
 ## Supported Providers
 
@@ -25,7 +25,58 @@ NOLLAMA_MODEL=qwen2@GPU
 
 ---
 
-### 2. **OpenAI** (Production Cloud)
+### 2. **OpenVINO** (Optimized Local - GPU/CPU)
+- **Use Case**: High-performance local inference with GPU/CPU acceleration
+- **API Format**: Direct Python library (not HTTP)
+- **Authentication**: None required
+- **Cost**: Free (self-hosted, offline)
+- **Performance**: Optimized with latency/throughput hints
+
+**Configuration:**
+```bash
+LLM_PROVIDER=openvino
+OPENVINO_MODEL_PATH=./DeepSeek-R1-Distill-Qwen-7B-int4-ov
+OPENVINO_DEVICE=GPU  # GPU, CPU, or NPU
+OPENVINO_PERFORMANCE_HINT=LATENCY  # LATENCY or THROUGHPUT
+OPENVINO_NUM_STREAMS=1  # For THROUGHPUT mode
+OPENVINO_MODEL=deepseek-r1-distill-qwen-7b
+```
+
+**Requirements:**
+- OpenVINO Runtime installed: `pip install openvino-genai`
+- Quantized model files (e.g., DeepSeek-R1-Distill-Qwen-7B-int4-ov)
+- GPU drivers (optional, for GPU acceleration)
+- Minimum 8GB RAM recommended
+
+**Setup Steps:**
+1. Install OpenVINO: `pip install openvino-genai`
+2. Download or prepare quantized model
+3. Set `LLM_PROVIDER=openvino`
+4. Set `OPENVINO_MODEL_PATH=/path/to/model`
+5. Restart the application
+
+**Performance Tuning:**
+```bash
+# For latency-sensitive applications (default)
+OPENVINO_PERFORMANCE_HINT=LATENCY
+OPENVINO_DEVICE=GPU
+
+# For throughput (batch processing)
+OPENVINO_PERFORMANCE_HINT=THROUGHPUT
+OPENVINO_NUM_STREAMS=4
+OPENVINO_DEVICE=GPU
+```
+
+**Advantages:**
+- 🚀 GPU acceleration (2-10x faster than CPU)
+- 🔒 Complete offline operation
+- 💰 Zero operational cost
+- 🎯 Precise latency control
+- 📊 Quantized models use less memory
+
+---
+
+### 3. **OpenAI** (Production Cloud)
 - **Use Case**: Production environments, highest quality models
 - **API Format**: OpenAI v1 API with authentication
 - **Authentication**: API key required
@@ -99,10 +150,15 @@ CUSTOM_LLM_MODEL=claude-3-opus
 
 | Variable | Provider | Required | Default | Description |
 |----------|----------|----------|---------|-------------|
-| `LLM_PROVIDER` | All | Yes | `nollama` | Which provider to use: `nollama`, `openai`, `custom` |
+| `LLM_PROVIDER` | All | Yes | `nollama` | Which provider to use: `nollama`, `openai`, `custom`, `openvino` |
 | `JUDGE_LLM_ENABLED` | All | No | `true` | Enable/disable LLM-based output judging |
 | `NOLLAMA_BASE_URL` | Nollama | No | `http://localhost:8000` | Nollama service URL |
 | `NOLLAMA_MODEL` | Nollama | No | `qwen2@GPU` | Model name to use |
+| `OPENVINO_MODEL_PATH` | OpenVINO | **Yes** | - | Path to quantized model (required if LLM_PROVIDER=openvino) |
+| `OPENVINO_DEVICE` | OpenVINO | No | `GPU` | Device: GPU, CPU, or NPU |
+| `OPENVINO_PERFORMANCE_HINT` | OpenVINO | No | `LATENCY` | Performance mode: LATENCY or THROUGHPUT |
+| `OPENVINO_NUM_STREAMS` | OpenVINO | No | `1` | Number of streams for THROUGHPUT mode |
+| `OPENVINO_MODEL` | OpenVINO | No | - | Model identifier |
 | `OPENAI_API_KEY` | OpenAI | **Yes** | - | OpenAI API key (required if LLM_PROVIDER=openai) |
 | `OPENAI_BASE_URL` | OpenAI | No | `https://api.openai.com/v1` | OpenAI API endpoint |
 | `OPENAI_MODEL` | OpenAI | No | `gpt-4` | Model to use |
