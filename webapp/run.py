@@ -1,7 +1,9 @@
 import argparse
 import importlib.util
+import json
 import os
 import socket
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -21,6 +23,37 @@ def _load_dotenv(env_path: Path) -> None:
             value = value.strip()
             if key and key not in os.environ:   # existing env vars take priority
                 os.environ[key] = value
+
+
+def _warmup_llm() -> None:
+    """Send a tiny request to pre-warm the LLM so the first user query isn't cold."""
+    import urllib.request, urllib.error
+    provider = os.getenv("LLM_PROVIDER", "nollama").lower()
+    if provider not in ("nollama", "custom"):
+        return  # cloud providers (openai, azure, anthropic) are always warm
+    base_url = os.getenv("NOLLAMA_BASE_URL", "http://localhost:8000") if provider == "nollama" \
+               else os.getenv("CUSTOM_LLM_BASE_URL", "")
+    if not base_url:
+        return
+    model = os.getenv("NOLLAMA_MODEL", "qwen2@GPU") if provider == "nollama" \
+            else os.getenv("CUSTOM_LLM_MODEL", "")
+    try:
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{base_url}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=180)
+        print(f"[IFSP] LLM warmed up ({provider} / {model})")
+    except Exception as e:
+        print(f"[IFSP] LLM warmup skipped: {e}")
 
 try:
     from webapp.app.main import app as fastapi_app
@@ -54,6 +87,9 @@ def main() -> None:
 
     selected_port = pick_port(args.host, args.port, args.max_tries)
     print(f"[IFSP] Starting server at http://{args.host}:{selected_port}")
+
+    # Warm up the LLM in background so first user query isn't cold-start slow
+    threading.Thread(target=_warmup_llm, daemon=True).start()
 
     if args.reload:
         try:

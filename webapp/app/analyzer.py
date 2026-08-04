@@ -1796,7 +1796,7 @@ def stream_llm(
         "model": selected_model,
         "messages": messages,
         "temperature": 0.2,
-        "max_tokens": 900,
+        "max_tokens": 600,
         "stream": True,            # ← key change: enables SSE streaming
     }
     data = json.dumps(payload).encode("utf-8")
