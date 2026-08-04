@@ -2125,9 +2125,10 @@ async function submitChat() {
             if (typeof token === 'string') {
               if (!firstToken) { firstToken = true; clearInterval(elapsedTimer); }
               fullText += token;
-            if (!rafPending) {
-              rafPending = true;
-              requestAnimationFrame(flushRender);  // throttle re-renders to ~60fps
+              if (!rafPending) {
+                rafPending = true;
+                requestAnimationFrame(flushRender);
+              }
             }
           } catch { /* ignore malformed chunk */ }
         }
