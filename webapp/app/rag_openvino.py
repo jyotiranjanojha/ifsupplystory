@@ -85,22 +85,43 @@ def _get_rag_chain(base_dir: Path):
         return _rag_chain
 
     from langchain_core.prompts import PromptTemplate
-    from langchain.chains.retrieval import create_retrieval_chain
-    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 
-    llm        = _get_openvino_llm()
+    llm         = _get_openvino_llm()
     vectorstore = _get_vectorstore(base_dir)
-    retriever  = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
+    retriever   = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
 
     prompt = PromptTemplate.from_template(
         "You are an Intel Foundry Supply Planning assistant.\n\n"
         "Use the following planning data context to answer the question.\n"
         "Only use information from the context. If the context is insufficient, say so.\n\n"
         "Context:\n{context}\n\n"
-        "Question: {input}\n\n"
+        "Question: {question}\n\n"
         "Answer:"
     )
-    _rag_chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, prompt))
+
+    def _format_docs(docs):
+        return "\n\n".join(d.page_content for d in docs)
+
+    # LCEL chain: retrieve → format → prompt → llm → parse
+    # Returns dict with 'answer' and 'context' keys
+    _rag_chain = (
+        RunnableParallel(
+            context=retriever | _format_docs,
+            question=RunnablePassthrough(),
+            docs=retriever,            # kept separately for source attribution
+        )
+        | RunnableParallel(
+            answer=(
+                RunnablePassthrough.assign(context=lambda x: x["context"])
+                | (lambda x: prompt.format(context=x["context"], question=x["question"]))
+                | (lambda text: llm.invoke(text))
+                | StrOutputParser()
+            ),
+            context=lambda x: x["docs"],
+        )
+    )
     return _rag_chain
 
 
@@ -205,8 +226,14 @@ def export_embedding_model(device: str = "GPU") -> Dict:
     if _OV_EMBEDDING_DIR.exists():
         return {"status": "already_exported", "path": str(_OV_EMBEDDING_DIR)}
 
-    import subprocess, sys
+    import subprocess, sys, os
     _OV_EMBEDDING_DIR.parent.mkdir(parents=True, exist_ok=True)
+
+    # Intel corporate environment sets ALL_PROXY=socks://... which breaks httpx
+    env = os.environ.copy()
+    env.pop("ALL_PROXY", None)
+    env.pop("all_proxy", None)
+
     try:
         subprocess.run(
             [
@@ -219,6 +246,7 @@ def export_embedding_model(device: str = "GPU") -> Dict:
             check=True,
             capture_output=True,
             text=True,
+            env=env,
         )
         return {"status": "exported", "path": str(_OV_EMBEDDING_DIR)}
     except subprocess.CalledProcessError as e:
@@ -257,7 +285,7 @@ def query_openvino_rag(
         return {"query": question, "hits": [], "answer": None, "backend": "openvino+faiss"}
 
     chain  = _get_rag_chain(base_dir)
-    result = chain.invoke({"input": question})
+    result = chain.invoke(question)
 
     hits = [
         {
