@@ -1371,7 +1371,8 @@ select:focus {
 }
 
 /* Output card */
-.rc-output-card {
+/* display set on .active variant only — avoids overriding .insight-page { display:none } */
+.rc-output-card.active {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
