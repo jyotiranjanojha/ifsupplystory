@@ -637,6 +637,9 @@ select:focus {
 .chat-content .md-list { margin: 0.28rem 0 0.28rem 1.25rem; padding: 0; }
 .chat-content .md-list li { margin: 0.18rem 0; line-height: 1.55; }
 .chat-content .md-code { background: rgba(0, 104, 181, 0.09); padding: 0.1rem 0.32rem; border-radius: 4px; font-size: 0.86em; font-family: 'Courier New', monospace; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+.chat-content:has(> *:last-child:empty) + .chat-streaming-cursor,
+.chat-streaming-cursor { display:inline-block; width:0.55em; height:1em; background:currentColor; vertical-align:text-bottom; border-radius:1px; animation:blink 0.9s step-end infinite; margin-left:1px; }
 
 /* Follow-up chips */
 .chat-followups {

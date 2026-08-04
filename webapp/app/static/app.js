@@ -2053,55 +2053,85 @@ async function submitChat() {
 
   const historyForApi = [...chatHistory];
   appendChatMessage('user', question);
-  appendChatMessage('assistant', 'Thinking...');
+  // Streaming placeholder — will be updated in-place
+  const streamIdx = chatMessages.length;
+  appendChatMessage('assistant', '▍');
 
   chatBtn.disabled = true;
-  chatBtn.textContent = 'Asking...';
+  chatBtn.textContent = 'Streaming...';
+  chatQuestion.value = '';
+
+  let fullText = '';
+  let rafPending = false;
+
+  function flushRender() {
+    rafPending = false;
+    chatMessages[streamIdx].content = fullText + '▍';
+    renderChatThread();
+  }
+
+  const chatSiteEl = document.getElementById('chatSite');
+  const body = JSON.stringify({
+    question,
+    week_id: document.getElementById('chatWeek').value || null,
+    scenario_id: document.getElementById('chatScenario').value || null,
+    llm_enabled: chatLlmEnabled.checked,
+    llm_model: chatLlmEnabled.checked ? chatLlmModel.value || null : null,
+    history: historyForApi,
+    scope: { site: chatSiteEl ? chatSiteEl.value || null : null },
+  });
+
   try {
-    const chatSiteEl = document.getElementById('chatSite');
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question,
-        week_id: document.getElementById('chatWeek').value || null,
-        scenario_id: document.getElementById('chatScenario').value || null,
-        llm_enabled: chatLlmEnabled.checked,
-        llm_model: chatLlmEnabled.checked ? chatLlmModel.value || null : null,
-        history: historyForApi,
-        scope: {
-          site: chatSiteEl ? chatSiteEl.value || null : null,
-        },
-      }),
+      body,
     });
 
-    const contentType = res.headers.get('content-type') || '';
-    const data = contentType.includes('application/json')
-      ? await res.json()
-      : { Error: `Unexpected response format from /api/chat (${res.status}).` };
+    if (!res.ok || !res.body) {
+      // Fall back to blocking endpoint on error
+      const data = await res.json().catch(() => ({}));
+      chatMessages[streamIdx].content = data['Assistant Reply'] || data.message || `Request failed (${res.status}).`;
+      renderChatThread();
+    } else {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
 
-    chatMessages.pop();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
 
-    if (!res.ok) {
-      appendChatMessage('assistant', `Request failed (${res.status}).`, data);
-      return;
+        // Process complete SSE lines
+        const lines = buf.split('\n');
+        buf = lines.pop();                      // keep incomplete last line
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6).trim();
+          if (payload === '[DONE]') { buf = ''; break; }
+          try {
+            fullText += JSON.parse(payload);
+            if (!rafPending) {
+              rafPending = true;
+              requestAnimationFrame(flushRender);  // throttle re-renders to ~60fps
+            }
+          } catch { /* ignore malformed chunk */ }
+        }
+      }
     }
-
-    const assistant = normalizeAssistantReply(data);
-    appendChatMessage('assistant', assistant.text, assistant.details);
+  } catch (err) {
+    fullText = `Error: ${err.message}`;
+  } finally {
+    // Remove typing cursor, show final text
+    chatMessages[streamIdx].content = fullText || 'No response received.';
+    renderChatThread();
 
     chatHistory.push({ role: 'user', content: question });
-    chatHistory.push({ role: 'assistant', content: assistant.text });
-    if (chatHistory.length > 20) {
-      chatHistory = chatHistory.slice(-20);
-    }
+    chatHistory.push({ role: 'assistant', content: fullText });
+    if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
 
-    chatQuestion.value = '';
-  } finally {
-    if (chatMessages.length > 0 && chatMessages[chatMessages.length - 1].content === 'Thinking...') {
-      chatMessages.pop();
-      renderChatThread();
-    }
     chatBtn.disabled = false;
     chatBtn.textContent = 'Ask Assistant';
   }
