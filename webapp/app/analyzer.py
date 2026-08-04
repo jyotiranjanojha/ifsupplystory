@@ -17,11 +17,96 @@ from .rag import ensure_rag_index, query_rag
 
 INPUT_FOLDER = "by_input"
 OUTPUT_FOLDER = "by_output"
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
-OLLAMA_JUDGE_MODEL = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.1:8b")
-OLLAMA_JUDGE_ENABLED = os.getenv("OLLAMA_JUDGE_ENABLED", "true")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "gemma3:latest")
+
+# =====================================================================
+# LLM PROVIDER CONFIGURATION (Production-Ready)
+# =====================================================================
+# Supported providers: 'nollama', 'openai', 'custom'
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "nollama").lower()
+
+# Nollama Configuration (Local, OpenAI-compatible v1 API)
+NOLLAMA_BASE_URL = os.getenv("NOLLAMA_BASE_URL", "http://localhost:8000")
+NOLLAMA_MODEL = os.getenv("NOLLAMA_MODEL", "qwen2@GPU")
+NOLLAMA_JUDGE_MODEL = os.getenv("NOLLAMA_JUDGE_MODEL", "qwen2@GPU")
+NOLLAMA_VISION_MODEL = os.getenv("NOLLAMA_VISION_MODEL", "qwen2@GPU")
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
+OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4-vision-preview")
+
+# Generic OpenAI-compatible API Configuration (for other providers)
+CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "")
+CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", "")
+CUSTOM_LLM_MODEL = os.getenv("CUSTOM_LLM_MODEL", "")
+
+# Judge/Review LLM Enable Flag
+JUDGE_LLM_ENABLED = os.getenv("JUDGE_LLM_ENABLED", "true")
+
+# Determine active provider and configuration
+def _get_active_llm_config():
+    """Get the active LLM provider configuration based on LLM_PROVIDER env var."""
+    if LLM_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not set. Required for OpenAI provider.")
+        return {
+            "provider": "openai",
+            "base_url": OPENAI_BASE_URL,
+            "api_key": OPENAI_API_KEY,
+            "model": OPENAI_MODEL,
+            "judge_model": OPENAI_JUDGE_MODEL,
+            "vision_model": OPENAI_VISION_MODEL,
+        }
+    elif LLM_PROVIDER == "custom":
+        if not CUSTOM_LLM_BASE_URL or not CUSTOM_LLM_MODEL:
+            raise ValueError("CUSTOM_LLM_BASE_URL and CUSTOM_LLM_MODEL required for custom provider.")
+        return {
+            "provider": "custom",
+            "base_url": CUSTOM_LLM_BASE_URL,
+            "api_key": CUSTOM_LLM_API_KEY,
+            "model": CUSTOM_LLM_MODEL,
+            "judge_model": CUSTOM_LLM_MODEL,
+            "vision_model": CUSTOM_LLM_MODEL,
+        }
+    else:  # Default to Nollama
+        return {
+            "provider": "nollama",
+            "base_url": NOLLAMA_BASE_URL,
+            "api_key": None,
+            "model": NOLLAMA_MODEL,
+            "judge_model": NOLLAMA_JUDGE_MODEL,
+            "vision_model": NOLLAMA_VISION_MODEL,
+        }
+
+# Get active configuration
+try:
+    LLM_CONFIG = _get_active_llm_config()
+except ValueError as e:
+    print(f"[WARNING] LLM Configuration Error: {e}")
+    print(f"[WARNING] Falling back to Nollama configuration")
+    LLM_CONFIG = {
+        "provider": "nollama",
+        "base_url": NOLLAMA_BASE_URL,
+        "api_key": None,
+        "model": NOLLAMA_MODEL,
+        "judge_model": NOLLAMA_JUDGE_MODEL,
+        "vision_model": NOLLAMA_VISION_MODEL,
+    }
+
+# Legacy OLLAMA env vars (for backward compatibility)
+OLLAMA_BASE_URL = LLM_CONFIG["base_url"]
+OLLAMA_MODEL = LLM_CONFIG["model"]
+OLLAMA_JUDGE_MODEL = LLM_CONFIG["judge_model"]
+OLLAMA_JUDGE_ENABLED = JUDGE_LLM_ENABLED
+OLLAMA_VISION_MODEL = LLM_CONFIG["vision_model"]
+
+# Aliases for internal use
+NOLLAMA_BASE_URL = LLM_CONFIG["base_url"] if LLM_CONFIG["provider"] == "nollama" else NOLLAMA_BASE_URL
+NOLLAMA_MODEL = LLM_CONFIG["model"] if LLM_CONFIG["provider"] == "nollama" else NOLLAMA_MODEL
+NOLLAMA_JUDGE_MODEL = LLM_CONFIG["judge_model"] if LLM_CONFIG["provider"] == "nollama" else NOLLAMA_JUDGE_MODEL
+NOLLAMA_VISION_MODEL = LLM_CONFIG["vision_model"] if LLM_CONFIG["provider"] == "nollama" else NOLLAMA_VISION_MODEL
 
 INPUT_DQ_VIEW_CONFIG = {
     "BY_ITEM": {"prefix": "if_snop_items-", "primary_key": ["ITEM"], "not_null_cols": ["ITEM", "DESCR", "ITEMCLASS"]},
@@ -1565,7 +1650,7 @@ def _build_domain_focus_assessment(
 
 
 def _ollama_chat(prompt: str, system_prompt: str) -> Optional[str]:
-    return _ollama_chat_with_model(prompt, system_prompt, OLLAMA_MODEL)
+    return _ollama_chat_with_model(prompt, system_prompt, LLM_CONFIG["model"])
 
 
 def _env_flag(value: Optional[str], default: bool = False) -> bool:
@@ -1609,7 +1694,7 @@ def _judge_llm_output(
     grounded_result: Optional[Dict],
     llm_model: Optional[str],
 ) -> Optional[Dict]:
-    if not _env_flag(OLLAMA_JUDGE_ENABLED, default=True):
+    if not _env_flag(NOLLAMA_JUDGE_ENABLED, default=True):
         return None
 
     system_prompt = (
@@ -1635,11 +1720,11 @@ def _judge_llm_output(
         ]
     )
 
-    review_text = _ollama_chat_with_model(prompt, system_prompt, OLLAMA_JUDGE_MODEL)
+    review_text = _ollama_chat_with_model(prompt, system_prompt, LLM_CONFIG["judge_model"])
     if not review_text:
         return {
             "status": "unavailable",
-            "judge_model": OLLAMA_JUDGE_MODEL,
+            "judge_model": LLM_CONFIG["judge_model"],
             "reason": "Judge model did not return a response.",
         }
 
@@ -1647,14 +1732,14 @@ def _judge_llm_output(
     if not parsed:
         return {
             "status": "parse_error",
-            "judge_model": OLLAMA_JUDGE_MODEL,
+            "judge_model": LLM_CONFIG["judge_model"],
             "raw_review": review_text,
             "reason": "Judge response was not valid JSON.",
         }
 
     parsed["status"] = parsed.get("status") or "ok"
-    parsed["judge_model"] = parsed.get("judge_model") or OLLAMA_JUDGE_MODEL
-    parsed["target_llm_model"] = parsed.get("target_llm_model") or ((llm_model or OLLAMA_MODEL).strip() or OLLAMA_MODEL)
+    parsed["judge_model"] = parsed.get("judge_model") or LLM_CONFIG["judge_model"]
+    parsed["target_llm_model"] = parsed.get("target_llm_model") or ((llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"])
     return parsed
 
 
@@ -1664,7 +1749,11 @@ def _ollama_chat_with_model(
     model_name: Optional[str],
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Optional[str]:
-    selected_model = (model_name or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+    """
+    Call the configured LLM provider with a chat message.
+    Supports: Nollama (local), OpenAI, and other OpenAI-compatible APIs.
+    """
+    selected_model = (model_name or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"]
     messages = [{"role": "system", "content": system_prompt}]
 
     for msg in (history or []):
@@ -1675,79 +1764,125 @@ def _ollama_chat_with_model(
 
     messages.append({"role": "user", "content": prompt})
 
+    # Build request for OpenAI-compatible API (works for Nollama, OpenAI, custom)
     payload = {
         "model": selected_model,
-        "stream": False,
         "messages": messages,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 900,   # cap output to ~90-120s on gemma3
-        },
+        "temperature": 0.2,
+        "max_tokens": 900,
     }
 
     data = json.dumps(payload).encode("utf-8")
+    
+    # Construct endpoint URL
+    base_url = LLM_CONFIG["base_url"]
+    endpoint = f"{base_url}/v1/chat/completions"
+    
+    # Prepare headers
+    headers = {"Content-Type": "application/json"}
+    if LLM_CONFIG.get("api_key"):
+        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+    
     req = request.Request(
-        f"{OLLAMA_BASE_URL}/api/chat",
+        endpoint,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
 
     try:
         with request.urlopen(req, timeout=300) as response:
             body = json.loads(response.read().decode("utf-8"))
-    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
         return None
 
-    message = body.get("message") or {}
-    content = (message.get("content") or "").strip()
-    return content or None
+    # Parse OpenAI format response (standard across all providers)
+    choices = body.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = (message.get("content") or "").strip()
+        return content or None
+    return None
 
 
 def list_ollama_models() -> Dict:
-    # Priority-ordered list of models best suited for planning Q&A.
-    # Earlier entries are preferred; the first available one is auto-selected.
-    _MODEL_PRIORITY: List[Tuple[str, str]] = [
-        ("llama3.1:8b",     "Best instruction-following for planning Q&A"),
-        ("llama3.1:latest", "Best instruction-following for planning Q&A"),
-        ("mistral:7b",      "Strong structured reasoning"),
-        ("mistral:latest",  "Strong structured reasoning"),
-        ("qwen2.5:7b",      "Excellent for logic & domain tasks"),
-        ("qwen2.5:latest",  "Excellent for logic & domain tasks"),
-        ("phi3:medium",     "Compact, highly instruction-aligned"),
-        ("phi3:latest",     "Compact, highly instruction-aligned"),
-        ("llama3:8b",       "Good general-purpose"),
-        ("llama3:latest",   "Good general-purpose"),
-        ("gemma3:4b",       "Lightweight general-purpose"),
-        ("gemma3:latest",   "Lightweight general-purpose"),
-    ]
+    """
+    List available models from the configured LLM provider.
+    Supports: Nollama (local OpenAI v1 API), OpenAI, and other OpenAI-compatible APIs.
+    """
+    provider = LLM_CONFIG["provider"]
+    base_url = LLM_CONFIG["base_url"]
+    model = LLM_CONFIG["model"]
+    
+    # Provider-specific model priorities
+    if provider == "openai":
+        _MODEL_PRIORITY: List[Tuple[str, str]] = [
+            ("gpt-4", "GPT-4 - Most capable model"),
+            ("gpt-4-turbo-preview", "GPT-4 Turbo - Fast and capable"),
+            ("gpt-3.5-turbo", "GPT-3.5 Turbo - Fast and economical"),
+        ]
+    elif provider == "custom":
+        _MODEL_PRIORITY = [(model, "Custom LLM model")]
+    else:  # Nollama (default)
+        _MODEL_PRIORITY: List[Tuple[str, str]] = [
+            ("qwen2@GPU", "Qwen2 - High performance reasoning model"),
+        ]
+    
     _RECOMMENDED_NAMES = {name for name, _ in _MODEL_PRIORITY}
-
-    req = request.Request(f"{OLLAMA_BASE_URL}/api/tags", method="GET")
+    
+    # For OpenAI, return configured model without trying to fetch list
+    if provider == "openai":
+        return {
+            "provider": "OpenAI",
+            "reachable": True,
+            "default_model": model,
+            "best_available": model,
+            "recommended_models": [model],
+            "models": [model],
+            "model_info": {
+                model: {
+                    "recommended": True,
+                    "note": "Configured OpenAI model",
+                }
+            },
+        }
+    
+    # For other providers (Nollama, custom), try to fetch models via v1 API
+    headers = {"Content-Type": "application/json"}
+    if LLM_CONFIG.get("api_key"):
+        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+    
+    req = request.Request(
+        f"{base_url}/v1/models",
+        headers=headers,
+        method="GET"
+    )
+    
     try:
         with request.urlopen(req, timeout=15) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return {
-            "provider": "Ollama",
+            "provider": provider.capitalize(),
             "reachable": False,
-            "default_model": OLLAMA_MODEL,
-            "best_available": OLLAMA_MODEL,
+            "default_model": model,
+            "best_available": model,
             "recommended_models": [name for name, _ in _MODEL_PRIORITY],
             "models": [],
             "model_info": {},
         }
 
     available: List[str] = []
-    for model in body.get("models", []):
-        name = (model.get("name") or "").strip()
-        if name:
-            available.append(name)
+    # Parse OpenAI v1 format response (standard for all v1 API providers)
+    for model_data in body.get("data", []):
+        model_id = (model_data.get("id") or "").strip()
+        if model_id:
+            available.append(model_id)
 
     available_set = set(available)
 
-    # Pick the best model from the priority list that is actually installed
-    best_available = OLLAMA_MODEL
+    # Pick the best model from the priority list that is actually available
+    best_available = model
     for name, _ in _MODEL_PRIORITY:
         if name in available_set:
             best_available = name
@@ -1763,9 +1898,9 @@ def list_ollama_models() -> Dict:
         }
 
     return {
-        "provider": "Ollama",
+        "provider": provider.capitalize(),
         "reachable": True,
-        "default_model": OLLAMA_MODEL,
+        "default_model": model,
         "best_available": best_available,
         "recommended_models": [name for name, _ in _MODEL_PRIORITY if name in available_set],
         "models": available,
@@ -1802,7 +1937,7 @@ def _summarize_with_ollama(
         "Only mention facts that are explicitly present in the grounded result JSON."
     )
 
-    selected_model = (llm_model or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+    selected_model = (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"]
     answer = _ollama_chat_with_model("\n\n".join(prompt_parts), system_prompt, selected_model)
     if not answer:
         return None
@@ -1811,7 +1946,7 @@ def _summarize_with_ollama(
         "Assistant Reply": answer,
         "Workflow": workflow,
         "Grounded Result": result,
-        "LLM Provider": "Ollama",
+        "LLM Provider": LLM_CONFIG["provider"].capitalize(),
         "LLM Model": selected_model,
     }
 
@@ -3737,7 +3872,7 @@ MEET STATUS: {ds.get('meet_status','unknown')} | FILL RATE: {_fmt(fill_rate)}%
         "(3 specific actions)\n"
     )
 
-    narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or OLLAMA_MODEL)
+    narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or LLM_CONFIG["model"])
 
     return {
         "narrative": narrative or _build_fallback_rc_narrative(
@@ -3746,7 +3881,7 @@ MEET STATUS: {ds.get('meet_status','unknown')} | FILL RATE: {_fmt(fill_rate)}%
         "stats":          stats,
         "question_type":  question_type,
         "question_label": _RC_QUESTION_LABELS.get(question_type, question_type),
-        "llm_model":      (llm_model or OLLAMA_MODEL),
+        "llm_model":      (llm_model or LLM_CONFIG["model"]),
         "llm_used":       bool(narrative),
         "raw_data":       raw,
         "deep_evidence":  deep,
@@ -3787,31 +3922,30 @@ def run_log_reader(
     )
     prompt = f"Planning context: week={context.get('week_id')}, scenario={context.get('scenario_id')}\n\nLog content:\n{content}"
 
-    reply = _ollama_chat_with_model(prompt, system_prompt, OLLAMA_MODEL)
+    reply = _ollama_chat_with_model(prompt, system_prompt, LLM_CONFIG["model"])
 
     return {
         "Workflow": "Log Reader",
         "Context Resolution": context,
         "Log Content Length": len(content),
-        "Assistant Reply": reply or "Log analysis could not be completed — Ollama unavailable.",
-        "LLM Provider": "Ollama",
-        "LLM Model": OLLAMA_MODEL,
+        "Assistant Reply": reply or f"Log analysis could not be completed — {LLM_CONFIG['provider']} unavailable.",
+        "LLM Provider": LLM_CONFIG["provider"].capitalize(),
+        "LLM Model": LLM_CONFIG["model"],
         "Note": "Paste the full log text as your question or in the log_text field for best results.",
     }
 
 
 # ---------------------------------------------------------------------------
-# Vision Query — analyze planning images via Ollama vision model
+# Vision Query — analyze planning images via Nollama vision model
 # ---------------------------------------------------------------------------
 
 def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
-    """Call the Ollama vision model with a base64-encoded image."""
+    """Call the vision model with a base64-encoded image using configured LLM provider."""
     # Strip data URI prefix if present (data:image/...;base64,...)
     b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64.strip())
 
     payload = {
-        "model": OLLAMA_VISION_MODEL,
-        "stream": False,
+        "model": LLM_CONFIG["vision_model"],
         "messages": [
             {
                 "role": "system",
@@ -3830,13 +3964,20 @@ def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
                 "images": [b64],
             },
         ],
-        "options": {"temperature": 0.1},
+        "temperature": 0.1,
     }
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    
+    # Add API key if configured (for OpenAI and custom providers)
+    api_key = LLM_CONFIG.get("api_key")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
     req = request.Request(
-        f"{OLLAMA_BASE_URL}/api/chat",
+        f"{LLM_CONFIG['base_url']}/v1/chat/completions",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -3844,7 +3985,13 @@ def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
             body = json.loads(resp.read().decode("utf-8"))
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
-    return ((body.get("message") or {}).get("content") or "").strip() or None
+    # Parse OpenAI format response
+    choices = body.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        content = (message.get("content") or "").strip()
+        return content or None
+    return None
 
 
 def run_vision_query(
@@ -3856,10 +4003,9 @@ def run_vision_query(
     scope: Optional[Dict] = None,
 ) -> Dict:
     """
-    Analyze a planning screenshot, chart, or visual report using the Ollama vision model.
+    Analyze a planning screenshot, chart, or visual report using the configured vision model.
     image_base64: base64-encoded image string (with or without data URI prefix).
-    Requires a vision-capable model (e.g. gemma3:latest).
-    Set OLLAMA_VISION_MODEL in .env.
+    Requires a vision-capable model configured via LLM_PROVIDER environment variable.
     """
     context = _resolve_context(base_dir, week_id, scenario_id)
 
@@ -3878,13 +4024,13 @@ def run_vision_query(
         "Assistant Reply": reply or (
             f"Vision analysis could not be completed. "
             f"Ensure a vision-capable model is available: "
-            f"OLLAMA_VISION_MODEL={OLLAMA_VISION_MODEL}. "
-            "Try: ollama pull gemma3:latest"
+            f"Vision Model={LLM_CONFIG['vision_model']} at {LLM_CONFIG['base_url']}. "
+            f"Contact your {LLM_CONFIG['provider']} administrator."
         ),
-        "LLM Provider": "Ollama",
-        "Vision Model": OLLAMA_VISION_MODEL,
+        "LLM Provider": LLM_CONFIG["provider"].capitalize(),
+        "Vision Model": LLM_CONFIG["vision_model"],
         "Note": (
-            f"Uses {OLLAMA_VISION_MODEL}. "
+            f"Uses {LLM_CONFIG['vision_model']} via {LLM_CONFIG['provider']}. "
         ),
     }
 
@@ -5433,8 +5579,8 @@ def run_chat_assistant(
                 "Workflow": workflow_name,
                 "Context Resolution": context,
                 "Suggested Follow-ups": follow_ups,
-                "LLM Provider": "Ollama",
-                "LLM Model": (llm_model or OLLAMA_MODEL).strip() or OLLAMA_MODEL,
+                "LLM Provider": LLM_CONFIG["provider"].capitalize(),
+                "LLM Model": (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"],
             }
             if workflow_result is not None:
                 response["Grounded Result"] = workflow_result
