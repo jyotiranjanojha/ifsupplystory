@@ -5840,6 +5840,129 @@ def _build_item_demand_supply_reply(workflow_result: Dict) -> Optional[str]:
     )
 
 
+def build_grounded_chat_prompt(
+    base_dir: Path,
+    question: str,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    scope: Dict,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, str, Dict]:
+    """
+    Run workflow analysis + RAG + grounding and return (system_prompt, grounded_prompt, meta).
+    No LLM call happens here — pure data gathering, safe to run before streaming.
+    """
+    q = (question or "").strip()
+
+    parsed_command = _parse_chat_command(q)
+    effective_week = week_id
+    effective_scenario = scenario_id
+    effective_scope = dict(scope or {})
+
+    if parsed_command.get("is_command"):
+        workflow_payload = _execute_chat_command(base_dir, parsed_command, week_id, scenario_id, effective_scope)
+        override = workflow_payload.get("context_override") or {}
+        effective_week = override.get("week_id", effective_week)
+        effective_scenario = override.get("scenario_id", effective_scenario)
+        effective_scope = override.get("scope", effective_scope)
+    else:
+        workflow_payload = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
+
+    context = _resolve_context(base_dir, effective_week, effective_scenario)
+    grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
+
+    rag_evidence = None
+    try:
+        if LLM_CONFIG["provider"] == "openvino":
+            from .rag_openvino import get_openvino_rag_status, query_openvino_rag
+            if get_openvino_rag_status(base_dir).get("status") == "ready":
+                rag_evidence = query_openvino_rag(base_dir, q, week_id=context.get("week_id"),
+                                                  scenario_id=context.get("scenario_id"), top_k=6)
+        else:
+            ensure_rag_index(base_dir, refresh_hours=24)
+            item_hint = _resolve_chat_item(q, history).get("selected_item")
+            rag_evidence = query_rag(base_dir, q, top_k=6,
+                                     week_id=context.get("week_id"),
+                                     scenario_id=context.get("scenario_id"),
+                                     site=(effective_scope or {}).get("site"),
+                                     item_id=item_hint)
+    except Exception:
+        pass
+
+    workflow_name = workflow_payload.get("workflow") or "Conversational Copilot"
+    workflow_result = workflow_payload.get("result")
+    workflow_note = workflow_payload.get("note")
+    clarification = workflow_payload.get("clarification")
+
+    system_prompt = (
+        "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
+        "Act like an industry-standard chat assistant similar to ChatGPT/Copilot/Claude: natural, precise, and actionable. "
+        "You are deeply knowledgeable in BY ESP LP optimization, data model, input/output table structure, linkage, and referential integrity. "
+        "Apply domain framing when relevant: Fulfillment Domain, Generation Domain, and Data Hygiene Domain. "
+        "Use bounded context language explicitly when matched: Context A (Demand Fulfillment), Context B (Supply Generation), Context C (Data Hygiene). "
+        "Ground all dataset-specific claims on provided evidence. Do not fabricate numbers or table contents. "
+        "When evidence is partial, separate confirmed findings from hypotheses. "
+        "If identifiers are missing (week, scenario, item, plant), ask concise clarifying questions."
+    )
+
+    prompt_sections: List[str] = []
+    prompt_sections.append(f"## User Question\n{q}")
+    prompt_sections.append(f"## Workflow Identified\n{workflow_name}")
+    prompt_sections.append(f"## Resolved Planning Context\nWeek: {context.get('week_id')} | Scenario: {context.get('scenario_id')}")
+
+    if workflow_result is not None:
+        prompt_sections.append(
+            f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(workflow_result, ensure_ascii=True)}"
+        )
+
+    if rag_evidence is not None:
+        hits = (rag_evidence or {}).get("hits", [])[:4]
+        if hits:
+            prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(hits, ensure_ascii=True)}")
+
+    if workflow_result is None:
+        trimmed_grounding = {
+            "context_resolution": grounding.get("context_resolution"),
+            "matched_tables": grounding.get("matched_tables", [])[:5],
+            "key_linkages": grounding.get("key_linkages", [])[:5],
+        }
+        prompt_sections.append(f"## Domain Grounding\n{json.dumps(trimmed_grounding, ensure_ascii=True)}")
+
+    if clarification:
+        prompt_sections.append(f"## Clarification Payload\n{json.dumps(clarification, ensure_ascii=True)}")
+    if workflow_note:
+        prompt_sections.append(f"## Workflow Note\n{workflow_note}")
+
+    prompt_sections.append(
+        "## Instructions\n"
+        "Respond with a planner-friendly answer containing: "
+        "1) Direct answer with specific numbers/status from the Grounded Planning Data (if available), "
+        "2) Key evidence (tables/columns/values/linkages), "
+        "3) Confidence and gaps, "
+        "4) Next best question. "
+        "If Grounded Planning Data exists, use it first and cite the actual values. "
+        "Do NOT say 'I cannot access the data' — the data is provided above."
+    )
+    if workflow_name.lower() == "item demand supply":
+        prompt_sections.append(
+            "For Item Demand Supply workflow, explicitly report: "
+            "demand_qty_total, scheduled_qty_total, unmet_qty, and meet_status."
+        )
+
+    meta = {
+        "workflow": workflow_name,
+        "workflow_result": workflow_result,
+        "context": context,
+        "rag_evidence": rag_evidence,
+        "clarification": clarification,
+        "follow_ups": _suggest_followups(workflow_name, q),
+        "history_window": (history or [])[-10:],
+        "grounding": grounding,
+        "workflow_payload": workflow_payload,
+    }
+    return system_prompt, "\n\n".join(prompt_sections), meta
+
+
 def run_chat_assistant(
     base_dir: Path,
     question: str,
@@ -5857,147 +5980,43 @@ def run_chat_assistant(
             "Suggested Next Step": "Try: 'Explain linkage between inddmdview and inddmdlink for the latest scenario'.",
         }
 
+    system_prompt, grounded_prompt, meta = build_grounded_chat_prompt(
+        base_dir, q, week_id, scenario_id, scope, history=history
+    )
+    workflow_payload = meta["workflow_payload"]
+    context = meta["context"]
+    workflow_name = meta["workflow"]
+    workflow_result = meta["workflow_result"]
+    clarification = meta["clarification"]
+    follow_ups = meta["follow_ups"]
+    rag_evidence = meta["rag_evidence"]
+    history_window = meta["history_window"]
+    grounding = meta["grounding"]
+
     parsed_command = _parse_chat_command(q)
-    workflow_payload: Dict
-    effective_week = week_id
-    effective_scenario = scenario_id
     effective_scope = dict(scope or {})
 
-    if parsed_command.get("is_command"):
-        workflow_payload = _execute_chat_command(base_dir, parsed_command, week_id, scenario_id, effective_scope)
-        override = workflow_payload.get("context_override") or {}
-        effective_week = override.get("week_id", effective_week)
-        effective_scenario = override.get("scenario_id", effective_scenario)
-        effective_scope = override.get("scope", effective_scope)
-    else:
-        workflow_payload = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
-
-    context = _resolve_context(base_dir, effective_week, effective_scenario)
-    history_window = (history or [])[-10:]
-    grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
-
-    rag_evidence = None
-    rag_status = None
-    try:
-        # Use OpenVINO FAISS RAG when provider is openvino and index exists
-        if LLM_CONFIG["provider"] == "openvino":
-            from .rag_openvino import get_openvino_rag_status, query_openvino_rag
-            _ov_status = get_openvino_rag_status(base_dir)
-            if _ov_status.get("status") == "ready":
-                rag_evidence = query_openvino_rag(
-                    base_dir, q,
-                    week_id=context.get("week_id"),
-                    scenario_id=context.get("scenario_id"),
-                    top_k=6,
-                )
-                rag_status = {"status": "ready", "backend": "openvino+faiss",
-                              "doc_count": _ov_status.get("doc_count")}
-            else:
-                rag_status = _ov_status
-        else:
-            rag_status = ensure_rag_index(base_dir, refresh_hours=24)
-            item_hint = _resolve_chat_item(q, history).get("selected_item")
-            rag_evidence = query_rag(
-                base_dir, q, top_k=6,
-                week_id=context.get("week_id"),
-                scenario_id=context.get("scenario_id"),
-                site=(effective_scope or {}).get("site"),
-                item_id=item_hint,
-            )
-    except Exception as exc:
-        rag_status = {"status": "error", "detail": str(exc)}
+    # Re-derive rag_status for the response metadata
+    rag_status = {"status": "ok", "backend": LLM_CONFIG["provider"]}
 
     grounding["rag"] = {
         "status": rag_status,
         "hits": (rag_evidence or {}).get("hits", []),
     }
 
-    workflow_name = workflow_payload.get("workflow") or "Conversational Copilot"
-    workflow_result = workflow_payload.get("result")
-    workflow_note = workflow_payload.get("note")
-    clarification = workflow_payload.get("clarification")
-    follow_ups = _suggest_followups(workflow_name, q)
+    effective_week = context.get("week_id")
+    effective_scenario = context.get("scenario_id")
 
     if llm_enabled:
-        system_prompt = (
-            "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
-            "Act like an industry-standard chat assistant similar to ChatGPT/Copilot/Claude: natural, precise, and actionable. "
-            "You are deeply knowledgeable in BY ESP LP optimization, data model, input/output table structure, linkage, and referential integrity. "
-            "Apply domain framing when relevant: Fulfillment Domain, Generation Domain, and Data Hygiene Domain. "
-            "Use bounded context language explicitly when matched: Context A (Demand Fulfillment), Context B (Supply Generation), Context C (Data Hygiene). "
-            "When applicable, align answer framing to the planner user story and expected key inputs/outputs for that context. "
-            "Map findings to the requested domain and keep business + data evidence connected. "
-            "Ground all dataset-specific claims on provided evidence. Do not fabricate numbers or table contents. "
-            "When evidence is partial, separate confirmed findings from hypotheses. "
-            "If identifiers are missing (week, scenario, item, plant), ask concise clarifying questions."
-        )
-
-        # Build a focused, grounded prompt.
-        # Priority: question → workflow result (actual data) → context → supporting evidence.
-        # Keep domain grounding brief when a workflow result is already available so
-        # smaller models (e.g. gemma3) can focus on the real data rather than large JSON blobs.
-        prompt_sections: List[str] = []
-
-        prompt_sections.append(f"## User Question\n{q}")
-        prompt_sections.append(f"## Workflow Identified\n{workflow_name}")
-        prompt_sections.append(f"## Resolved Planning Context\nWeek: {context.get('week_id')} | Scenario: {context.get('scenario_id')}")
-
-        # Workflow grounded result — include prominently BEFORE generic context
-        if workflow_result is not None:
-            prompt_sections.append(
-                f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(workflow_result, ensure_ascii=True)}"
-            )
-
-        # RAG evidence — include top hits only, trimmed
-        if rag_evidence is not None:
-            hits = (rag_evidence or {}).get("hits", [])[:4]
-            if hits:
-                prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(hits, ensure_ascii=True)}")
-
-        # Domain grounding — include only when no workflow result exists (avoid bloating prompt)
-        if workflow_result is None:
-            # Trim grounding: keep only matched_tables and key_linkages (skip heavy solver_knowledge)
-            trimmed_grounding = {
-                "context_resolution": grounding.get("context_resolution"),
-                "matched_tables": grounding.get("matched_tables", [])[:5],
-                "key_linkages": grounding.get("key_linkages", [])[:5],
-            }
-            prompt_sections.append(f"## Domain Grounding\n{json.dumps(trimmed_grounding, ensure_ascii=True)}")
-
-        if clarification:
-            prompt_sections.append(f"## Clarification Payload\n{json.dumps(clarification, ensure_ascii=True)}")
-        if workflow_note:
-            prompt_sections.append(f"## Workflow Note\n{workflow_note}")
-
-        prompt_sections.append(
-            "## Instructions\n"
-            "Respond with a planner-friendly answer containing: "
-            "1) Direct answer with specific numbers/status from the Grounded Planning Data (if available), "
-            "2) Bounded context and user story alignment (if applicable), "
-            "3) Key evidence (tables/columns/values/linkages), "
-            "4) Confidence and gaps, "
-            "5) Next best question. "
-            "If Grounded Planning Data exists, use it first and cite the actual values. "
-            "Do NOT say 'I cannot access the data' — the data is provided above."
-        )
-        if workflow_name.lower() == "item demand supply":
-            prompt_sections.append(
-                "For Item Demand Supply workflow, explicitly report these stats from the Grounded Planning Data: "
-                "demand_qty_total, scheduled_qty_total, unmet_qty, and meet_status."
-            )
-
         conversational_reply = _ollama_chat_with_model(
-            "\n\n".join(prompt_sections),
+            grounded_prompt,
             system_prompt,
             llm_model,
             history=history_window,
         )
         if conversational_reply:
             judge_review = _judge_llm_output(
-                q,
-                conversational_reply,
-                workflow_name,
-                context,
+                q, conversational_reply, workflow_name, context,
                 workflow_result if isinstance(workflow_result, dict) else None,
                 llm_model,
             )
