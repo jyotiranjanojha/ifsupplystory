@@ -1,14 +1,17 @@
 from pathlib import Path
 import base64
 import json
+import os
+import time
 from datetime import datetime
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .analyzer import build_grounded_chat_prompt, dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_root_cause_explained, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check, stream_llm
+from .analyzer import ALLOWED_SEMANTIC_MODES, SEMANTIC_MODE, build_grounded_chat_prompt, dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_root_cause_explained, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check, stream_llm
 from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
 from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
@@ -24,6 +27,25 @@ _llm_semaphore = _threading.Semaphore(1)
 _llm_queue_count = 0
 _llm_queue_lock = _threading.Lock()
 
+# Optional security controls (P0 hardening)
+API_AUTH_ENABLED = os.getenv("API_AUTH_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "").strip()
+
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+RATE_LIMIT_WINDOW_SECS = int(os.getenv("RATE_LIMIT_WINDOW_SECS", "60"))
+RATE_LIMIT_PER_WINDOW = int(os.getenv("RATE_LIMIT_PER_WINDOW", "120"))
+RATE_LIMIT_STRICT_PATHS = {
+    "/api/chat",
+    "/api/chat/stream",
+    "/api/sql-query",
+    "/api/rag/reindex",
+    "/api/rag/openvino/reindex",
+}
+RATE_LIMIT_STRICT_PER_WINDOW = int(os.getenv("RATE_LIMIT_STRICT_PER_WINDOW", "30"))
+
+_rate_lock = _threading.Lock()
+_rate_buckets = defaultdict(lambda: deque())
+
 app = FastAPI(
     title="Intel Foundry Planning AI Assistant",
     version="1.0.0",
@@ -32,6 +54,64 @@ app = FastAPI(
 
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+def _is_open_endpoint(path: str) -> bool:
+    return path in {
+        "/",
+        "/favicon.ico",
+        "/api/health",
+        "/api/auth/me",
+    } or path.startswith("/static/")
+
+
+def _client_key(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _rate_limit_check(client: str, path: str) -> tuple[bool, int]:
+    now = time.time()
+    limit = RATE_LIMIT_STRICT_PER_WINDOW if path in RATE_LIMIT_STRICT_PATHS else RATE_LIMIT_PER_WINDOW
+    key = f"{client}:{path if path in RATE_LIMIT_STRICT_PATHS else 'default'}"
+
+    with _rate_lock:
+        q = _rate_buckets[key]
+        while q and (now - q[0]) > RATE_LIMIT_WINDOW_SECS:
+            q.popleft()
+        if len(q) >= limit:
+            retry_after = int(max(1, RATE_LIMIT_WINDOW_SECS - (now - q[0])))
+            return False, retry_after
+        q.append(now)
+    return True, 0
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    path = request.url.path
+
+    if API_AUTH_ENABLED and path.startswith("/api/") and not _is_open_endpoint(path):
+        if not API_AUTH_TOKEN:
+            return JSONResponse(status_code=500, content={"error": "API auth is enabled but API_AUTH_TOKEN is not configured."})
+        provided = (request.headers.get("x-api-key") or "").strip()
+        if provided != API_AUTH_TOKEN:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    if RATE_LIMIT_ENABLED and path.startswith("/api/") and not _is_open_endpoint(path):
+        client = _client_key(request)
+        ok, retry_after = _rate_limit_check(client, path)
+        if not ok:
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={"error": "Rate limit exceeded", "retry_after_seconds": retry_after},
+            )
+
+    return await call_next(request)
 
 
 def _extract_auth_profile(request: Request) -> dict:
@@ -94,6 +174,16 @@ async def home(request: Request):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "ifsp-webapp", "base_dir": str(BASE_DIR)}
+
+
+@app.get("/api/config")
+def runtime_config():
+    return {
+        "semantic_mode": SEMANTIC_MODE,
+        "allowed_semantic_modes": sorted(ALLOWED_SEMANTIC_MODES),
+        "semantic_mode_validation": "ok",
+        "guidance": "Set SEMANTIC_MODE to exactly one allowed value in .env and restart the service after changes.",
+    }
 
 
 @app.get("/api/auth/me")
@@ -344,13 +434,31 @@ def chat_stream(req: ChatRequest):
     )
     tok_queue: _queue.Queue = _queue.Queue()
 
+    def _fallback_from_meta(meta: dict) -> str:
+        clarification = meta.get("clarification")
+        if clarification:
+            q = clarification.get("question") or "Please provide missing details so I can continue."
+            ex = clarification.get("examples") or []
+            if ex:
+                return f"{q} Example: {ex[0]}"
+            return q
+
+        workflow_result = meta.get("workflow_result")
+        workflow = meta.get("workflow") or "analysis"
+        if isinstance(workflow_result, dict) and workflow_result:
+            # Prefer short deterministic payload over empty stream.
+            small = {k: workflow_result[k] for k in list(workflow_result.keys())[:3]}
+            return f"Using grounded {workflow} evidence: {json.dumps(small, ensure_ascii=True)}"
+
+        return "I do not have enough data to answer."
+
     def _producer():
         import time as _time
         global _llm_queue_count
         try:
             tok_queue.put(("status", "Analysing your question and querying planning data…"))
             _t0 = _time.perf_counter()
-            sp, grounded_prompt, _ = build_grounded_chat_prompt(
+            sp, grounded_prompt, meta = build_grounded_chat_prompt(
                 BASE_DIR,
                 req.question,
                 req.week_id,
@@ -376,6 +484,10 @@ def chat_stream(req: ChatRequest):
                         print(f"[IFSP] ttft={int((_time.perf_counter()-_t1)*1000)}ms", flush=True)
                         first_token = False
                     tok_queue.put(("token", chunk))
+                if first_token:
+                    # No token was emitted (timeout/provider issue). Return deterministic grounded fallback.
+                    tok_queue.put(("status", "LLM response timed out; returning grounded fallback."))
+                    tok_queue.put(("token", _fallback_from_meta(meta)))
                 print(f"[IFSP] llm_total={int((_time.perf_counter()-_t1)*1000)}ms", flush=True)
             finally:
                 _llm_semaphore.release()

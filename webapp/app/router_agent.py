@@ -297,6 +297,188 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# BY ESP taxonomy overlay: keep these explicit so planner-facing intent labels are
+# available while remaining backward-compatible with existing workflows.
+INTENT_CATALOG.update({
+    "DemandStatusLookup": {
+        "description": "Independent demand status, lateness, partial and unmet checks.",
+        "terms": [
+            "demand status", "unmet demand", "late demand", "partial fulfillment",
+            "dmd status", "customer demand status", "ship status",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 11,
+        "workflow": "ItemDemandSupply",
+        "domain": "Fulfillment",
+    },
+    "DemandSupplyPeggingExplain": {
+        "description": "Demand-to-supply pegging and linkage explainability.",
+        "terms": [
+            "pegging", "demand supply link", "inddmd link", "order link",
+            "which supply covers", "what supply serves demand",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 11,
+        "workflow": "RootCause",
+        "domain": "Fulfillment",
+    },
+    "CapacityConstraintExplain": {
+        "description": "Resource overload/underload and capacity exception diagnosis.",
+        "terms": [
+            "capacity constraint", "resource constraint", "res exception", "utilization",
+            "overutilized", "underloaded", "res load", "resprojstatic",
+        ],
+        "required_slots": [],
+        "optional_slots": ["site", "week_id", "scenario_id"],
+        "priority": 11,
+        "workflow": "DomainFocus",
+        "domain": "Generation",
+    },
+    "MaterialConstraintExplain": {
+        "description": "BOM/component constraint and dependent demand propagation diagnosis.",
+        "terms": [
+            "material constraint", "component shortage", "dependent demand", "depdmd",
+            "bom shortage", "subordinate shortage",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 11,
+        "workflow": "RootCause",
+        "domain": "Fulfillment",
+    },
+    "PlanOrderDecisionExplain": {
+        "description": "Why planned production orders were/weren't generated.",
+        "terms": [
+            "planorder", "planned order", "production decision", "why plan generated",
+            "why no planned order", "plan order decision",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 10,
+        "workflow": "DomainFocus",
+        "domain": "Generation",
+    },
+    "PlanPurchDecisionExplain": {
+        "description": "Why planned purchase orders were/weren't generated.",
+        "terms": [
+            "planpurch", "planned purchase", "purchase decision", "purch method",
+            "why no purchase plan", "why purchase generated",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 10,
+        "workflow": "SqlQuery",
+        "domain": "Generation",
+    },
+    "TransferDecisionExplain": {
+        "description": "Why transfer/arrival plans were/weren't generated.",
+        "terms": [
+            "planarriv", "transfer decision", "arrival plan", "source dest",
+            "why no transfer", "sourcing route",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 10,
+        "workflow": "SqlQuery",
+        "domain": "Generation",
+    },
+    "InventoryProjectionExplain": {
+        "description": "Projected inventory, stockout and coverage explainability.",
+        "terms": [
+            "projected inventory", "inventory projection", "stockout", "skuprojstatic",
+            "skustatstatic", "coverage duration", "constrained stock",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 10,
+        "workflow": "ItemDemandSupply",
+        "domain": "Fulfillment",
+    },
+    "AllocationPriorityExplain": {
+        "description": "Allocation and priority-driven fulfillment behavior.",
+        "terms": [
+            "allocation", "priority", "customer tier", "demand group", "allocation horizon",
+            "priority inversion",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 9,
+        "workflow": "Insights",
+        "domain": "Fulfillment",
+    },
+    "ForecastConsumptionExplain": {
+        "description": "Forecast consumption and forecast-order fulfillment behavior.",
+        "terms": [
+            "forecast consumption", "fcstorder", "consumed forecast", "demand group forecast",
+            "forecast fulfilled", "forecast unmet",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site", "week_id", "scenario_id"],
+        "priority": 9,
+        "workflow": "Insights",
+        "domain": "Fulfillment",
+    },
+    "ScenarioSolveComparison": {
+        "description": "Simulation/solve comparison using output deltas.",
+        "terms": [
+            "solve version", "simulation compare", "scenario solve compare", "compare simulations",
+            "across solve", "scenario delta",
+        ],
+        "required_slots": [],
+        "optional_slots": ["week_id", "scenario_id", "site"],
+        "priority": 9,
+        "workflow": "ScenarioCompare",
+        "domain": None,
+    },
+    "InputDataValidation": {
+        "description": "Input and parameter quality and referential integrity validation.",
+        "terms": [
+            "input data validation", "ri check", "referential integrity", "master data validation",
+            "parameter validation", "data readiness",
+        ],
+        "required_slots": [],
+        "optional_slots": ["site", "week_id", "scenario_id"],
+        "priority": 9,
+        "workflow": "Validation",
+        "domain": "DataHygiene",
+    },
+    "MasterDataLookup": {
+        "description": "Lookup of master data definitions and entities.",
+        "terms": [
+            "item master", "location master", "customer master", "resource master",
+            "master lookup", "describe master",
+        ],
+        "required_slots": [],
+        "optional_slots": ["site"],
+        "priority": 8,
+        "workflow": "DatasetSummary",
+        "domain": None,
+    },
+    "ParameterLookup": {
+        "description": "Lookup of planning parameters and methods.",
+        "terms": [
+            "lead time", "lot size", "min ss", "max coverage", "production method",
+            "purch method", "sourcing factor", "parameter lookup",
+        ],
+        "required_slots": [],
+        "optional_slots": ["item", "site"],
+        "priority": 8,
+        "workflow": "DatasetSummary",
+        "domain": None,
+    },
+    "Other": {
+        "description": "Question outside supported BY ESP intents.",
+        "terms": [],
+        "required_slots": [],
+        "optional_slots": [],
+        "priority": 1,
+        "workflow": "ConversationalCopilot",
+        "domain": None,
+    },
+})
+
 # Slot clarification templates
 SLOT_CLARIFICATION: Dict[str, Dict[str, Any]] = {
     "item": {

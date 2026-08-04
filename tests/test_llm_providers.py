@@ -4,8 +4,8 @@ Test script for multi-provider LLM configuration.
 Demonstrates how the application switches between different LLM providers.
 
 Usage:
-    python test_llm_providers.py          # Test current provider
-    LLM_PROVIDER=openai python test_llm_providers.py  # Test OpenAI (without actual API key)
+    python tests/test_llm_providers.py          # Test current provider
+    LLM_PROVIDER=openai python tests/test_llm_providers.py  # Test OpenAI (without actual API key)
 """
 
 import os
@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Import the analyzer module to test LLM config
 import sys
-sys.path.insert(0, str(Path(__file__).parent / "webapp"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "webapp"))
 
 def test_llm_configuration():
     """Test the LLM configuration system."""

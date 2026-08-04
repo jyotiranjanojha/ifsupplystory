@@ -96,7 +96,7 @@ CUSTOM_LLM_MODEL=model-name
 | [webapp/app/analyzer.py](webapp/app/analyzer.py) | Configuration factory + all LLM functions | ✅ Complete |
 | [.env.example](.env.example) | New - comprehensive configuration reference | ✅ Created |
 | [LLM_PROVIDER_GUIDE.md](LLM_PROVIDER_GUIDE.md) | New - complete deployment guide | ✅ Created |
-| [test_llm_providers.py](test_llm_providers.py) | New - configuration testing script | ✅ Created |
+| [test_llm_providers.py](../tests/test_llm_providers.py) | New - configuration testing script | ✅ Created |
 
 ---
 
@@ -203,7 +203,7 @@ CUSTOM_LLM_MODEL=model-name
 ### Documentation
 - ✅ [.env.example](.env.example) - Configuration reference
 - ✅ [LLM_PROVIDER_GUIDE.md](LLM_PROVIDER_GUIDE.md) - Full deployment guide
-- ✅ [test_llm_providers.py](test_llm_providers.py) - Testing script
+- ✅ [test_llm_providers.py](../tests/test_llm_providers.py) - Testing script
 
 ---
 
@@ -292,7 +292,7 @@ curl http://127.0.0.1:8010/api/llm/models
 
 Check configuration:
 ```bash
-python test_llm_providers.py
+python tests/test_llm_providers.py
 ```
 
 Test health:

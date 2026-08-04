@@ -10,4 +10,4 @@ env/
 .rag/
 embedding_model/
 _test_output.txt
-test_nollama.py
+tests/test_nollama.py

@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import math
 import os
 import re
@@ -9,13 +10,16 @@ from datetime import datetime
 from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 from urllib import error, request
 import http.client
 import threading
 import urllib.parse
+import uuid
 
 from .rag import ensure_rag_index, query_rag
+from .intent_classifier import OpenVINOQwenIntentClassifier
+from .grounding_engine import build_grounded_answer
 
 
 INPUT_FOLDER = "by_input"
@@ -76,6 +80,9 @@ JUDGE_LLM_ENABLED = os.getenv("JUDGE_LLM_ENABLED", "true")
 
 # Global OpenVINO pipeline (cached)
 _OPENVINO_PIPELINE = None
+_OPENVINO_INTENT_CLASSIFIER = None
+OPENVINO_INTENT_CLASSIFIER_ENABLED = os.getenv("OPENVINO_INTENT_CLASSIFIER_ENABLED", "true").lower() == "true"
+OPENVINO_INTENT_OVERRIDE_THRESHOLD = float(os.getenv("OPENVINO_INTENT_OVERRIDE_THRESHOLD", "0.80"))
 
 def _get_openvino_pipeline():
     """Lazy-load OpenVINO pipeline with performance hints."""
@@ -207,6 +214,10 @@ OLLAMA_MODEL = LLM_CONFIG["model"]
 OLLAMA_JUDGE_MODEL = LLM_CONFIG["judge_model"]
 OLLAMA_JUDGE_ENABLED = JUDGE_LLM_ENABLED
 OLLAMA_VISION_MODEL = LLM_CONFIG["vision_model"]
+
+# Streaming safeguards
+STREAM_LLM_HTTP_TIMEOUT_SECS = max(15, int(os.getenv("STREAM_LLM_HTTP_TIMEOUT_SECS", "60")))
+STREAM_LLM_TTFT_TIMEOUT_SECS = max(10, int(os.getenv("STREAM_LLM_TTFT_TIMEOUT_SECS", "35")))
 
 # Aliases for internal use
 NOLLAMA_BASE_URL = LLM_CONFIG["base_url"] if LLM_CONFIG["provider"] == "nollama" else NOLLAMA_BASE_URL
@@ -1832,7 +1843,12 @@ def stream_llm(
 
     # ── OpenVINO path: in-process streaming via TextStreamer callback ──────────
     if provider == "openvino":
-        yield from _stream_openvino(prompt, system_prompt, selected_model)
+        yield from _stream_openvino(
+            prompt,
+            system_prompt,
+            selected_model,
+            first_token_timeout_secs=STREAM_LLM_TTFT_TIMEOUT_SECS,
+        )
         return
 
     # ── HTTP path: SSE streaming (stream=true) ────────────────────────────────
@@ -1868,9 +1884,14 @@ def stream_llm(
 
     req = request.Request(endpoint, data=data, headers=headers, method="POST")
     try:
-        with request.urlopen(req, timeout=300) as resp:
+        import time as _time
+        first_visible_token_sent = False
+        started = _time.perf_counter()
+        with request.urlopen(req, timeout=STREAM_LLM_HTTP_TIMEOUT_SECS) as resp:
             in_think = False
             for raw_line in resp:
+                if (not first_visible_token_sent) and ((_time.perf_counter() - started) > STREAM_LLM_TTFT_TIMEOUT_SECS):
+                    break
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or line == "data: [DONE]":
                     continue
@@ -1892,12 +1913,18 @@ def stream_llm(
                     in_think = True
                     continue
                 if text:
+                    first_visible_token_sent = True
                     yield text
     except (error.URLError, TimeoutError, OSError):
         return
 
 
-def _stream_openvino(prompt: str, system_prompt: str, selected_model: str) -> Generator[str, None, None]:
+def _stream_openvino(
+    prompt: str,
+    system_prompt: str,
+    selected_model: str,
+    first_token_timeout_secs: int = 35,
+) -> Generator[str, None, None]:
     """Stream tokens from openvino_genai using TextStreamer (zero HTTP overhead)."""
     import openvino_genai as ov_genai
     from queue import Queue, Empty
@@ -1921,6 +1948,7 @@ def _stream_openvino(prompt: str, system_prompt: str, selected_model: str) -> Ge
     )
 
     import threading
+    import time as _time
     streamer = _QueueStreamer()
     t = threading.Thread(
         target=pipeline.generate,
@@ -1932,11 +1960,15 @@ def _stream_openvino(prompt: str, system_prompt: str, selected_model: str) -> Ge
 
     in_think = False
     buffer = ""
+    started = _time.perf_counter()
+    first_visible_token_sent = False
     while True:
-        try:
-            token = q.get(timeout=30)
-        except Empty:
+        if (not first_visible_token_sent) and ((_time.perf_counter() - started) > first_token_timeout_secs):
             break
+        try:
+            token = q.get(timeout=5)
+        except Empty:
+            continue
         if token is None:
             break
         buffer += token
@@ -1948,6 +1980,7 @@ def _stream_openvino(prompt: str, system_prompt: str, selected_model: str) -> Ge
             in_think = True
             continue
         if buffer:
+            first_visible_token_sent = True
             yield buffer
             buffer = ""
 
@@ -1985,6 +2018,195 @@ def _parse_json_object_from_text(text: str) -> Optional[Dict]:
     return None
 
 
+def _as_string(value: Any, default: str = "UNKNOWN") -> str:
+    text = "" if value is None else str(value).strip()
+    return text if text else default
+
+
+def _as_list_of_strings(value: Any, default_unknown: bool = True) -> List[str]:
+    if isinstance(value, list):
+        out = [str(v).strip() for v in value if str(v).strip()]
+        if out:
+            return out
+    return ["UNKNOWN"] if default_unknown else []
+
+
+def _as_dict(value: Any) -> Dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_semantic_retrieval_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    required_columns_raw = obj.get("required_columns")
+    if isinstance(required_columns_raw, dict):
+        required_columns = {
+            str(k).strip(): _as_list_of_strings(v)
+            for k, v in required_columns_raw.items()
+            if str(k).strip()
+        }
+        if not required_columns:
+            required_columns = {"UNKNOWN": ["UNKNOWN"]}
+    elif isinstance(required_columns_raw, list):
+        required_columns = {"UNKNOWN": _as_list_of_strings(required_columns_raw)}
+    else:
+        required_columns = {"UNKNOWN": ["UNKNOWN"]}
+
+    entities = obj.get("entities") if isinstance(obj.get("entities"), dict) else {"UNKNOWN": {}}
+
+    return {
+        "intent": _as_string(obj.get("intent")),
+        "business_domain": _as_string(obj.get("business_domain")),
+        "business_concepts": _as_list_of_strings(obj.get("business_concepts")),
+        "entities": entities,
+        "required_files": _as_list_of_strings(obj.get("required_files")),
+        "required_columns": required_columns,
+        "required_kpis": _as_list_of_strings(obj.get("required_kpis")),
+        "required_relationships": _as_list_of_strings(obj.get("required_relationships")),
+        "required_solver_outputs": _as_list_of_strings(obj.get("required_solver_outputs")),
+        "confidence": _as_string(obj.get("confidence")),
+        "retrieval_plan": _as_string(obj.get("retrieval_plan")),
+    }
+
+
+def _normalize_semantic_router_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    return {
+        "intent": _as_string(obj.get("intent")),
+        "objective": _as_string(obj.get("objective")),
+        "input_files": _as_list_of_strings(obj.get("input_files")),
+        "output_files": _as_list_of_strings(obj.get("output_files")),
+        "columns": _as_list_of_strings(obj.get("columns")),
+        "kpis": _as_list_of_strings(obj.get("kpis")),
+        "business_rules": _as_list_of_strings(obj.get("business_rules")),
+        "reasoning": _as_string(obj.get("reasoning")),
+    }
+
+
+def _normalize_semantic_file_discovery_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    return {
+        "primary_files": _as_list_of_strings(obj.get("primary_files")),
+        "secondary_files": _as_list_of_strings(obj.get("secondary_files")),
+        "supporting_files": _as_list_of_strings(obj.get("supporting_files")),
+        "confidence": _as_string(obj.get("confidence")),
+    }
+
+
+def _normalize_semantic_kpi_selector_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    return {
+        "required_kpis": _as_list_of_strings(obj.get("required_kpis")),
+        "why_needed": _as_list_of_strings(obj.get("why_needed")),
+    }
+
+
+def _normalize_solver_explainability_planner_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    return {
+        "analysis_type": _as_string(obj.get("analysis_type")),
+        "required_input_files": _as_list_of_strings(obj.get("required_input_files")),
+        "required_output_files": _as_list_of_strings(obj.get("required_output_files")),
+        "required_constraint_files": _as_list_of_strings(obj.get("required_constraint_files")),
+        "required_kpis": _as_list_of_strings(obj.get("required_kpis")),
+        "required_business_rules": _as_list_of_strings(obj.get("required_business_rules")),
+    }
+
+
+def _normalize_recommendation_retrieval_planner_output(parsed: Optional[Dict]) -> Dict:
+    obj = _as_dict(parsed)
+    return {
+        "required_data": _as_list_of_strings(obj.get("required_data")),
+        "required_solver_outputs": _as_list_of_strings(obj.get("required_solver_outputs")),
+        "required_kpis": _as_list_of_strings(obj.get("required_kpis")),
+        "required_rules": _as_list_of_strings(obj.get("required_rules")),
+        "recommended_workflow": _as_list_of_strings(obj.get("recommended_workflow")),
+    }
+
+
+def _relationship_strings_from_plan(retrieval_plan: Dict) -> List[str]:
+    rels = retrieval_plan.get("relationships") if isinstance(retrieval_plan.get("relationships"), list) else []
+    out: List[str] = []
+    for rel in rels:
+        if isinstance(rel, dict):
+            frm = str(rel.get("from") or "").strip()
+            to = str(rel.get("to") or "").strip()
+            keys = rel.get("keys") or rel.get("on") or rel.get("join")
+            if isinstance(keys, list):
+                key_txt = ",".join([str(k).strip() for k in keys if str(k).strip()])
+            else:
+                key_txt = str(keys or "").strip()
+            if frm and to and key_txt:
+                out.append(f"{frm}->{to} on {key_txt}")
+            elif frm and to:
+                out.append(f"{frm}->{to}")
+    return out or ["UNKNOWN"]
+
+
+def _flatten_columns_from_plan(retrieval_plan: Dict) -> List[str]:
+    col_map = retrieval_plan.get("columns") if isinstance(retrieval_plan.get("columns"), dict) else {}
+    flattened: List[str] = []
+    seen = set()
+    for cols in col_map.values():
+        if not isinstance(cols, list):
+            continue
+        for c in cols:
+            cc = str(c).strip()
+            if cc and cc.lower() not in seen:
+                flattened.append(cc)
+                seen.add(cc.lower())
+    return flattened[:60] if flattened else ["UNKNOWN"]
+
+
+def _apply_retrieval_plan_to_semantic_output(mode: str, normalized: Dict, retrieval_plan: Optional[Dict]) -> Dict:
+    if not isinstance(retrieval_plan, dict):
+        return normalized
+
+    output = dict(normalized)
+    input_files = _as_list_of_strings(retrieval_plan.get("required_input_files"))
+    output_files = _as_list_of_strings(retrieval_plan.get("required_output_files"))
+    all_files = _as_list_of_strings(retrieval_plan.get("files"))
+    kpis = _as_list_of_strings(retrieval_plan.get("kpis"))
+    rules = _as_list_of_strings(retrieval_plan.get("business_rules"))
+    solver_outputs = _as_list_of_strings(retrieval_plan.get("solver_outputs"))
+    rel_strings = _relationship_strings_from_plan(retrieval_plan)
+    columns_map = retrieval_plan.get("columns") if isinstance(retrieval_plan.get("columns"), dict) else {"UNKNOWN": ["UNKNOWN"]}
+
+    if mode == "retrieval":
+        output["required_files"] = all_files
+        output["required_columns"] = columns_map
+        output["required_kpis"] = kpis
+        output["required_relationships"] = rel_strings
+        output["required_solver_outputs"] = solver_outputs
+    elif mode == "router":
+        output["input_files"] = input_files
+        output["output_files"] = output_files
+        output["columns"] = _flatten_columns_from_plan(retrieval_plan)
+        output["kpis"] = kpis
+        output["business_rules"] = rules
+    elif mode == "file_discovery":
+        output["primary_files"] = output_files
+        output["secondary_files"] = input_files
+        output["supporting_files"] = all_files
+    elif mode == "kpi_selector":
+        output["required_kpis"] = kpis
+        output["why_needed"] = rules[: max(1, min(8, len(rules)))]
+    elif mode == "solver_explainability_planner":
+        output["required_input_files"] = input_files
+        output["required_output_files"] = output_files
+        output["required_constraint_files"] = rel_strings
+        output["required_kpis"] = kpis
+        output["required_business_rules"] = rules
+    elif mode == "recommendation_retrieval_planner":
+        output["required_data"] = all_files
+        output["required_solver_outputs"] = solver_outputs
+        output["required_kpis"] = kpis
+        output["required_rules"] = rules
+        workflow_name = ((retrieval_plan.get("intent") or {}).get("normalized") or "UNKNOWN").strip() or "UNKNOWN"
+        output["recommended_workflow"] = [workflow_name]
+
+    return output
+
+
 def _judge_llm_output(
     question: str,
     answer: str,
@@ -1993,7 +2215,7 @@ def _judge_llm_output(
     grounded_result: Optional[Dict],
     llm_model: Optional[str],
 ) -> Optional[Dict]:
-    if not _env_flag(NOLLAMA_JUDGE_ENABLED, default=True):
+    if not _env_flag(OLLAMA_JUDGE_ENABLED, default=True):
         return None
 
     system_prompt = (
@@ -5654,6 +5876,29 @@ _DOMAIN_CATALOG_MAP = {
 }
 
 
+BY_ESP_INTENT_TO_LEGACY = {
+    "DemandStatusLookup": "item_demand_supply",
+    "DemandSupplyPeggingExplain": "root_cause",
+    "CapacityConstraintExplain": "domain_generation",
+    "MaterialConstraintExplain": "root_cause",
+    "PlanOrderDecisionExplain": "domain_generation",
+    "PlanPurchDecisionExplain": "sql_query",
+    "TransferDecisionExplain": "sql_query",
+    "InventoryProjectionExplain": "item_demand_supply",
+    "AllocationPriorityExplain": "insights",
+    "ForecastConsumptionExplain": "insights",
+    "ScenarioSolveComparison": "compare",
+    "InputDataValidation": "validation",
+    "MasterDataLookup": "summary",
+    "ParameterLookup": "summary",
+    "Other": "conversational",
+}
+
+
+def _normalize_router_intent(intent: str) -> str:
+    return BY_ESP_INTENT_TO_LEGACY.get(intent, intent)
+
+
 def _dispatch_by_intent(
     base_dir: Path,
     meta: Dict,
@@ -5665,15 +5910,19 @@ def _dispatch_by_intent(
     Clean dispatcher driven by RouterAgent IntentMetadata.
     Replaces the old if/elif keyword chain.
     """
-    intent = meta.get("intent", "conversational")
+    raw_intent = meta.get("intent", "conversational")
+    intent = _normalize_router_intent(raw_intent)
     entities = meta.get("entities") or {}
     domain_raw = meta.get("domain")
     resolved_item = entities.get("item")
     router_meta = {
-        "intent": intent,
+        "intent": raw_intent,
+        "normalized_intent": intent,
         "workflow": meta.get("workflow"),
         "domain": domain_raw,
         "confidence": meta.get("confidence"),
+        "openvino_intent": meta.get("openvino_intent"),
+        "openvino_override_applied": bool(meta.get("openvino_override_applied", False)),
         "matched_terms": meta.get("matched_terms"),
         "conflict": meta.get("conflict"),
         "conflicting_intents": meta.get("conflicting_intents"),
@@ -5711,7 +5960,12 @@ def _dispatch_by_intent(
     # ── sql_query (Text-to-SQL Engineer) ─────────────────────────────────
     if intent == "sql_query":
         from .text_to_sql_agent import run_sql_query  # lazy import
-        return run_sql_query(base_dir, meta.get("question", ""), week_id, scenario_id, scope)
+        sql_out = run_sql_query(base_dir, meta.get("question", ""), week_id, scenario_id, scope)
+        return {
+            "workflow": "Text-to-SQL",
+            "result": sql_out,
+            "router_metadata": router_meta,
+        }
 
     # ── bom_drill ────────────────────────────────────────────────────────
     if intent == "bom_drill":
@@ -5879,6 +6133,274 @@ def INTENT_CATALOG_DOMAIN_KEY(intent_name: str) -> str:
     return (INTENT_CATALOG.get(intent_name) or {}).get("domain") or ""
 
 
+def _get_openvino_intent_classifier() -> OpenVINOQwenIntentClassifier:
+    global _OPENVINO_INTENT_CLASSIFIER
+    if _OPENVINO_INTENT_CLASSIFIER is None:
+        _OPENVINO_INTENT_CLASSIFIER = OpenVINOQwenIntentClassifier()
+    return _OPENVINO_INTENT_CLASSIFIER
+
+
+def _map_openvino_label_to_router_intent(label: str) -> str:
+    mapping = {
+        "InventoryLookup": "InventoryProjectionExplain",
+        "ForecastLookup": "ForecastConsumptionExplain",
+        "PurchaseOrderLookup": "PlanPurchDecisionExplain",
+        "RiskAnalysis": "CapacityConstraintExplain",
+        "KPIAnalysis": "ScenarioSolveComparison",
+        "CustomerOrderLookup": "DemandStatusLookup",
+        "Other": "conversational",
+    }
+    return mapping.get(label, "conversational")
+
+
+def _enrich_router_meta_with_openvino_intent(
+    meta: Dict,
+    question: str,
+    history: Optional[List[Dict[str, str]]],
+) -> Dict:
+    enriched = dict(meta or {})
+    enriched["openvino_override_applied"] = False
+    if not OPENVINO_INTENT_CLASSIFIER_ENABLED:
+        return enriched
+
+    try:
+        cls = _get_openvino_intent_classifier().classify(question)
+    except Exception as exc:
+        enriched["openvino_intent"] = {
+            "classification_result": "Other",
+            "confidence_score": 0.0,
+            "reasoning": f"OpenVINO intent classifier unavailable: {exc}",
+        }
+        return enriched
+
+    openvino_meta = cls.model_dump()
+    enriched["openvino_intent"] = openvino_meta
+
+    mapped_intent = _map_openvino_label_to_router_intent(openvino_meta.get("classification_result", "Other"))
+    score = float(openvino_meta.get("confidence_score") or 0.0)
+    entities = dict(enriched.get("entities") or {})
+
+    # Auto-resolve item where needed so we can safely apply high-confidence overrides.
+    if not entities.get("item"):
+        resolved_item = _resolve_chat_item(question, history).get("selected_item")
+        if resolved_item:
+            entities["item"] = resolved_item
+            enriched["entities"] = entities
+
+    requires_item = mapped_intent in {
+        "item_demand_supply",
+        "root_cause",
+        "bom_drill",
+        "DemandStatusLookup",
+        "DemandSupplyPeggingExplain",
+        "MaterialConstraintExplain",
+        "InventoryProjectionExplain",
+    }
+    has_required_item = bool((enriched.get("entities") or {}).get("item"))
+
+    if score >= OPENVINO_INTENT_OVERRIDE_THRESHOLD and mapped_intent != "conversational":
+        if (not requires_item) or has_required_item:
+            from .router_agent import INTENT_CATALOG
+
+            normalized_intent = _normalize_router_intent(mapped_intent)
+            enriched["intent"] = mapped_intent
+            enriched["workflow"] = (
+                (INTENT_CATALOG.get(mapped_intent) or {}).get("workflow")
+                or (INTENT_CATALOG.get(normalized_intent) or {}).get("workflow")
+                or enriched.get("workflow")
+            )
+            enriched["openvino_override_applied"] = True
+
+    return enriched
+
+
+def _discover_kpis_for_plan(question: str, workflow_name: str, workflow_result: Optional[Dict]) -> List[str]:
+    q = (question or "").lower()
+    discovered: List[str] = []
+
+    keyword_map = {
+        "fill rate": "fill_rate",
+        "otif": "otif",
+        "service level": "service_level",
+        "utilization": "capacity_utilization",
+        "underload": "capacity_underload",
+        "overload": "capacity_overload",
+        "inventory": "inventory_projection",
+        "eoh": "end_of_horizon_inventory",
+        "late": "lateness",
+        "short": "unmet_demand",
+        "unmet": "unmet_demand",
+    }
+    for term, kpi in keyword_map.items():
+        if term in q:
+            discovered.append(kpi)
+
+    if isinstance(workflow_result, dict):
+        kpi_summary = workflow_result.get("kpi_summary") or workflow_result.get("KPI Summary") or {}
+        if isinstance(kpi_summary, dict):
+            discovered.extend([str(k).strip() for k in kpi_summary.keys() if str(k).strip()])
+
+    workflow_l = (workflow_name or "").lower()
+    if "root cause" in workflow_l:
+        discovered.extend(["unmet_demand", "lateness", "capacity_utilization"])
+    elif "scenario" in workflow_l:
+        discovered.extend(["fill_rate", "capacity_utilization", "unmet_demand"])
+
+    unique: List[str] = []
+    seen = set()
+    for k in discovered:
+        kl = k.lower()
+        if kl and kl not in seen:
+            unique.append(k)
+            seen.add(kl)
+    return unique or ["UNKNOWN"]
+
+
+def _extract_business_rules_for_plan(grounding: Optional[Dict]) -> List[str]:
+    rules: List[str] = [
+        "Semantic layer is the source of truth for files, columns, relationships, and solver outputs.",
+        "LLM layer must not select files, columns, or joins.",
+    ]
+
+    solver_knowledge = (grounding or {}).get("solver_knowledge")
+    if isinstance(solver_knowledge, dict):
+        for key in solver_knowledge.keys():
+            k = str(key).strip()
+            if k:
+                rules.append(f"Solver rule context: {k}")
+
+    key_linkages = (grounding or {}).get("key_linkages") or []
+    for rel in key_linkages[:8]:
+        if not isinstance(rel, dict):
+            continue
+        frm = str(rel.get("from") or "").strip()
+        to = str(rel.get("to") or "").strip()
+        if frm and to:
+            rules.append(f"Use governed linkage: {frm} -> {to}")
+
+    unique: List[str] = []
+    seen = set()
+    for rule in rules:
+        rk = rule.lower()
+        if rk not in seen:
+            unique.append(rule)
+            seen.add(rk)
+    return unique[:20]
+
+
+def _build_semantic_retrieval_plan(
+    base_dir: Path,
+    question: str,
+    router_meta: Dict,
+    context: Dict,
+    grounding: Dict,
+    workflow_name: str,
+    workflow_result: Optional[Dict],
+) -> Dict:
+    matched_tables = (grounding or {}).get("matched_tables") or []
+    key_linkages = (grounding or {}).get("key_linkages") or []
+
+    files: List[str] = []
+    input_files: List[str] = []
+    output_files: List[str] = []
+    columns: Dict[str, List[str]] = {}
+
+    for t in matched_tables:
+        if not isinstance(t, dict):
+            continue
+        table = str(t.get("table") or "").strip()
+        if not table:
+            continue
+        files.append(table)
+        family = str(t.get("family") or "").strip().lower()
+        if family == "input":
+            input_files.append(table)
+        elif family == "output":
+            output_files.append(table)
+
+        cols = t.get("columns")
+        if isinstance(cols, list):
+            clean_cols = [str(c).strip() for c in cols if str(c).strip()]
+            columns[table] = clean_cols[:30] if clean_cols else ["UNKNOWN"]
+        else:
+            columns[table] = ["UNKNOWN"]
+
+    relationships: List[Dict[str, Any]] = []
+    for rel in key_linkages:
+        if isinstance(rel, dict):
+            relationships.append(rel)
+
+    entities = router_meta.get("entities") if isinstance(router_meta.get("entities"), dict) else {}
+    intent_raw = str(router_meta.get("intent") or "conversational").strip()
+    normalized_intent = _normalize_router_intent(intent_raw)
+
+    kpis = _discover_kpis_for_plan(question, workflow_name, workflow_result)
+    business_rules = _extract_business_rules_for_plan(grounding)
+
+    solver_outputs = output_files[:] if output_files else ["UNKNOWN"]
+    files = files or ["UNKNOWN"]
+    input_files = input_files or ["UNKNOWN"]
+    output_files = output_files or ["UNKNOWN"]
+    if not columns:
+        columns = {"UNKNOWN": ["UNKNOWN"]}
+
+    plan_id = str(uuid.uuid4())
+    plan = {
+        "plan_id": plan_id,
+        "created_at_utc": datetime.utcnow().isoformat() + "Z",
+        "question": question,
+        "context": {
+            "week_id": context.get("week_id"),
+            "scenario_id": context.get("scenario_id"),
+        },
+        "intent": {
+            "raw": intent_raw,
+            "normalized": normalized_intent,
+        },
+        "entities": entities,
+        "files": files,
+        "required_input_files": input_files,
+        "required_output_files": output_files,
+        "columns": columns,
+        "kpis": kpis,
+        "relationships": relationships,
+        "solver_outputs": solver_outputs,
+        "business_rules": business_rules,
+        "stages": {
+            "intent_classification": {"intent": intent_raw, "normalized_intent": normalized_intent},
+            "entity_extraction": entities,
+            "semantic_retrieval": {
+                "matched_tables": [t.get("table") for t in matched_tables if isinstance(t, dict)],
+                "relationship_count": len(relationships),
+            },
+            "file_discovery": {"input": input_files, "output": output_files},
+            "kpi_discovery": kpis,
+            "relationship_discovery": relationships,
+            "retrieval_plan_generation": "complete",
+            "data_retrieval": "pending",
+            "kpi_calculation": "pending",
+            "llm_explanation": "pending",
+        },
+        "audit": {
+            "source": "semantic_layer",
+            "base_dir": str(base_dir),
+        },
+    }
+    return plan
+
+
+def _persist_retrieval_plan_for_audit(base_dir: Path, retrieval_plan: Dict) -> Optional[str]:
+    try:
+        audit_dir = base_dir / ".rag" / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_file = audit_dir / "retrieval_plans.jsonl"
+        with audit_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(retrieval_plan, ensure_ascii=True) + "\n")
+        return str(audit_file)
+    except OSError:
+        return None
+
+
 def _run_chat_workflow_if_needed(
     base_dir: Path,
     question: str,
@@ -5886,16 +6408,40 @@ def _run_chat_workflow_if_needed(
     scenario_id: Optional[str],
     scope: Dict,
     history: Optional[List[Dict[str, str]]] = None,
+    router_meta: Optional[Dict] = None,
+    retrieval_plan: Optional[Dict] = None,
 ) -> Dict:
-    from .router_agent import route_question
-    meta = route_question(question, history, week_id, scenario_id, scope)
+    if router_meta is None:
+        from .router_agent import route_question
+        meta = route_question(question, history, week_id, scenario_id, scope)
+        meta = _enrich_router_meta_with_openvino_intent(meta, question, history)
+    else:
+        meta = dict(router_meta)
+
+    if isinstance(retrieval_plan, dict):
+        plan_entities = retrieval_plan.get("entities") if isinstance(retrieval_plan.get("entities"), dict) else {}
+        if plan_entities:
+            existing = dict(meta.get("entities") or {})
+            for k, v in plan_entities.items():
+                if existing.get(k) in {None, ""} and v not in {None, ""}:
+                    existing[k] = v
+            meta["entities"] = existing
+        normalized_intent = ((retrieval_plan.get("intent") or {}).get("normalized") or "").strip()
+        if normalized_intent:
+            meta["intent"] = normalized_intent
+
     meta["question"] = question  # make question available to dispatcher
+    if isinstance(retrieval_plan, dict):
+        meta["semantic_retrieval_plan_id"] = retrieval_plan.get("plan_id")
     result = _dispatch_by_intent(base_dir, meta, week_id, scenario_id, scope)
+
+    if isinstance(retrieval_plan, dict):
+        result["retrieval_plan"] = retrieval_plan
 
     # Safety-net: if the router produced no workflow result but the question clearly
     # asks about demand fulfillment for a specific item, run the item_demand_supply
     # workflow directly rather than returning an empty conversational response.
-    if result.get("workflow") in {None, "Conversational Copilot"} and not result.get("result"):
+    if retrieval_plan is None and result.get("workflow") in {None, "Conversational Copilot"} and not result.get("result"):
         ql = (question or "").lower()
         demand_terms = [
             "demand", "met", "unmet", "fulfill", "fulfil", "supply",
@@ -5913,7 +6459,7 @@ def _run_chat_workflow_if_needed(
             }
 
     # Safety-net for root cause clarification — if item is known, run root cause directly
-    if "Clarification" in (result.get("workflow") or "") and not result.get("result"):
+    if retrieval_plan is None and "Clarification" in (result.get("workflow") or "") and not result.get("result"):
         ql = (question or "").lower()
         rc_terms = ["why", "drop", "late", "short", "early", "low", "change", "utiliz", "underload"]
         item = (meta.get("entities") or {}).get("item") or _resolve_chat_item(question, history).get("selected_item")
@@ -5973,6 +6519,276 @@ def _trim_workflow_result_for_prompt(result: Dict) -> Dict:
     return trimmed
 
 
+def _build_semantic_retrieval_prompt(user_query: str, semantic_model: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only retrieval prompt from grounded semantic context."""
+    system_prompt = (
+        "You are a Semantic Retrieval Engine for a BY ESP Supply Planning Copilot.\n\n"
+        "Your job is NOT to answer the user's question.\n\n"
+        "Your job is ONLY to identify:\n\n"
+        "1. Business concepts\n"
+        "2. Intent\n"
+        "3. Relevant entities\n"
+        "4. Required files\n"
+        "5. Required columns\n"
+        "6. Required KPIs\n"
+        "7. Required joins\n"
+        "8. Evidence sources\n\n"
+        "Use ONLY the semantic model provided.\n\n"
+        "Do not invent files.\n"
+        "Do not invent columns.\n"
+        "Do not invent KPIs.\n\n"
+        "If information is unavailable in the semantic model,\n"
+        "return UNKNOWN."
+    )
+
+    prompt = (
+        "-----------------------------------------\n\n"
+        "User Query:\n\n"
+        f"{user_query}\n\n"
+        "-----------------------------------------\n\n"
+        "Semantic Model:\n\n"
+        f"{json.dumps(semantic_model, ensure_ascii=True)}\n\n"
+        "-----------------------------------------\n\n"
+        "Return JSON only:\n\n"
+        "{\n"
+        "  \"intent\": \"\",\n"
+        "  \"business_domain\": \"\",\n"
+        "  \"business_concepts\": [],\n"
+        "  \"entities\": {},\n"
+        "  \"required_files\": [],\n"
+        "  \"required_columns\": {},\n"
+        "  \"required_kpis\": [],\n"
+        "  \"required_relationships\": [],\n"
+        "  \"required_solver_outputs\": [],\n"
+        "  \"confidence\": \"\",\n"
+        "  \"retrieval_plan\": \"\"\n"
+        "}"
+    )
+    return system_prompt, prompt
+
+
+def _build_semantic_router_prompt(user_query: str, semantic_catalog: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only semantic routing prompt from grounded catalog context."""
+    system_prompt = (
+        "You are a Supply Planning Semantic Router.\n\n"
+        "Determine how the user's question should be investigated.\n\n"
+        "Tasks:\n\n"
+        "1. Determine intent.\n"
+        "2. Identify planner objective.\n"
+        "3. Identify required input files.\n"
+        "4. Identify required output files.\n"
+        "5. Identify required KPIs.\n"
+        "6. Identify required solver outputs.\n"
+        "7. Identify required business rules.\n\n"
+        "Do NOT answer the question."
+    )
+
+    prompt = (
+        "User Query:\n\n"
+        f"{user_query}\n\n"
+        "Semantic Catalog:\n\n"
+        f"{json.dumps(semantic_catalog, ensure_ascii=True)}\n\n"
+        "Output JSON only.\n\n"
+        "{\n"
+        "  \"intent\":\"\",\n"
+        "  \"objective\":\"\",\n"
+        "  \"input_files\":[],\n"
+        "  \"output_files\":[],\n"
+        "  \"columns\":[],\n"
+        "  \"kpis\":[],\n"
+        "  \"business_rules\":[],\n"
+        "  \"reasoning\":\"\"\n"
+        "}"
+    )
+    return system_prompt, prompt
+
+
+def _build_semantic_file_discovery_prompt(user_query: str, file_catalog: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only semantic file discovery prompt from available file catalog."""
+    system_prompt = (
+        "You are a Semantic File Discovery Agent.\n\n"
+        "Identify which files contain the information required to answer the question.\n\n"
+        "Do not answer the question.\n"
+        "Only identify data sources."
+    )
+
+    prompt = (
+        "Available Files:\n\n"
+        f"{json.dumps(file_catalog, ensure_ascii=True)}\n\n"
+        "Question:\n\n"
+        f"{user_query}\n\n"
+        "Return:\n\n"
+        "{\n"
+        "  \"primary_files\": [],\n"
+        "  \"secondary_files\": [],\n"
+        "  \"supporting_files\": [],\n"
+        "  \"confidence\": \"\"\n"
+        "}\n\n"
+        "Do not answer the question.\n"
+        "Only identify data sources."
+    )
+    return system_prompt, prompt
+
+
+def _build_semantic_kpi_selector_prompt(user_query: str, kpi_catalog: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only KPI selector prompt from available KPI catalog."""
+    system_prompt = (
+        "You are a Supply Planning KPI Selector.\n\n"
+        "Determine which KPIs are required.\n\n"
+        "Do not calculate KPIs.\n"
+        "Do not answer the question."
+    )
+
+    prompt = (
+        "Question:\n\n"
+        f"{user_query}\n\n"
+        "Available KPIs:\n\n"
+        f"{json.dumps(kpi_catalog, ensure_ascii=True)}\n\n"
+        "Determine which KPIs are required.\n\n"
+        "Return:\n\n"
+        "{\n"
+        "  \"required_kpis\": [],\n"
+        "  \"why_needed\": []\n"
+        "}\n\n"
+        "Do not calculate KPIs.\n"
+        "Do not answer the question."
+    )
+    return system_prompt, prompt
+
+
+def _build_solver_explainability_planner_prompt(user_query: str, semantic_catalog: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only solver explainability planner prompt from semantic catalog."""
+    system_prompt = (
+        "You are a Solver Explainability Planner.\n\n"
+        "Do not generate an explanation.\n"
+        "Only create a retrieval plan."
+    )
+
+    prompt = (
+        "Question:\n\n"
+        f"{user_query}\n\n"
+        "Semantic Catalog:\n\n"
+        f"{json.dumps(semantic_catalog, ensure_ascii=True)}\n\n"
+        "Determine:\n\n"
+        "1. Is this question about:\n"
+        "   - Input Data\n"
+        "   - Solver Outputs\n"
+        "   - Constraints\n"
+        "   - Recommendations\n"
+        "   - Root Cause\n\n"
+        "2. Which solver output datasets are needed?\n\n"
+        "3. Which constraint datasets are needed?\n\n"
+        "4. Which KPIs are needed?\n\n"
+        "Return:\n\n"
+        "{\n"
+        "  \"analysis_type\":\"\",\n"
+        "  \"required_input_files\":[],\n"
+        "  \"required_output_files\":[],\n"
+        "  \"required_constraint_files\":[],\n"
+        "  \"required_kpis\":[],\n"
+        "  \"required_business_rules\":[]\n"
+        "}\n\n"
+        "Do not generate an explanation.\n"
+        "Only create a retrieval plan."
+    )
+    return system_prompt, prompt
+
+
+def _build_recommendation_retrieval_planner_prompt(user_query: str, semantic_layer: Dict) -> Tuple[str, str]:
+    """Build strict JSON-only recommendation retrieval planner prompt from semantic layer."""
+    system_prompt = (
+        "You are a Recommendation Retrieval Planner.\n\n"
+        "Do not generate recommendations.\n"
+        "Only generate the retrieval plan."
+    )
+
+    prompt = (
+        "Question:\n\n"
+        f"{user_query}\n\n"
+        "Semantic Layer:\n\n"
+        f"{json.dumps(semantic_layer, ensure_ascii=True)}\n\n"
+        "Determine:\n\n"
+        "1. What data must be collected?\n"
+        "2. What KPIs must be calculated?\n"
+        "3. What rules must be evaluated?\n"
+        "4. Which solver outputs are required?\n\n"
+        "Output:\n\n"
+        "{\n"
+        "  \"required_data\":[],\n"
+        "  \"required_solver_outputs\":[],\n"
+        "  \"required_kpis\":[],\n"
+        "  \"required_rules\":[],\n"
+        "  \"recommended_workflow\":[]\n"
+        "}\n\n"
+        "Do not generate recommendations.\n"
+        "Only generate the retrieval plan."
+    )
+    return system_prompt, prompt
+
+
+LOGGER = logging.getLogger(__name__)
+
+ALLOWED_SEMANTIC_MODES = {
+    "legacy",
+    "semantic_retrieval",
+    "hybrid",
+    "solver_explainability",
+}
+
+DEPRECATED_SEMANTIC_FLAGS = [
+    "IFSP_SEMANTIC_RETRIEVAL_MODE",
+    "IFSP_SEMANTIC_ROUTER_MODE",
+    "IFSP_SEMANTIC_FILE_DISCOVERY_MODE",
+    "IFSP_SEMANTIC_KPI_SELECTOR_MODE",
+    "IFSP_SOLVER_EXPLAINABILITY_PLANNER_MODE",
+    "IFSP_RECOMMENDATION_RETRIEVAL_PLANNER_MODE",
+]
+
+
+def _load_semantic_mode_from_env() -> str:
+    raw_mode = (os.getenv("SEMANTIC_MODE") or "").strip()
+    if not raw_mode:
+        msg = (
+            "SEMANTIC_MODE is not configured. Set SEMANTIC_MODE to exactly one of: "
+            "legacy, semantic_retrieval, hybrid, solver_explainability."
+        )
+        LOGGER.error(msg)
+        raise RuntimeError(msg)
+
+    tokens = [t.strip().lower() for t in re.split(r"[,;\s]+", raw_mode) if t and t.strip()]
+    if len(tokens) != 1:
+        msg = (
+            "Invalid SEMANTIC_MODE configuration: multiple modes were provided "
+            f"({tokens}). Set exactly one mode: legacy, semantic_retrieval, hybrid, solver_explainability."
+        )
+        LOGGER.error(msg)
+        raise RuntimeError(msg)
+
+    selected_mode = tokens[0]
+    if selected_mode not in ALLOWED_SEMANTIC_MODES:
+        msg = (
+            f"Unsupported SEMANTIC_MODE '{selected_mode}'. Allowed values: "
+            "legacy, semantic_retrieval, hybrid, solver_explainability."
+        )
+        LOGGER.error(msg)
+        raise RuntimeError(msg)
+
+    deprecated_enabled = [name for name in DEPRECATED_SEMANTIC_FLAGS if _env_flag(os.getenv(name), default=False)]
+    if deprecated_enabled:
+        msg = (
+            "Deprecated semantic mode flags are enabled alongside SEMANTIC_MODE: "
+            f"{deprecated_enabled}. Disable these flags and use SEMANTIC_MODE as the single source of truth."
+        )
+        LOGGER.error(msg)
+        raise RuntimeError(msg)
+
+    return selected_mode
+
+
+# Loaded once at startup and treated as single source of truth.
+SEMANTIC_MODE = _load_semantic_mode_from_env()
+
+
 def build_grounded_chat_prompt(
     base_dir: Path,
     question: str,
@@ -5992,6 +6808,7 @@ def build_grounded_chat_prompt(
     effective_week = week_id
     effective_scenario = scenario_id
     effective_scope = dict(scope or {})
+    retrieval_plan: Optional[Dict] = None
 
     if parsed_command.get("is_command"):
         workflow_payload = _execute_chat_command(base_dir, parsed_command, week_id, scenario_id, effective_scope)
@@ -6002,59 +6819,119 @@ def build_grounded_chat_prompt(
         context = _resolve_context(base_dir, effective_week, effective_scenario)
         grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
         rag_evidence = None
+        command_meta = {
+            "intent": "command",
+            "entities": {},
+            "workflow": workflow_payload.get("workflow") or "Command",
+        }
+        retrieval_plan = _build_semantic_retrieval_plan(
+            base_dir,
+            q,
+            command_meta,
+            context,
+            grounding,
+            command_meta["workflow"],
+            workflow_payload.get("result") if isinstance(workflow_payload, dict) else None,
+        )
+        audit_path = _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
+        if audit_path:
+            retrieval_plan.setdefault("audit", {})["storage_path"] = audit_path
     else:
-        import concurrent.futures as _cf
+        from .router_agent import route_question
 
-        # workflow, grounding+context, and RAG are independent — run all three in parallel
-        context_holder: Dict = {}
+        _tp = _time.perf_counter()
+        routed_meta = route_question(q, history, week_id, scenario_id, effective_scope)
+        routed_meta = _enrich_router_meta_with_openvino_intent(routed_meta, q, history)
+        routed_meta["question"] = q
+        print(f"[IFSP]   intent_entities={int((_time.perf_counter()-_tp)*1000)}ms", flush=True)
 
-        def _run_workflow():
-            _tw = _time.perf_counter()
-            result = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
-            print(f"[IFSP]   workflow={int((_time.perf_counter()-_tw)*1000)}ms intent={result.get('workflow')}", flush=True)
-            return result
+        _tg = _time.perf_counter()
+        context = _resolve_context(base_dir, effective_week, effective_scenario)
+        grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
+        print(f"[IFSP]   grounding_build={int((_time.perf_counter()-_tg)*1000)}ms", flush=True)
 
-        def _run_grounding():
-            _tg = _time.perf_counter()
-            ctx = _resolve_context(base_dir, effective_week, effective_scenario)
-            context_holder["context"] = ctx
-            g = _build_chat_grounding(base_dir, q, ctx, effective_scope)
-            print(f"[IFSP]   grounding_build={int((_time.perf_counter()-_tg)*1000)}ms", flush=True)
-            return g
+        _ts = _time.perf_counter()
+        retrieval_plan = _build_semantic_retrieval_plan(
+            base_dir,
+            q,
+            routed_meta,
+            context,
+            grounding,
+            str((routed_meta.get("workflow") or "Conversational Copilot")),
+            None,
+        )
+        audit_path = _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
+        if audit_path:
+            retrieval_plan.setdefault("audit", {})["storage_path"] = audit_path
+        print(f"[IFSP]   semantic_plan={int((_time.perf_counter()-_ts)*1000)}ms", flush=True)
 
-        def _run_rag():
-            _tr = _time.perf_counter()
-            try:
-                if LLM_CONFIG["provider"] == "openvino":
-                    from .rag_openvino import get_openvino_rag_status, query_openvino_rag
-                    if get_openvino_rag_status(base_dir).get("status") == "ready":
-                        # context may not be ready yet — use raw week/scenario
-                        return query_openvino_rag(base_dir, q, week_id=week_id, scenario_id=scenario_id, top_k=6)
-                    return None
-                item_hint = _resolve_chat_item(q, history).get("selected_item")
-                result = query_rag(base_dir, q, top_k=6,
-                                   week_id=week_id, scenario_id=scenario_id,
-                                   site=(effective_scope or {}).get("site"),
-                                   item_id=item_hint)
-                print(f"[IFSP]   rag={int((_time.perf_counter()-_tr)*1000)}ms", flush=True)
-                return result
-            except Exception:
-                return None
+        _tw = _time.perf_counter()
+        workflow_payload = _run_chat_workflow_if_needed(
+            base_dir,
+            q,
+            week_id,
+            scenario_id,
+            effective_scope,
+            history=history,
+            router_meta=routed_meta,
+            retrieval_plan=retrieval_plan,
+        )
+        print(f"[IFSP]   workflow={int((_time.perf_counter()-_tw)*1000)}ms intent={workflow_payload.get('workflow')}", flush=True)
 
-        with _cf.ThreadPoolExecutor(max_workers=3) as _pool:
-            _f_wf  = _pool.submit(_run_workflow)
-            _f_gr  = _pool.submit(_run_grounding)
-            _f_rag = _pool.submit(_run_rag)
-            workflow_payload = _f_wf.result()
-            grounding        = _f_gr.result()
-            rag_evidence     = _f_rag.result()
+        _tr = _time.perf_counter()
+        rag_evidence = None
+        try:
+            if LLM_CONFIG["provider"] == "openvino":
+                from .rag_openvino import get_openvino_rag_status, query_openvino_rag
+                if get_openvino_rag_status(base_dir).get("status") == "ready":
+                    rag_evidence = query_openvino_rag(base_dir, q, week_id=week_id, scenario_id=scenario_id, top_k=6)
+            else:
+                plan_entities = retrieval_plan.get("entities") if isinstance(retrieval_plan, dict) else {}
+                item_hint = (plan_entities or {}).get("item") or _resolve_chat_item(q, history).get("selected_item")
+                rag_evidence = query_rag(
+                    base_dir,
+                    q,
+                    top_k=6,
+                    week_id=week_id,
+                    scenario_id=scenario_id,
+                    site=(effective_scope or {}).get("site"),
+                    item_id=item_hint,
+                )
+        except Exception:
+            rag_evidence = None
+        print(f"[IFSP]   rag={int((_time.perf_counter()-_tr)*1000)}ms", flush=True)
 
-        context = context_holder.get("context") or _resolve_context(base_dir, effective_week, effective_scenario)
+        if isinstance(workflow_payload, dict):
+            workflow_payload["retrieval_plan"] = retrieval_plan
+
+    if isinstance(retrieval_plan, dict):
+        wr = workflow_payload.get("result") if isinstance(workflow_payload, dict) else None
+        stages = retrieval_plan.setdefault("stages", {})
+        stages["data_retrieval"] = "complete" if wr is not None else "partial"
+
+        kpi_summary_present = False
+        if isinstance(wr, dict):
+            kpi_summary_present = bool(wr.get("kpi_summary") or wr.get("KPI Summary"))
+        stages["kpi_calculation"] = "complete" if kpi_summary_present else "not_required_or_pending"
+        stages["llm_explanation"] = "pending"
+
+        retrieval_plan.setdefault("audit", {})["last_stage_update_utc"] = datetime.utcnow().isoformat() + "Z"
+        post_audit_path = _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
+        if post_audit_path:
+            retrieval_plan.setdefault("audit", {})["storage_path"] = post_audit_path
 
     workflow_name = workflow_payload.get("workflow") or "Conversational Copilot"
     workflow_result = workflow_payload.get("result")
     workflow_note = workflow_payload.get("note")
     clarification = workflow_payload.get("clarification")
+
+    semantic_retrieval_mode = SEMANTIC_MODE == "semantic_retrieval"
+    # hybrid mode enables structured semantic routing planner behavior
+    semantic_router_mode = SEMANTIC_MODE == "hybrid"
+    semantic_file_discovery_mode = False
+    semantic_kpi_selector_mode = False
+    solver_explainability_planner_mode = SEMANTIC_MODE == "solver_explainability"
+    recommendation_retrieval_planner_mode = False
 
     system_prompt = (
         "You are a senior Intel Foundry Supply Planning expert with deep knowledge of "
@@ -6098,9 +6975,16 @@ def build_grounded_chat_prompt(
     if workflow_note:
         prompt_sections.append(f"## Workflow Note\n{workflow_note}")
 
+    if retrieval_plan is not None:
+        prompt_sections.append(
+            f"## Authoritative Retrieval Plan (Semantic Layer Source of Truth)\n{json.dumps(retrieval_plan, ensure_ascii=True)}"
+        )
+
     prompt_sections.append(
         "## Instructions\n"
         "Answer the planner's question directly using the data above. "
+        "Use the Authoritative Retrieval Plan as the only source for files, columns, relationships/joins, KPIs, and solver outputs. "
+        "Do not select or infer files, columns, or joins in the LLM layer. "
         "Lead with the actual answer (numbers, status, items). "
         "Explain why briefly if useful. "
         "End with one follow-up question only if it would materially help the planner. "
@@ -6110,6 +6994,207 @@ def build_grounded_chat_prompt(
         prompt_sections.append(
             "For this demand query, state clearly: total demand, scheduled supply, unmet quantity, and whether demand was fully met, partially met, or not met."
         )
+
+    if semantic_file_discovery_mode:
+        file_catalog = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "matched_tables": (grounding.get("matched_tables") or [])[:30] if isinstance(grounding, dict) else [],
+            "key_linkages": (grounding.get("key_linkages") or [])[:30] if isinstance(grounding, dict) else [],
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:10],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_semantic_file_discovery_prompt(q, file_catalog)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "semantic_file_discovery_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
+
+    if semantic_kpi_selector_mode:
+        kpi_catalog = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "domain_framework": grounding.get("domain_framework") if isinstance(grounding, dict) else None,
+            "solver_knowledge": grounding.get("solver_knowledge") if isinstance(grounding, dict) else None,
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "kpi_summary": (
+                (workflow_result.get("kpi_summary") if isinstance(workflow_result, dict) else None)
+                or (workflow_result.get("KPI Summary") if isinstance(workflow_result, dict) else None)
+                or {}
+            ),
+            "matched_tables": (grounding.get("matched_tables") or [])[:20] if isinstance(grounding, dict) else [],
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:8],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_semantic_kpi_selector_prompt(q, kpi_catalog)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "semantic_kpi_selector_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
+
+    if solver_explainability_planner_mode:
+        semantic_catalog = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "matched_tables": (grounding.get("matched_tables") or [])[:30] if isinstance(grounding, dict) else [],
+            "key_linkages": (grounding.get("key_linkages") or [])[:40] if isinstance(grounding, dict) else [],
+            "domain_framework": grounding.get("domain_framework") if isinstance(grounding, dict) else None,
+            "solver_knowledge": grounding.get("solver_knowledge") if isinstance(grounding, dict) else None,
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "kpi_summary": (
+                (workflow_result.get("kpi_summary") if isinstance(workflow_result, dict) else None)
+                or (workflow_result.get("KPI Summary") if isinstance(workflow_result, dict) else None)
+                or {}
+            ),
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:8],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_solver_explainability_planner_prompt(q, semantic_catalog)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "solver_explainability_planner_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
+
+    if recommendation_retrieval_planner_mode:
+        semantic_layer = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "matched_tables": (grounding.get("matched_tables") or [])[:30] if isinstance(grounding, dict) else [],
+            "key_linkages": (grounding.get("key_linkages") or [])[:40] if isinstance(grounding, dict) else [],
+            "domain_framework": grounding.get("domain_framework") if isinstance(grounding, dict) else None,
+            "solver_knowledge": grounding.get("solver_knowledge") if isinstance(grounding, dict) else None,
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "kpi_summary": (
+                (workflow_result.get("kpi_summary") if isinstance(workflow_result, dict) else None)
+                or (workflow_result.get("KPI Summary") if isinstance(workflow_result, dict) else None)
+                or {}
+            ),
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:8],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_recommendation_retrieval_planner_prompt(q, semantic_layer)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "recommendation_retrieval_planner_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
+
+    if semantic_router_mode:
+        semantic_catalog = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "matched_tables": (grounding.get("matched_tables") or [])[:20] if isinstance(grounding, dict) else [],
+            "key_linkages": (grounding.get("key_linkages") or [])[:30] if isinstance(grounding, dict) else [],
+            "domain_framework": grounding.get("domain_framework") if isinstance(grounding, dict) else None,
+            "solver_knowledge": grounding.get("solver_knowledge") if isinstance(grounding, dict) else None,
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:5],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_semantic_router_prompt(q, semantic_catalog)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "semantic_router_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
+
+    if semantic_retrieval_mode:
+        semantic_model = {
+            "workflow": workflow_name,
+            "context": {
+                "week_id": context.get("week_id"),
+                "scenario_id": context.get("scenario_id"),
+            },
+            "workflow_result": _trim_workflow_result_for_prompt(workflow_result) if isinstance(workflow_result, dict) else workflow_result,
+            "grounding": {
+                "context_resolution": grounding.get("context_resolution") if isinstance(grounding, dict) else None,
+                "matched_tables": (grounding.get("matched_tables") or [])[:12] if isinstance(grounding, dict) else [],
+                "key_linkages": (grounding.get("key_linkages") or [])[:20] if isinstance(grounding, dict) else [],
+                "domain_framework": grounding.get("domain_framework") if isinstance(grounding, dict) else None,
+                "solver_knowledge": grounding.get("solver_knowledge") if isinstance(grounding, dict) else None,
+            },
+            "rag_evidence": ((rag_evidence or {}).get("hits") or [])[:5],
+            "retrieval_plan": retrieval_plan,
+        }
+        system_prompt, semantic_prompt = _build_semantic_retrieval_prompt(q, semantic_model)
+        meta = {
+            "workflow": workflow_name,
+            "workflow_result": workflow_result,
+            "context": context,
+            "rag_evidence": rag_evidence,
+            "clarification": clarification,
+            "follow_ups": _suggest_followups(workflow_name, q),
+            "history_window": (history or [])[-10:],
+            "grounding": grounding,
+            "workflow_payload": workflow_payload,
+            "semantic_retrieval_mode": True,
+            "retrieval_plan": retrieval_plan,
+        }
+        return system_prompt, semantic_prompt, meta
 
     meta = {
         "workflow": workflow_name,
@@ -6121,8 +7206,58 @@ def build_grounded_chat_prompt(
         "history_window": (history or [])[-10:],
         "grounding": grounding,
         "workflow_payload": workflow_payload,
+        "retrieval_plan": retrieval_plan,
     }
     return system_prompt, "\n\n".join(prompt_sections), meta
+
+
+def _extract_citations_from_rag(rag_evidence: Optional[Dict]) -> List[str]:
+    hits = (rag_evidence or {}).get("hits") or []
+    citations: List[str] = []
+    seen = set()
+    for h in hits:
+        citation = (h.get("citation") or "").strip()
+        if not citation:
+            file_name = (h.get("file") or "").strip()
+            row_num = h.get("row_number")
+            if file_name and row_num is not None:
+                citation = f"{file_name}#row{row_num}"
+        if citation and citation not in seen:
+            citations.append(citation)
+            seen.add(citation)
+    return citations
+
+
+def _compute_answer_confidence(
+    workflow_result: Optional[Dict],
+    rag_evidence: Optional[Dict],
+    clarification: Optional[Dict],
+    citations: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    if clarification:
+        return {
+            "level": "Low",
+            "reason": "Missing required slots or clarifications reduce confidence.",
+        }
+
+    has_structured = isinstance(workflow_result, dict) and len(workflow_result) > 0
+    hits = (rag_evidence or {}).get("hits") or []
+    citation_count = len(citations or [])
+
+    if has_structured and (not rag_evidence or (hits and citation_count > 0)):
+        return {
+            "level": "High",
+            "reason": "Structured workflow evidence is available and citations are present when RAG is used.",
+        }
+    if has_structured or (hits and citation_count > 0):
+        return {
+            "level": "Medium",
+            "reason": "Partial evidence coverage is available but not complete across all sources.",
+        }
+    return {
+        "level": "Low",
+        "reason": "Insufficient grounded evidence or missing citations.",
+    }
 
 
 def run_chat_assistant(
@@ -6150,10 +7285,20 @@ def run_chat_assistant(
     workflow_name = meta["workflow"]
     workflow_result = meta["workflow_result"]
     clarification = meta["clarification"]
+    workflow_note = (workflow_payload or {}).get("note")
     follow_ups = meta["follow_ups"]
     rag_evidence = meta["rag_evidence"]
     history_window = meta["history_window"]
     grounding = meta["grounding"]
+    retrieval_plan = meta.get("retrieval_plan") if isinstance(meta.get("retrieval_plan"), dict) else None
+    semantic_file_discovery_mode = bool(meta.get("semantic_file_discovery_mode"))
+    semantic_kpi_selector_mode = bool(meta.get("semantic_kpi_selector_mode"))
+    solver_explainability_planner_mode = bool(meta.get("solver_explainability_planner_mode"))
+    recommendation_retrieval_planner_mode = bool(meta.get("recommendation_retrieval_planner_mode"))
+    semantic_router_mode = bool(meta.get("semantic_router_mode"))
+    semantic_retrieval_mode = bool(meta.get("semantic_retrieval_mode"))
+    citations = _extract_citations_from_rag(rag_evidence)
+    confidence = _compute_answer_confidence(workflow_result, rag_evidence, clarification, citations)
 
     parsed_command = _parse_chat_command(q)
     effective_scope = dict(scope or {})
@@ -6177,6 +7322,51 @@ def run_chat_assistant(
             history=history_window,
         )
         if conversational_reply:
+            if retrieval_plan is not None:
+                retrieval_plan.setdefault("stages", {})["llm_explanation"] = "complete"
+                retrieval_plan.setdefault("audit", {})["last_stage_update_utc"] = datetime.utcnow().isoformat() + "Z"
+                _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
+
+            if semantic_file_discovery_mode or semantic_kpi_selector_mode or solver_explainability_planner_mode or recommendation_retrieval_planner_mode or semantic_router_mode or semantic_retrieval_mode:
+                parsed = _parse_json_object_from_text(conversational_reply)
+                if semantic_file_discovery_mode:
+                    normalized_semantic = _normalize_semantic_file_discovery_output(parsed)
+                    semantic_mode = "file_discovery"
+                elif semantic_kpi_selector_mode:
+                    normalized_semantic = _normalize_semantic_kpi_selector_output(parsed)
+                    semantic_mode = "kpi_selector"
+                elif solver_explainability_planner_mode:
+                    normalized_semantic = _normalize_solver_explainability_planner_output(parsed)
+                    semantic_mode = "solver_explainability_planner"
+                elif recommendation_retrieval_planner_mode:
+                    normalized_semantic = _normalize_recommendation_retrieval_planner_output(parsed)
+                    semantic_mode = "recommendation_retrieval_planner"
+                elif semantic_router_mode:
+                    normalized_semantic = _normalize_semantic_router_output(parsed)
+                    semantic_mode = "router"
+                else:
+                    normalized_semantic = _normalize_semantic_retrieval_output(parsed)
+                    semantic_mode = "retrieval"
+                normalized_semantic = _apply_retrieval_plan_to_semantic_output(
+                    semantic_mode,
+                    normalized_semantic,
+                    retrieval_plan,
+                )
+                response = {
+                    "Assistant Reply": json.dumps(normalized_semantic, ensure_ascii=True),
+                    "Workflow": workflow_name,
+                    "Context Resolution": context,
+                    "LLM Provider": LLM_CONFIG["provider"].capitalize(),
+                    "LLM Model": (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"],
+                    "Confidence": confidence,
+                    "Semantic Mode": semantic_mode,
+                }
+                if retrieval_plan is not None:
+                    response["Retrieval Plan"] = retrieval_plan
+                if workflow_payload.get("router_metadata"):
+                    response["Router Metadata"] = workflow_payload["router_metadata"]
+                return response
+
             judge_review = _judge_llm_output(
                 q, conversational_reply, workflow_name, context,
                 workflow_result if isinstance(workflow_result, dict) else None,
@@ -6189,17 +7379,31 @@ def run_chat_assistant(
                 "Suggested Follow-ups": follow_ups,
                 "LLM Provider": LLM_CONFIG["provider"].capitalize(),
                 "LLM Model": (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"],
+                "Confidence": confidence,
             }
+            if retrieval_plan is not None:
+                response["Retrieval Plan"] = retrieval_plan
             if workflow_result is not None:
                 response["Grounded Result"] = workflow_result
             if clarification is not None:
                 response["Clarification Needed"] = clarification
             if rag_evidence is not None:
                 response["RAG Evidence"] = rag_evidence
+                response["Citations"] = citations
+                if not citations:
+                    response["Evidence Gaps"] = ["RAG evidence present but citations were missing."]
             if judge_review is not None:
                 response["LLM Judge Review"] = judge_review
             if workflow_payload.get("router_metadata"):
                 response["Router Metadata"] = workflow_payload["router_metadata"]
+            grounded = build_grounded_answer(
+                conversational_reply,
+                workflow_result if isinstance(workflow_result, dict) else None,
+                rag_evidence,
+                confidence,
+            )
+            response["Grounded Response"] = grounded
+            response.update(grounded)
             return response
 
     fallback_reply = "I can answer BY ESP planning questions in natural language and run validation, compare, root-cause, and insights workflows."
@@ -6211,6 +7415,7 @@ def run_chat_assistant(
         "Workflow": workflow_name,
         "Context Resolution": context,
         "Suggested Follow-ups": follow_ups,
+        "Confidence": confidence,
         "Knowledge Areas": [
             "BY ESP LP optimization mechanics",
             "Input/output table definitions and columns",
@@ -6226,12 +7431,28 @@ def run_chat_assistant(
             "/table by_if_snop_out_inddmdview",
         ],
     }
+    if retrieval_plan is not None:
+        retrieval_plan.setdefault("stages", {})["llm_explanation"] = "not_generated_fallback"
+        retrieval_plan.setdefault("audit", {})["last_stage_update_utc"] = datetime.utcnow().isoformat() + "Z"
+        _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
+        fallback["Retrieval Plan"] = retrieval_plan
     if workflow_result is not None:
         fallback["Grounded Result"] = workflow_result
     if rag_evidence is not None:
         fallback["RAG Evidence"] = rag_evidence
+        fallback["Citations"] = citations
+        if not citations:
+            fallback["Evidence Gaps"] = ["RAG evidence present but citations were missing."]
     if clarification is not None:
         fallback["Clarification Needed"] = clarification
     if workflow_note:
         fallback["Note"] = workflow_note
+    grounded = build_grounded_answer(
+        fallback_reply,
+        workflow_result if isinstance(workflow_result, dict) else None,
+        rag_evidence,
+        confidence,
+    )
+    fallback["Grounded Response"] = grounded
+    fallback.update(grounded)
     return fallback

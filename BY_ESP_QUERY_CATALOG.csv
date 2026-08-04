@@ -1,0 +1,101 @@
+id,question,intent,primary_output_files,supporting_files,solver_first
+1,"What is the current unmet quantity for ITEM 100000000008 at LOC 1004 this week?",DemandStatusLookup,"by_if_snop_out_inddmdview","if_snop_customerorder; if_snop_dfutoskufcst",Y
+2,"Show independent demand lines that are late for ITEM 100000000008",DemandStatusLookup,"by_if_snop_out_inddmdview","if_snop_customerorder",Y
+3,"Which customer demands are partially met at LOC 1004?",DemandStatusLookup,"by_if_snop_out_inddmdview","if_snop_customer; if_snop_customerorder",Y
+4,"List demand records with zero scheduled quantity but positive requested quantity",DemandStatusLookup,"by_if_snop_out_inddmdview","",Y
+5,"How many forecast demands were not scheduled on requested need date?",DemandStatusLookup,"by_if_snop_out_inddmdview","by_if_snop_out_fcstorder",Y
+6,"Which demand types have the highest unmet ratio by location?",DemandStatusLookup,"by_if_snop_out_inddmdview","",Y
+7,"Show top 10 demand groups with highest late quantity",DemandStatusLookup,"by_if_snop_out_inddmdview","",Y
+8,"What is the average lateness duration by customer tier?",DemandStatusLookup,"by_if_snop_out_inddmdview","if_snop_customer",Y
+9,"Identify demands with high priority but unmet status",DemandStatusLookup,"by_if_snop_out_inddmdview","",Y
+10,"For a given order id, show demand status and schedule date",DemandStatusLookup,"by_if_snop_out_inddmdview","if_snop_customerorder",Y
+11,"Trace supply pegged to demand sequence 12345",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_inddmdview",Y
+12,"Which supplies are pegged to customer order ORDER123?",DemandSupplyPeggingExplain,"by_if_snop_out_orderlink","by_if_snop_out_inddmdview",Y
+13,"Show demand lines with insufficient pegged quantity",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","",Y
+14,"What supply types are covering forecast demand for ITEM A?",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_fcstorder",Y
+15,"How much planned purchase is pegged to DMDSEQNUM 9001?",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planpurch",Y
+16,"Map demand to parent supply chain for ITEM A at LOC B",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_orderlink",Y
+17,"Show pegging split by supply method for top unmet customers",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","if_snop_customer",Y
+18,"List unpegged independent demands by need date bucket",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_inddmdview",Y
+19,"Find demand lines pegged only to inventory and not to planned orders",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","",Y
+20,"Which demands are pegged through transfer arrivals versus production?",DemandSupplyPeggingExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planarriv; by_if_snop_out_planorder",Y
+21,"Which resources are overutilized above 95 percent?",CapacityConstraintExplain,"by_if_snop_out_resprojstatic","if_snop_res",Y
+22,"Show all active resource exceptions by severity",CapacityConstraintExplain,"by_if_snop_out_resexception","if_snop_res",Y
+23,"What is the weekly capacity load versus available capacity by resource?",CapacityConstraintExplain,"by_if_snop_out_resprojstatic","if_snop_res",Y
+24,"Which items contribute most to RES01 overload?",CapacityConstraintExplain,"by_if_snop_out_resloaddetail","by_if_snop_out_resexception",Y
+25,"For RES01, list top demand orders causing load spikes",CapacityConstraintExplain,"by_if_snop_out_resloadinddmdlink","by_if_snop_out_resloaddetail",Y
+26,"Where is capacity underutilized below 40 percent?",CapacityConstraintExplain,"by_if_snop_out_resprojstatic","if_snop_res",Y
+27,"Which production methods are associated with repeated resource violations?",CapacityConstraintExplain,"by_if_snop_out_resexception","if_snop_productionmethod",Y
+28,"Show capacity exception trend by solve version",CapacityConstraintExplain,"by_if_snop_out_resexception","by_if_snop_out_por",Y
+29,"Which calendar windows align with peak resource overload?",CapacityConstraintExplain,"by_if_snop_out_resprojstatic","if_snop_calpattern; if_snop_calattribute",Y
+30,"List capacity pegged quantity by demand priority",CapacityConstraintExplain,"by_if_snop_out_resloadinddmdlink","by_if_snop_out_inddmdview",Y
+31,"Which components are driving dependent demand shortages for ITEM A?",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_billofmaterials",Y
+32,"Show parent demands impacted by component SUBORD X",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_billofmaterials",Y
+33,"Where do BOM alternatives exist but unmet demand remains?",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_altbillofmaterials; if_snop_billofmaterials",Y
+34,"List dependent demand with earliest need date before supply availability",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","by_if_snop_out_inddmdlink",Y
+35,"Which BOM numbers produce highest constrained dependent demand?",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_billofmaterials",Y
+36,"Show component-level shortage by location and week",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_inventory",Y
+37,"How much unmet demand is linked to low yield factors in BOM?",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_billofmaterials",Y
+38,"Which parent production orders are blocked by subordinate availability?",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","by_if_snop_out_planorder",Y
+39,"Find supersession opportunities for constrained components",MaterialConstraintExplain,"by_if_snop_out_depdmdstatic","if_snop_supersession",Y
+40,"Show material exceptions with highest violation value",MaterialConstraintExplain,"by_if_snop_out_skuexception","if_snop_billofmaterials",Y
+41,"Why was plan order created for ITEM A at LOC B on date D?",PlanOrderDecisionExplain,"by_if_snop_out_planorder","by_if_snop_out_inddmdlink; if_snop_productionmethod",Y
+42,"Why was no plan order generated for ITEM A despite demand?",PlanOrderDecisionExplain,"by_if_snop_out_inddmdlink","if_snop_productionmethod; by_if_snop_out_resexception",Y
+43,"List plan orders by production method and quantity",PlanOrderDecisionExplain,"by_if_snop_out_planorder","if_snop_productionmethod",Y
+44,"Show plan orders violating preferred production priority",PlanOrderDecisionExplain,"by_if_snop_out_planorder","if_snop_productionmethod",Y
+45,"Which plan orders started earlier than required need date and why?",PlanOrderDecisionExplain,"by_if_snop_out_planorder","by_if_snop_out_inddmdlink",Y
+46,"Map each plan order to the demand sequences it serves",PlanOrderDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planorder",Y
+47,"Find plan orders with low conversion to scheduled supply",PlanOrderDecisionExplain,"by_if_snop_out_planorder","by_if_snop_out_orderlink",Y
+48,"What proportion of demand is covered by plan orders versus inventory?",PlanOrderDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planorder",Y
+49,"Which plan orders are most impacted by capacity exceptions?",PlanOrderDecisionExplain,"by_if_snop_out_resloaddetail","by_if_snop_out_resexception; by_if_snop_out_planorder",Y
+50,"Explain production decision changes across solve versions",PlanOrderDecisionExplain,"by_if_snop_out_planorder","by_if_snop_out_por",Y
+51,"Why was plan purchase created for ITEM A at LOC B?",PlanPurchDecisionExplain,"by_if_snop_out_planpurch","by_if_snop_out_inddmdlink; if_snop_purchmethod",Y
+52,"Why was no purchase plan generated for ITEM A despite unmet demand?",PlanPurchDecisionExplain,"by_if_snop_out_inddmdlink","if_snop_purchmethod; by_if_snop_out_skuexception",Y
+53,"List purchase plans by purch method and lead time",PlanPurchDecisionExplain,"by_if_snop_out_planpurch","if_snop_purchmethod",Y
+54,"Show planned purchases with need date earlier than sched date",PlanPurchDecisionExplain,"by_if_snop_out_planpurch","",Y
+55,"Which purchase plans are tied to high-priority customer orders?",PlanPurchDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planpurch; if_snop_customerorder",Y
+56,"How much demand is fulfilled by planned purchase by week?",PlanPurchDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planpurch",Y
+57,"Find purchase decisions blocked by policy constraints",PlanPurchDecisionExplain,"by_if_snop_out_skuexception","if_snop_purchmethod; if_snop_sku",Y
+58,"Which items rely only on purchase and have unmet demand?",PlanPurchDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planpurch; if_snop_sku",Y
+59,"Show differences in planned purchase between two simulations",PlanPurchDecisionExplain,"by_if_snop_out_planpurch","by_if_snop_out_por",Y
+60,"Rank locations by planned purchase volume",PlanPurchDecisionExplain,"by_if_snop_out_planpurch","",Y
+61,"Why was a transfer arrival generated from SOURCE to DEST?",TransferDecisionExplain,"by_if_snop_out_planarriv","by_if_snop_out_inddmdlink; if_snop_sourcing",Y
+62,"Why was no transfer generated for ITEM A between nodes?",TransferDecisionExplain,"by_if_snop_out_inddmdlink","if_snop_sourcing; if_snop_network",Y
+63,"Show transfer plans by transport mode and lead time",TransferDecisionExplain,"by_if_snop_out_planarriv","if_snop_network",Y
+64,"Which transfer routes are most used for unmet demand recovery?",TransferDecisionExplain,"by_if_snop_out_planarriv","by_if_snop_out_inddmdview",Y
+65,"Find transfer plans arriving after demand schedule date",TransferDecisionExplain,"by_if_snop_out_planarriv","by_if_snop_out_inddmdlink",Y
+66,"How much demand is covered by intersite transfer versus local production?",TransferDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planarriv; by_if_snop_out_planorder",Y
+67,"Show source-destination pairs with no planned arrivals",TransferDecisionExplain,"by_if_snop_out_planarriv","if_snop_network; if_snop_sourcing",Y
+68,"Which transfer decisions changed most across solve versions?",TransferDecisionExplain,"by_if_snop_out_planarriv","by_if_snop_out_por",Y
+69,"List high-priority demands served through transfer only",TransferDecisionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planarriv; by_if_snop_out_inddmdview",Y
+70,"Find transfer plans associated with capacity-constrained destinations",TransferDecisionExplain,"by_if_snop_out_planarriv","by_if_snop_out_resprojstatic",Y
+71,"What is projected on-hand inventory by item and location over time?",InventoryProjectionExplain,"by_if_snop_out_skuprojstatic","",Y
+72,"Which SKUs have projected stockout in next 4 weeks?",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","by_if_snop_out_skuprojstatic",Y
+73,"Show minimum coverage duration by SKU",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","if_snop_skueffinventoryparam",Y
+74,"Which items have negative projected availability?",InventoryProjectionExplain,"by_if_snop_out_skuprojstatic","",Y
+75,"How much of total demand is met from inventory versus new supply?",InventoryProjectionExplain,"by_if_snop_out_skuprojstatic","by_if_snop_out_inddmdlink",Y
+76,"List SKUs with highest stockout duration",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","",Y
+77,"Compare projected inventory between simulation A and B",InventoryProjectionExplain,"by_if_snop_out_skuprojstatic","by_if_snop_out_por",Y
+78,"Find inventory shortage periods where scheduled receipts exist",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","if_snop_schedrcpts",Y
+79,"Show relationship between safety stock policy and projected stockouts",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","if_snop_skueffinventoryparam",Y
+80,"Which locations have chronic low constrained stock levels?",InventoryProjectionExplain,"by_if_snop_out_skustatstatic","",Y
+81,"Which customers lost allocation despite higher priority?",AllocationPriorityExplain,"by_if_snop_out_inddmdview","if_snop_customerorder",Y
+82,"Show unmet demand by demand group and priority",AllocationPriorityExplain,"by_if_snop_out_inddmdview","",Y
+83,"How does inddmd priority influence pegged quantity?",AllocationPriorityExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_inddmdview",Y
+84,"Find customer tiers with highest partial fulfillment",AllocationPriorityExplain,"by_if_snop_out_inddmdview","if_snop_customer",Y
+85,"Which demands were deprioritized due to capacity scarcity?",AllocationPriorityExplain,"by_if_snop_out_resloadinddmdlink","by_if_snop_out_resexception",Y
+86,"Show allocation by customer and location for constrained items",AllocationPriorityExplain,"by_if_snop_out_inddmdview","if_snop_customer",Y
+87,"Identify priority inversions where lower priority demand got higher schedule qty",AllocationPriorityExplain,"by_if_snop_out_inddmdview","",Y
+88,"Which demand groups consumed available supply first?",AllocationPriorityExplain,"by_if_snop_out_inddmdlink","",Y
+89,"How did allocation outcomes change between solve versions?",AllocationPriorityExplain,"by_if_snop_out_inddmdview","by_if_snop_out_por",Y
+90,"List customers with repeated unmet demand across weeks",AllocationPriorityExplain,"by_if_snop_out_inddmdview","if_snop_customer",Y
+91,"How much forecast was consumed by customer orders by item?",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","if_snop_dfutoskufcst; if_snop_customerorder",Y
+92,"Show forecast orders with high consumed quantity but unmet demand",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","by_if_snop_out_inddmdview",Y
+93,"Which forecast demand groups are consistently under-fulfilled?",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","by_if_snop_out_inddmdview",Y
+94,"Compare forecast consumption across locations",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","if_snop_dfutoskufcst",Y
+95,"What is the lag between forecast need date and scheduled fulfillment?",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","by_if_snop_out_inddmdview",Y
+96,"Find forecast demand driving most planned production",ForecastConsumptionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planorder; by_if_snop_out_fcstorder",Y
+97,"Show forecast-driven planned purchases by week",ForecastConsumptionExplain,"by_if_snop_out_inddmdlink","by_if_snop_out_planpurch; by_if_snop_out_fcstorder",Y
+98,"Which forecast types have highest unmet quantity?",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","by_if_snop_out_inddmdview",Y
+99,"How do upside forecast priorities impact fulfillment outcomes?",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","by_if_snop_out_inddmdview",Y
+100,"Detect forecast overconsumption versus baseline forecast volume",ForecastConsumptionExplain,"by_if_snop_out_fcstorder","if_snop_dfutoskufcst",Y
