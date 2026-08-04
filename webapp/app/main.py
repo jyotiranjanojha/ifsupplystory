@@ -331,9 +331,10 @@ def chat_stream(req: ChatRequest):
     import queue as _queue
     import threading as _threading
 
+    # system_prompt is overridden by build_grounded_chat_prompt; this is a fallback only
     system_prompt = (
-        "You are IFSP Planning Copilot, a senior Blue Yonder Enterprise Supply Planning expert. "
-        "Be concise, grounded, and planner-friendly."
+        "You are a senior Intel Foundry Supply Planning expert. "
+        "Answer directly using the data provided. Lead with the actual numbers."
     )
     tok_queue: _queue.Queue = _queue.Queue()
 
