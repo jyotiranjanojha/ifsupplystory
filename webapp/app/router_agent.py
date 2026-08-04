@@ -26,9 +26,21 @@ from urllib import error, request as urllib_request
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
-# ── Ollama LLM router config (used only as low-confidence fallback) ──────────
-_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-_OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
+# ── Router LLM config — resolved lazily from LLM_CONFIG at call time ─────────
+_ROUTER_BASE_URL_OVERRIDE = os.getenv("OLLAMA_BASE_URL")   # explicit env override only
+_ROUTER_MODEL_OVERRIDE    = os.getenv("OLLAMA_MODEL")      # explicit env override only
+
+
+def _get_router_llm_config() -> tuple:
+    """Return (base_url, model) for intent classification using the active LLM_CONFIG."""
+    try:
+        from .analyzer import LLM_CONFIG  # lazy import avoids circular dep
+        base_url = _ROUTER_BASE_URL_OVERRIDE or LLM_CONFIG.get("base_url") or "http://127.0.0.1:11434"
+        model    = _ROUTER_MODEL_OVERRIDE    or LLM_CONFIG.get("model")    or "gemma3:latest"
+    except Exception:
+        base_url = _ROUTER_BASE_URL_OVERRIDE or "http://127.0.0.1:11434"
+        model    = _ROUTER_MODEL_OVERRIDE    or "gemma3:latest"
+    return base_url, model
 # High threshold: only bypass the LLM when keyword confidence is very strong.
 # This makes routing LLM-first for almost all questions.
 _ROUTER_BYPASS_THRESHOLD = float(os.getenv("OLLAMA_ROUTER_CONFIDENCE_THRESHOLD", "0.75"))
@@ -408,16 +420,16 @@ def _extract_table_name(text: str) -> Optional[str]:
 
 def _call_ollama_router(question: str) -> Optional[str]:
     """
-    Ask Ollama to classify the planning question intent.
+    Classify the planning question intent using the active LLM (same model as main responses).
 
-    Now the PRIMARY routing path (not just a fallback).  The LLM is much
-    better than keyword lists at understanding natural language variations.
+    Routes through LLM_CONFIG so the router always uses whatever model is configured,
 
     Strategy (version-safe):
       1. Try with JSON schema `format` (Ollama >= 0.3.9) — enum-constrained.
       2. On failure — retry without format and fall back to substring matching.
     """
     valid_intents = list(INTENT_CATALOG.keys())
+    _router_base_url, _router_model = _get_router_llm_config()
     intent_lines = "\n".join(
         f"- {name}: {spec['description']}"
         for name, spec in INTENT_CATALOG.items()
@@ -482,69 +494,33 @@ def _call_ollama_router(question: str) -> Optional[str]:
         f"Question: {question}\nIntent:"
     )
 
-    format_schema = {
-        "type": "object",
-        "properties": {
-            "intent": {
-                "type": "string",
-                "enum": valid_intents,
-            }
-        },
-        "required": ["intent"],
+    # Single attempt — OpenAI /v1/chat/completions format
+    payload = {
+        "model": _router_model,
+        "stream": False,
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "messages": [
+            {"role": "system", "content": "You are a planning query classifier. Return ONLY the intent name, nothing else."},
+            {"role": "user", "content": prompt_plain},
+        ],
     }
-
-    for use_format in (True, False):
-        base = {
-            "model": _OLLAMA_ROUTER_MODEL,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a planning query classifier.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt_structured if use_format else prompt_plain,
-                },
-            ],
-            "options": {"temperature": 0.0},
-        }
-        if use_format:
-            base["format"] = format_schema
-
-        data = json.dumps(base).encode("utf-8")
-        req = urllib_request.Request(
-            f"{_OLLAMA_BASE_URL}/api/chat",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib_request.urlopen(req, timeout=20) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            content = ((body.get("message") or {}).get("content") or "").strip()
-            if not content:
-                continue
-
-            if use_format:
-                # Schema-constrained path — parse JSON and trust the enum
-                parsed = json.loads(content)
-                intent = (parsed.get("intent") or "").strip().lower()
-                if intent in INTENT_CATALOG:
-                    return intent          # clean, validated result
-                # Ollama returned JSON but intent not in catalog (shouldn't happen)
-                continue                   # retry without format
-            else:
-                # Plain-text fallback path — substring match
-                raw = content.lower()
-                if raw in INTENT_CATALOG:
-                    return raw
-                return next((k for k in INTENT_CATALOG if k in raw), None)
-
-        except (error.URLError, TimeoutError, json.JSONDecodeError, OSError, KeyError):
-            if use_format:
-                continue   # schema not supported — retry without format
-            return None    # both attempts failed
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib_request.Request(
+        f"{_router_base_url}/v1/chat/completions",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        content = (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip().lower()
+        if content in INTENT_CATALOG:
+            return content
+        return next((k for k in INTENT_CATALOG if k in content), None)
+    except (error.URLError, TimeoutError, json.JSONDecodeError, OSError, KeyError):
+        return None
 
     return None
 

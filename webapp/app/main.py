@@ -345,9 +345,11 @@ def chat_stream(req: ChatRequest):
     tok_queue: _queue.Queue = _queue.Queue()
 
     def _producer():
+        import time as _time
         global _llm_queue_count
         try:
             tok_queue.put(("status", "Analysing your question and querying planning data…"))
+            _t0 = _time.perf_counter()
             sp, grounded_prompt, _ = build_grounded_chat_prompt(
                 BASE_DIR,
                 req.question,
@@ -356,6 +358,8 @@ def chat_stream(req: ChatRequest):
                 req.scope.model_dump(),
                 history=[m.model_dump() for m in req.history],
             )
+            _grounding_ms = int((_time.perf_counter() - _t0) * 1000)
+            print(f"[IFSP] grounding={_grounding_ms}ms q={req.question[:60]!r}", flush=True)
             # Show queue position if LLM is busy with another request
             with _llm_queue_lock:
                 _llm_queue_count += 1
@@ -363,10 +367,16 @@ def chat_stream(req: ChatRequest):
             if position > 1:
                 tok_queue.put(("status", f"Waiting for GPU — {position - 1} request(s) ahead…"))
             _llm_semaphore.acquire()
+            _t1 = _time.perf_counter()
             try:
                 tok_queue.put(("status", "Generating answer…"))
+                first_token = True
                 for chunk in stream_llm(grounded_prompt, sp, model_name=req.llm_model):
+                    if first_token:
+                        print(f"[IFSP] ttft={int((_time.perf_counter()-_t1)*1000)}ms", flush=True)
+                        first_token = False
                     tok_queue.put(("token", chunk))
+                print(f"[IFSP] llm_total={int((_time.perf_counter()-_t1)*1000)}ms", flush=True)
             finally:
                 _llm_semaphore.release()
                 with _llm_queue_lock:

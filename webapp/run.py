@@ -50,6 +50,7 @@ def _warmup_llm() -> None:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # No semaphore — warmup runs independently; model loading happens on the LLM server
         urllib.request.urlopen(req, timeout=180)
         print(f"[IFSP] LLM warmed up ({provider} / {model})")
     except Exception as e:

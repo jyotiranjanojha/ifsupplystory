@@ -563,11 +563,26 @@ def _run_domain_focus_workflow(
     }
 
 
-def _safe_rows(file_path: Path) -> Iterable[dict]:
+# (file_path_str -> (mtime_ns, List[Dict])) — eliminates repeated full-file scans across all workflows
+_ROWS_CACHE: Dict[str, tuple] = {}
+
+
+def _safe_rows(file_path: Path) -> List[dict]:
+    """Return cached rows for file_path; re-reads only when mtime changes."""
+    try:
+        mtime = file_path.stat().st_mtime_ns
+    except OSError:
+        return []
+    cached = _ROWS_CACHE.get(str(file_path))
+    if cached and cached[0] == mtime:
+        return cached[1]
+    rows: List[dict] = []
     with file_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="|")
         for row in reader:
-            yield row
+            rows.append(row)
+    _ROWS_CACHE[str(file_path)] = (mtime, rows)
+    return rows
 
 
 def _list_csv_files(folder: Path) -> List[Path]:
@@ -576,22 +591,39 @@ def _list_csv_files(folder: Path) -> List[Path]:
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".csv"])
 
 
+# (file_path_str -> (mtime_ns, summary_dict)) — avoids full CSV scan on every request
+_FILE_SUMMARY_CACHE: Dict[str, tuple] = {}
+
+
 def _file_summary(file_path: Path) -> Dict:
-    row_count = 0
+    stat = file_path.stat()
+    mtime = stat.st_mtime_ns
+    cached = _FILE_SUMMARY_CACHE.get(str(file_path))
+    if cached and cached[0] == mtime:
+        return cached[1]
+    # Read only the header line — avoid scanning every row on cold start
     columns: List[str] = []
     with file_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle, delimiter="|")
-        for idx, row in enumerate(reader):
-            if idx == 0:
-                columns = row
-            else:
-                row_count += 1
-    return {
+        first_line = handle.readline()
+        if first_line:
+            columns = next(csv.reader([first_line], delimiter="|"), [])
+            # estimate row count: (file_size - header_bytes) / avg_line_bytes
+            avg_line = max(len(first_line), 1)
+            row_count = max(0, int((stat.st_size - len(first_line.encode())) / avg_line))
+        else:
+            row_count = 0
+    result = {
         "file": file_path.name,
         "rows": row_count,
         "columns": columns,
         "column_count": len(columns),
     }
+    _FILE_SUMMARY_CACHE[str(file_path)] = (mtime, result)
+    return result
+
+
+# (base_dir_str -> (fingerprint, inventory_dict)) — dataset_inventory is called on every request
+_INVENTORY_CACHE: Dict[str, tuple] = {}
 
 
 def dataset_inventory(base_dir: Path) -> Dict:
@@ -599,7 +631,14 @@ def dataset_inventory(base_dir: Path) -> Dict:
     output_dir = base_dir / OUTPUT_FOLDER
     input_files = _list_csv_files(input_dir)
     output_files = _list_csv_files(output_dir)
-    return {
+    # fingerprint by sorted filenames + mtimes so cache invalidates when files change
+    fingerprint = "|".join(
+        f"{p.name}:{p.stat().st_mtime_ns}" for p in sorted(input_files + output_files)
+    )
+    cached = _INVENTORY_CACHE.get(str(base_dir))
+    if cached and cached[0] == fingerprint:
+        return cached[1]
+    result = {
         "input_folder": str(input_dir),
         "output_folder": str(output_dir),
         "input_files": [_file_summary(f) for f in input_files],
@@ -607,6 +646,8 @@ def dataset_inventory(base_dir: Path) -> Dict:
         "input_file_count": len(input_files),
         "output_file_count": len(output_files),
     }
+    _INVENTORY_CACHE[str(base_dir)] = (fingerprint, result)
+    return result
 
 
 def _find_file_by_prefix(folder: Path, prefix: str) -> Optional[Path]:
@@ -1241,7 +1282,17 @@ def _parse_solve_version_sort_key(value: Optional[str]) -> Tuple[int, str]:
     return (0, text)
 
 
+# (base_dir_str -> (checked_monotonic, catalog_dict)) — catalog only changes when CSV files change
+_CONTEXT_CATALOG_CACHE: Dict[str, tuple] = {}
+_CONTEXT_CATALOG_TTL = 300  # 5-minute TTL
+
+
 def _collect_context_catalog(base_dir: Path) -> Dict:
+    import time as _time
+    cache_key = str(base_dir)
+    cached = _CONTEXT_CATALOG_CACHE.get(cache_key)
+    if cached and (_time.monotonic() - cached[0]) < _CONTEXT_CATALOG_TTL:
+        return cached[1]
     output_dir = base_dir / OUTPUT_FOLDER
     catalog = {}
 
@@ -1265,6 +1316,7 @@ def _collect_context_catalog(base_dir: Path) -> Dict:
                         "sort_key": sort_key,
                     }
 
+    _CONTEXT_CATALOG_CACHE[cache_key] = (_time.monotonic(), catalog)
     return catalog
 
 
@@ -4623,7 +4675,29 @@ def run_knowledge_graph(base_dir: Path, week_id: Optional[str], scenario_id: Opt
     }
 
 
+_INSIGHTS_CACHE: Dict[str, tuple] = {}
+_INSIGHTS_TTL = 300  # 5-minute TTL
+
+
 def run_insights(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    base_scenario_id: Optional[str],
+    compare_scenario_id: Optional[str],
+    scope: Dict,
+) -> Dict:
+    import time as _time
+    cache_key = f"{base_dir}|{week_id}|{scenario_id}|{base_scenario_id}|{compare_scenario_id}|{scope.get('site')}"
+    cached = _INSIGHTS_CACHE.get(cache_key)
+    if cached and (_time.monotonic() - cached[0]) < _INSIGHTS_TTL:
+        return cached[1]
+    result = _run_insights_impl(base_dir, week_id, scenario_id, base_scenario_id, compare_scenario_id, scope)
+    _INSIGHTS_CACHE[cache_key] = (_time.monotonic(), result)
+    return result
+
+
+def _run_insights_impl(
     base_dir: Path,
     week_id: Optional[str],
     scenario_id: Optional[str],
@@ -5911,6 +5985,7 @@ def build_grounded_chat_prompt(
     Run workflow analysis + RAG + grounding and return (system_prompt, grounded_prompt, meta).
     No LLM call happens here — pure data gathering, safe to run before streaming.
     """
+    import time as _time
     q = (question or "").strip()
 
     parsed_command = _parse_chat_command(q)
@@ -5924,29 +5999,57 @@ def build_grounded_chat_prompt(
         effective_week = override.get("week_id", effective_week)
         effective_scenario = override.get("scenario_id", effective_scenario)
         effective_scope = override.get("scope", effective_scope)
+        context = _resolve_context(base_dir, effective_week, effective_scenario)
+        grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
+        rag_evidence = None
     else:
-        workflow_payload = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
+        import concurrent.futures as _cf
 
-    context = _resolve_context(base_dir, effective_week, effective_scenario)
-    grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
+        # workflow, grounding+context, and RAG are independent — run all three in parallel
+        context_holder: Dict = {}
 
-    rag_evidence = None
-    try:
-        if LLM_CONFIG["provider"] == "openvino":
-            from .rag_openvino import get_openvino_rag_status, query_openvino_rag
-            if get_openvino_rag_status(base_dir).get("status") == "ready":
-                rag_evidence = query_openvino_rag(base_dir, q, week_id=context.get("week_id"),
-                                                  scenario_id=context.get("scenario_id"), top_k=6)
-        else:
-            ensure_rag_index(base_dir, refresh_hours=24)
-            item_hint = _resolve_chat_item(q, history).get("selected_item")
-            rag_evidence = query_rag(base_dir, q, top_k=6,
-                                     week_id=context.get("week_id"),
-                                     scenario_id=context.get("scenario_id"),
-                                     site=(effective_scope or {}).get("site"),
-                                     item_id=item_hint)
-    except Exception:
-        pass
+        def _run_workflow():
+            _tw = _time.perf_counter()
+            result = _run_chat_workflow_if_needed(base_dir, q, week_id, scenario_id, effective_scope, history=history)
+            print(f"[IFSP]   workflow={int((_time.perf_counter()-_tw)*1000)}ms intent={result.get('workflow')}", flush=True)
+            return result
+
+        def _run_grounding():
+            _tg = _time.perf_counter()
+            ctx = _resolve_context(base_dir, effective_week, effective_scenario)
+            context_holder["context"] = ctx
+            g = _build_chat_grounding(base_dir, q, ctx, effective_scope)
+            print(f"[IFSP]   grounding_build={int((_time.perf_counter()-_tg)*1000)}ms", flush=True)
+            return g
+
+        def _run_rag():
+            _tr = _time.perf_counter()
+            try:
+                if LLM_CONFIG["provider"] == "openvino":
+                    from .rag_openvino import get_openvino_rag_status, query_openvino_rag
+                    if get_openvino_rag_status(base_dir).get("status") == "ready":
+                        # context may not be ready yet — use raw week/scenario
+                        return query_openvino_rag(base_dir, q, week_id=week_id, scenario_id=scenario_id, top_k=6)
+                    return None
+                item_hint = _resolve_chat_item(q, history).get("selected_item")
+                result = query_rag(base_dir, q, top_k=6,
+                                   week_id=week_id, scenario_id=scenario_id,
+                                   site=(effective_scope or {}).get("site"),
+                                   item_id=item_hint)
+                print(f"[IFSP]   rag={int((_time.perf_counter()-_tr)*1000)}ms", flush=True)
+                return result
+            except Exception:
+                return None
+
+        with _cf.ThreadPoolExecutor(max_workers=3) as _pool:
+            _f_wf  = _pool.submit(_run_workflow)
+            _f_gr  = _pool.submit(_run_grounding)
+            _f_rag = _pool.submit(_run_rag)
+            workflow_payload = _f_wf.result()
+            grounding        = _f_gr.result()
+            rag_evidence     = _f_rag.result()
+
+        context = context_holder.get("context") or _resolve_context(base_dir, effective_week, effective_scenario)
 
     workflow_name = workflow_payload.get("workflow") or "Conversational Copilot"
     workflow_result = workflow_payload.get("result")

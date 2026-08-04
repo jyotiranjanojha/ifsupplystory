@@ -62,7 +62,17 @@ def _tokenize(text: str) -> List[str]:
     return re.findall(r"[a-z0-9_]{2,}", (text or "").lower())
 
 
+# (base_dir_str -> (fingerprint_dict, checked_monotonic)) — avoids 38 os.stat() calls per query
+_FINGERPRINT_CACHE: Dict[str, tuple] = {}
+_FINGERPRINT_TTL_SECS = 300  # re-check every 5 minutes
+
+
 def _build_fingerprint(base_dir: Path) -> Dict[str, Dict[str, int]]:
+    import time as _time
+    cache_key = str(base_dir)
+    cached = _FINGERPRINT_CACHE.get(cache_key)
+    if cached and (_time.monotonic() - cached[1]) < _FINGERPRINT_TTL_SECS:
+        return cached[0]
     fingerprint: Dict[str, Dict[str, int]] = {}
     for family, folder_name in [("input", INPUT_FOLDER), ("output", OUTPUT_FOLDER)]:
         folder = base_dir / folder_name
@@ -73,6 +83,7 @@ def _build_fingerprint(base_dir: Path) -> Dict[str, Dict[str, int]]:
                 "size": int(stat.st_size),
                 "mtime_ns": int(stat.st_mtime_ns),
             }
+    _FINGERPRINT_CACHE[cache_key] = (fingerprint, _time.monotonic())
     return fingerprint
 
 
@@ -84,11 +95,21 @@ def _faiss_path(base_dir: Path) -> Path:
     return base_dir / RAG_FOLDER / "vectors.faiss"
 
 
+# (path -> (mtime_ns, parsed_dict)) — avoids re-reading the large JSON on every request
+_INDEX_CACHE: Dict[str, tuple] = {}
+
+
 def _load_index(index_path: Path) -> Optional[Dict]:
     if not index_path.exists():
         return None
     try:
-        return json.loads(index_path.read_text(encoding="utf-8"))
+        mtime = index_path.stat().st_mtime_ns
+        cached = _INDEX_CACHE.get(str(index_path))
+        if cached and cached[0] == mtime:
+            return cached[1]
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        _INDEX_CACHE[str(index_path)] = (mtime, data)
+        return data
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -96,6 +117,7 @@ def _load_index(index_path: Path) -> Optional[Dict]:
 def _save_index(index_path: Path, payload: Dict) -> None:
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    _INDEX_CACHE.pop(str(index_path), None)  # invalidate cache after write
 
 
 def _is_stale(built_at_iso: Optional[str], refresh_hours: int) -> bool:
