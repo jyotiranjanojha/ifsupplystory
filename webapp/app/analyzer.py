@@ -5872,6 +5872,33 @@ def _build_item_demand_supply_reply(workflow_result: Dict) -> Optional[str]:
     )
 
 
+_RC_KEEP_KEYS = {
+    "Item", "Demand vs Supply Stats", "Supply Evidence", "Constraint Signals",
+    "Confirmed Findings", "Root Causes", "Explainability Scope",
+    "Demand and Supply Summary", "Lineage and Linkage Findings",
+    "Planned Supply Evidence", "Constraint and Exception Analysis",
+    "Comparison Scope", "Top Delta Metrics (ranked)", "KPI Summary",
+    "fill_rate_trend_workweek", "demand_supply_trend_workweek", "met_unmet_split",
+    "capacity_trend_workweek", "kpi_summary",
+}
+_VERBOSE_KEYS = {"Reference", "Domain Focus Assessment", "Cause Attribution (BY ESP Expert View)",
+                 "Hypotheses and Missing Evidence", "router_metadata", "Evidence Used"}
+
+def _trim_workflow_result_for_prompt(result: Dict) -> Dict:
+    """Remove nested verbose sections that bloat the prompt without adding answer quality."""
+    if not isinstance(result, dict):
+        return result
+    trimmed = {}
+    for k, v in result.items():
+        if k in _VERBOSE_KEYS:
+            continue
+        if isinstance(v, dict):
+            # Recursively trim one more level
+            v = {ik: iv for ik, iv in v.items() if ik not in _VERBOSE_KEYS}
+        trimmed[k] = v
+    return trimmed
+
+
 def build_grounded_chat_prompt(
     base_dir: Path,
     question: str,
@@ -5942,14 +5969,18 @@ def build_grounded_chat_prompt(
     prompt_sections.append(f"## Resolved Planning Context\nWeek: {context.get('week_id')} | Scenario: {context.get('scenario_id')}")
 
     if workflow_result is not None:
+        # Strip deeply nested or verbose keys to keep prompt under ~1500 tokens
+        trimmed = _trim_workflow_result_for_prompt(workflow_result)
         prompt_sections.append(
-            f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(workflow_result, ensure_ascii=True)}"
+            f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(trimmed, ensure_ascii=True)}"
         )
 
     if rag_evidence is not None:
-        hits = (rag_evidence or {}).get("hits", [])[:4]
+        hits = (rag_evidence or {}).get("hits", [])[:3]
         if hits:
-            prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(hits, ensure_ascii=True)}")
+            # Only include essential fields from each RAG hit
+            slim_hits = [{"table": h.get("table"), "text": (h.get("text") or h.get("snippet", ""))[:200]} for h in hits]
+            prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(slim_hits, ensure_ascii=True)}")
 
     if workflow_result is None:
         trimmed_grounding = {
