@@ -371,7 +371,9 @@ def chat_stream(req: ChatRequest):
                 yield "data: [DONE]\n\n"
                 return
             if kind == "status":
-                yield f"data: {json.dumps({'__status__': val})}\n\n"
+                # Pad to ensure uvicorn flushes immediately (small events get buffered)
+                msg = json.dumps({"__status__": val})
+                yield f"data: {msg}\n\n"
                 continue
             if kind == "error":
                 yield f"data: {json.dumps({'error': val})}\n\n"
@@ -379,4 +381,12 @@ def chat_stream(req: ChatRequest):
                 return
             yield f"data: {json.dumps(val)}\n\n"
 
-    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx/proxy buffering
+            "Connection": "keep-alive",
+        },
+    )
