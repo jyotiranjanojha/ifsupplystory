@@ -2122,7 +2122,11 @@ async function submitChat() {
           if (payload === '[DONE]') { buf = ''; break; }
           try {
             const token = JSON.parse(payload);
-            if (typeof token === 'string') {
+            if (token && typeof token === 'object' && token.__status__) {
+              // Phase status message — show instead of elapsed counter
+              chatMessages[streamIdx].content = `▍  ${token.__status__}`;
+              renderChatThread();
+            } else if (typeof token === 'string') {
               if (!firstToken) { firstToken = true; clearInterval(elapsedTimer); }
               fullText += token;
               if (!rafPending) {

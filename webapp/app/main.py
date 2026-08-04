@@ -340,6 +340,7 @@ def chat_stream(req: ChatRequest):
     def _producer():
         try:
             # Build the fully grounded prompt (RAG + workflow + context) before streaming
+            tok_queue.put(("status", "Analysing your question and querying planning data…"))
             sp, grounded_prompt, _ = build_grounded_chat_prompt(
                 BASE_DIR,
                 req.question,
@@ -348,6 +349,7 @@ def chat_stream(req: ChatRequest):
                 req.scope.model_dump(),
                 history=[m.model_dump() for m in req.history],
             )
+            tok_queue.put(("status", "Generating answer…"))
             for chunk in stream_llm(grounded_prompt, sp, model_name=req.llm_model):
                 tok_queue.put(("token", chunk))
         except Exception as exc:
@@ -367,6 +369,9 @@ def chat_stream(req: ChatRequest):
             if kind == "done":
                 yield "data: [DONE]\n\n"
                 return
+            if kind == "status":
+                yield f"data: {json.dumps({'__status__': val})}\n\n"
+                continue
             if kind == "error":
                 yield f"data: {json.dumps({'error': val})}\n\n"
                 yield "data: [DONE]\n\n"
