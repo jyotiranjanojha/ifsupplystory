@@ -13,6 +13,7 @@ from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
 from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
 from .rag import build_rag_index, get_rag_status, query_rag
+from .rag_openvino import build_openvino_rag_index, export_embedding_model, get_openvino_rag_status, query_openvino_rag
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -129,6 +130,33 @@ def rag_query(req: RagQueryRequest):
         scenario_id=req.scenario_id,
         site=req.scope.site,
         item_id=req.item_id,
+    )
+
+
+@app.get("/api/rag/openvino/status")
+def rag_openvino_status():
+    return get_openvino_rag_status(BASE_DIR)
+
+
+@app.post("/api/rag/openvino/export-embedding")
+def rag_openvino_export_embedding():
+    """Export bge-small-en-v1.5 to OpenVINO IR (run once before first reindex)."""
+    return export_embedding_model()
+
+
+@app.post("/api/rag/openvino/reindex")
+def rag_openvino_reindex(force: bool = False):
+    return build_openvino_rag_index(BASE_DIR, force=force)
+
+
+@app.post("/api/rag/openvino/query")
+def rag_openvino_query(req: RagQueryRequest):
+    return query_openvino_rag(
+        BASE_DIR,
+        req.question,
+        week_id=req.week_id,
+        scenario_id=req.scenario_id,
+        top_k=req.top_k,
     )
 
 
