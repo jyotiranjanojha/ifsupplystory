@@ -8,3 +8,6 @@ venv/
 env/
 .pytest_cache/
 .rag/
+embedding_model/
+_test_output.txt
+test_nollama.py
