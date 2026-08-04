@@ -55,6 +55,9 @@ def _warmup_llm() -> None:
     except Exception as e:
         print(f"[IFSP] LLM warmup skipped: {e}")
 
+# Load .env BEFORE importing the app so module-level env vars (NOLLAMA_MODEL, etc.) are set correctly
+_load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 try:
     from webapp.app.main import app as fastapi_app
 except ModuleNotFoundError:
