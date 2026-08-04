@@ -21,7 +21,7 @@ OUTPUT_FOLDER = "by_output"
 # =====================================================================
 # LLM PROVIDER CONFIGURATION (Production-Ready)
 # =====================================================================
-# Supported providers: 'nollama', 'openai', 'custom', 'openvino'
+# Supported providers: 'nollama', 'openai', 'anthropic', 'custom', 'openvino'
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "nollama").lower()
 
 # Nollama Configuration (Local, OpenAI-compatible v1 API)
@@ -36,6 +36,13 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
 OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4")
 OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4-vision-preview")
+
+# Anthropic Configuration
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+ANTHROPIC_JUDGE_MODEL = os.getenv("ANTHROPIC_JUDGE_MODEL", "claude-3-5-haiku-20241022")
+ANTHROPIC_VISION_MODEL = os.getenv("ANTHROPIC_VISION_MODEL", "claude-3-5-sonnet-20241022")
 
 # Generic OpenAI-compatible API Configuration (for other providers)
 CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY", "")
@@ -97,9 +104,22 @@ def _get_active_llm_config():
             "provider": "openai",
             "base_url": OPENAI_BASE_URL,
             "api_key": OPENAI_API_KEY,
+            "auth_header": "Authorization",  # Bearer token
             "model": OPENAI_MODEL,
             "judge_model": OPENAI_JUDGE_MODEL,
             "vision_model": OPENAI_VISION_MODEL,
+        }
+    elif LLM_PROVIDER == "anthropic":
+        if not ANTHROPIC_API_KEY:
+            raise ValueError("ANTHROPIC_API_KEY not set. Required for Anthropic provider.")
+        return {
+            "provider": "anthropic",
+            "base_url": ANTHROPIC_BASE_URL,
+            "api_key": ANTHROPIC_API_KEY,
+            "auth_header": "x-api-key",  # Anthropic uses x-api-key, not Bearer
+            "model": ANTHROPIC_MODEL,
+            "judge_model": ANTHROPIC_JUDGE_MODEL,
+            "vision_model": ANTHROPIC_VISION_MODEL,
         }
     elif LLM_PROVIDER == "custom":
         if not CUSTOM_LLM_BASE_URL or not CUSTOM_LLM_MODEL:
@@ -108,6 +128,7 @@ def _get_active_llm_config():
             "provider": "custom",
             "base_url": CUSTOM_LLM_BASE_URL,
             "api_key": CUSTOM_LLM_API_KEY,
+            "auth_header": "Authorization",  # assume Bearer by default for custom
             "model": CUSTOM_LLM_MODEL,
             "judge_model": CUSTOM_LLM_MODEL,
             "vision_model": CUSTOM_LLM_MODEL,
@@ -132,6 +153,7 @@ def _get_active_llm_config():
             "provider": "nollama",
             "base_url": NOLLAMA_BASE_URL,
             "api_key": None,
+            "auth_header": "Authorization",
             "model": NOLLAMA_MODEL,
             "judge_model": NOLLAMA_JUDGE_MODEL,
             "vision_model": NOLLAMA_VISION_MODEL,
@@ -1844,7 +1866,10 @@ def _ollama_chat_with_model(
     # Prepare headers
     headers = {"Content-Type": "application/json"}
     if LLM_CONFIG.get("api_key"):
-        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+        auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
+        headers[auth_hdr] = f"Bearer {LLM_CONFIG['api_key']}" if auth_hdr == "Authorization" else LLM_CONFIG['api_key']
+    if LLM_CONFIG.get("provider") == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     
     req = request.Request(
         endpoint,
@@ -1976,7 +2001,10 @@ def list_ollama_models() -> Dict:
     # Try to fetch models via v1 API
     headers = {"Content-Type": "application/json"}
     if LLM_CONFIG.get("api_key"):
-        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+        auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
+        headers[auth_hdr] = f"Bearer {LLM_CONFIG['api_key']}" if auth_hdr == "Authorization" else LLM_CONFIG['api_key']
+    if LLM_CONFIG.get("provider") == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     
     req = request.Request(
         f"{base_url}/v1/models",
@@ -2036,7 +2064,10 @@ def list_ollama_models() -> Dict:
     # For other providers (Nollama, custom), try to fetch models via v1 API
     headers = {"Content-Type": "application/json"}
     if LLM_CONFIG.get("api_key"):
-        headers["Authorization"] = f"Bearer {LLM_CONFIG['api_key']}"
+        auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
+        headers[auth_hdr] = f"Bearer {LLM_CONFIG['api_key']}" if auth_hdr == "Authorization" else LLM_CONFIG['api_key']
+    if LLM_CONFIG.get("provider") == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     
     req = request.Request(
         f"{base_url}/v1/models",
@@ -4155,10 +4186,12 @@ def _call_vision_ollama(question: str, image_base64: str) -> Optional[str]:
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     
-    # Add API key if configured (for OpenAI and custom providers)
     api_key = LLM_CONFIG.get("api_key")
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        auth_hdr = LLM_CONFIG.get("auth_header", "Authorization")
+        headers[auth_hdr] = f"Bearer {api_key}" if auth_hdr == "Authorization" else api_key
+    if LLM_CONFIG.get("provider") == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     
     req = request.Request(
         f"{LLM_CONFIG['base_url']}/v1/chat/completions",
