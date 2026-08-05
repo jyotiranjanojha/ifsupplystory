@@ -1,0 +1,38 @@
+name: Push Docker Image to Harbor
+
+on:
+  push:
+    branches:
+      - main  # Triggers the workflow when code is pushed to the main branch
+
+permissions:
+  contents: read
+
+env:
+  HARBOR_REGISTRY: amr-registry-pre.caas.intel.com       # Replace with your Harbor URL
+  HARBOR_PROJECT: if-pdh-ai-assist           # Replace with your Harbor project name
+  IMAGE_NAME: ifsp-webapp                    # Replace with your desired image name
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Log in to Harbor
+        run: |
+          echo "${{ secrets.HARBOR_PASSWORD }}" | docker login "${{ env.HARBOR_REGISTRY }}" --username "${{ secrets.HARBOR_USERNAME }}" --password-stdin
+
+      - name: Build and push Docker image
+        run: |
+          docker build -f webapp/Dockerfile -t "${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest" -t "${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" .
+          docker push "${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
