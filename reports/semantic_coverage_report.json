@@ -1,0 +1,39 @@
+{
+  "total_test_cases": 240,
+  "coverage": {
+    "expected_intent": {
+      "count": 240,
+      "pct": 100.0
+    },
+    "expected_entities": {
+      "count": 240,
+      "pct": 100.0
+    },
+    "expected_files": {
+      "count": 240,
+      "pct": 100.0
+    },
+    "expected_kpis": {
+      "count": 240,
+      "pct": 100.0
+    }
+  },
+  "categories": {
+    "Inventory": 40,
+    "Forecast": 40,
+    "Capacity Constraints": 40,
+    "Solver Decisions": 40,
+    "Root Cause Analysis": 40,
+    "Recommendations": 40
+  },
+  "unique_expected_intents": [
+    "compare",
+    "conversational",
+    "domain_fulfillment",
+    "domain_generation",
+    "insights",
+    "item_demand_supply",
+    "root_cause",
+    "sql_query"
+  ]
+}

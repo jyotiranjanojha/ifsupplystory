@@ -1,0 +1,6 @@
+Semantic Regression Test Summary
+Total: 6
+Passed: 6
+Failures: 0
+Errors: 0
+Skipped: 0

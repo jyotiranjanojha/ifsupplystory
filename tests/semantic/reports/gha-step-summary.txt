@@ -1,0 +1,11 @@
+Semantic Regression Report
+
+Tests Run: 6
+Passed: 6
+Failed: 0
+
+Intent Accuracy: 100.00%
+Entity Accuracy: 100.00%
+File Mapping Accuracy: 100.00%
+KPI Accuracy: 100.00%
+Hallucination Rate: 0.00%
