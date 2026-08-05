@@ -147,68 +147,123 @@ For provider-specific setup details, see LLM_PROVIDER_GUIDE.md.
 
 ```mermaid
 flowchart LR
-    Q[Planner Query] --> I[Intent + Entity Extraction]
-    I --> S[Semantic Retrieval Plan]
-    S --> D[Deterministic Data Retrieval]
-    D --> K[KPI Engine]
-    K --> R[Rule and Constraint Engine]
-    R --> G[Grounding and Citations]
-    G --> L[LLM Explanation]
-    L --> O[Final Auditable Response]
+  %% User to Answer lane
+  Q([Planner Question]) --> I[Intent and Entity Detection]
+  I --> S[Semantic Retrieval Plan]
+  S --> D[Deterministic Data Retrieval]
 
-    D --> IN[(by_input CSV snapshots)]
-    D --> OUT[(by_output CSV snapshots)]
-    D --> RAG[(.rag index)]
+  %% Deterministic reasoning lane
+  D --> K[KPI Engine]
+  D --> RU[Rule and Constraint Engine]
+  K --> G[Evidence Grounding and Citations]
+  RU --> G
+
+  %% Explanation lane
+  G --> L[LLM Narrative Builder]
+  L --> O([Grounded Final Response])
+
+  %% Data dependencies
+  D -. reads .-> IN[(by_input snapshots)]
+  D -. reads .-> OUT[(by_output snapshots)]
+  D -. retrieves .-> RAG[(RAG index)]
+
+  classDef user fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.5px,color:#0f172a;
+  classDef plan fill:#ecfeff,stroke:#0e7490,stroke-width:1.5px,color:#0f172a;
+  classDef deterministic fill:#f0fdf4,stroke:#15803d,stroke-width:1.5px,color:#0f172a;
+  classDef explain fill:#fff7ed,stroke:#c2410c,stroke-width:1.5px,color:#0f172a;
+  classDef data fill:#f8fafc,stroke:#475569,stroke-dasharray: 4 2,color:#0f172a;
+
+  class Q,O user;
+  class I,S plan;
+  class D,K,RU,G deterministic;
+  class L explain;
+  class IN,OUT,RAG data;
 ```
 
 ### Runtime Components
 
 ```mermaid
 flowchart TB
-    subgraph Client
+    subgraph C[Client Layer]
       UI[Web UI]
-      APIClient[Programmatic Clients]
+      APIClient[API Clients]
     end
 
-    subgraph Service[FastAPI Service]
-      Routes[main.py routes]
-      Orchestrator[analyzer.py]
-      Router[router_agent.py]
-      SQLAgent[text_to_sql_agent.py]
-      BomGraph[langgraph_bom.py]
-      Grounding[grounding_engine.py]
+    subgraph SVC[Application Service Layer]
+      Routes[API Routes and Middleware]
+      Orchestrator[Request Orchestrator]
+      Router[Intent Router]
+      SQLAgent[Text-to-SQL Agent]
+      BomGraph[BOM Explainability Graph]
+      Grounding[Grounding Engine]
     end
 
-    subgraph Deterministic
-      KPIEngine[kpi_engine.py]
+    subgraph DET[Deterministic Logic Layer]
+      KPIEngine[KPI Engine]
       Validation[Validation Checks]
       Policy[Constraint Attribution Policy]
     end
 
-    subgraph Data
-      InputCSV[by_input]
-      OutputCSV[by_output]
-      RagIndex[.rag]
+    subgraph DS[Data Layer]
+      InputCSV[(by_input snapshots)]
+      OutputCSV[(by_output snapshots)]
+      RagIndex[(RAG index)]
     end
 
-    subgraph LLM
+    subgraph M[Model Layer]
       Provider[OpenAI or Azure or Anthropic or Nollama or OpenVINO]
     end
 
-    UI --> Routes
-    APIClient --> Routes
-    Routes --> Orchestrator
-    Orchestrator --> Router
-    Orchestrator --> SQLAgent
-    Orchestrator --> BomGraph
-    Orchestrator --> Grounding
-    Orchestrator --> KPIEngine
-    Orchestrator --> Validation
-    Orchestrator --> Policy
-    Orchestrator --> InputCSV
-    Orchestrator --> OutputCSV
-    Orchestrator --> RagIndex
-    Orchestrator --> Provider
+    UI -->|planner requests| Routes
+    APIClient -->|service calls| Routes
+    Routes -->|dispatch| Orchestrator
+
+    Orchestrator -->|route by intent| Router
+    Orchestrator -->|SQL workflow| SQLAgent
+    Orchestrator -->|BOM drill workflow| BomGraph
+    Orchestrator -->|assemble evidence| Grounding
+
+    Orchestrator -->|deterministic KPIs| KPIEngine
+    Orchestrator -->|data quality gates| Validation
+    Orchestrator -->|constraint logic| Policy
+
+    Orchestrator -->|read input master data| InputCSV
+    Orchestrator -->|read solver outputs| OutputCSV
+    Orchestrator -->|retrieve context| RagIndex
+    Orchestrator -->|generate explanation| Provider
+
+    classDef layerClient fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.2px,color:#0f172a;
+    classDef layerService fill:#ecfeff,stroke:#0e7490,stroke-width:1.2px,color:#0f172a;
+    classDef layerDet fill:#f0fdf4,stroke:#15803d,stroke-width:1.2px,color:#0f172a;
+    classDef layerData fill:#f8fafc,stroke:#475569,stroke-width:1.2px,color:#0f172a;
+    classDef layerModel fill:#fff7ed,stroke:#c2410c,stroke-width:1.2px,color:#0f172a;
+
+    class UI,APIClient layerClient;
+    class Routes,Orchestrator,Router,SQLAgent,BomGraph,Grounding layerService;
+    class KPIEngine,Validation,Policy layerDet;
+    class InputCSV,OutputCSV,RagIndex layerData;
+    class Provider layerModel;
+```
+
+### Executive View (One-Page)
+
+```mermaid
+flowchart LR
+  A([Planner Question]) --> B[Understand Intent]
+  B --> C[Collect Planning Evidence]
+  C --> D[Run Deterministic Checks]
+  D --> E[Generate Grounded Explanation]
+  E --> F([Decision-Ready Answer])
+
+  C -. uses .-> I[(Input Snapshots)]
+  C -. uses .-> O[(Output Snapshots)]
+  C -. uses .-> R[(RAG Context)]
+
+  classDef exec fill:#f8fafc,stroke:#0f172a,stroke-width:1.2px,color:#0f172a;
+  classDef data fill:#ecfeff,stroke:#0e7490,stroke-dasharray: 4 2,color:#0f172a;
+
+  class A,B,C,D,E,F exec;
+  class I,O,R data;
 ```
 
 ---
