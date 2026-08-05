@@ -53,6 +53,8 @@ Built for planning teams that need explainability, traceability, and operational
 
 ## Quick Navigation
 
+- [Tech Stack](#tech-stack)
+- [Model Support](#model-support)
 - [Architecture](#architecture)
 - [Core Components](#core-components)
 - [Data Sources](#data-sources)
@@ -75,6 +77,67 @@ Built for planning teams that need explainability, traceability, and operational
 | Data | BY ESP CSV snapshots (by_input and by_output) |
 | Explainability | Deterministic KPI and rule engines plus grounded LLM narratives |
 | Quality Gate | Semantic regression with CI thresholds |
+
+---
+
+## Tech Stack
+
+<p>
+  <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/Uvicorn-111111?logo=uvicorn&logoColor=white" alt="Uvicorn" />
+  <img src="https://img.shields.io/badge/Pandas-150458?logo=pandas&logoColor=white" alt="Pandas" />
+  <img src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white" alt="NumPy" />
+  <img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&logoColor=white" alt="Pydantic" />
+  <img src="https://img.shields.io/badge/pytest-0A9EDC?logo=pytest&logoColor=white" alt="pytest" />
+  <img src="https://img.shields.io/badge/HTML-E34F26?logo=html5&logoColor=white" alt="HTML" />
+  <img src="https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=111111" alt="JavaScript" />
+</p>
+
+| Layer | Technology | Icon |
+|---|---|---|
+| Backend Framework | FastAPI | <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" /> |
+| Runtime Language | Python 3.11+ | <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python" /> |
+| API Server | Uvicorn | <img src="https://img.shields.io/badge/Uvicorn-111111?logo=uvicorn&logoColor=white" alt="Uvicorn" /> |
+| Data Processing | Pandas and NumPy | <img src="https://img.shields.io/badge/Pandas-150458?logo=pandas&logoColor=white" alt="Pandas" /> <img src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white" alt="NumPy" /> |
+| Validation Models | Pydantic | <img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&logoColor=white" alt="Pydantic" /> |
+| Workflow Orchestration | LangGraph | <img src="https://img.shields.io/badge/LangGraph-0B132B?logoColor=white" alt="LangGraph" /> |
+| Testing | pytest | <img src="https://img.shields.io/badge/pytest-0A9EDC?logo=pytest&logoColor=white" alt="pytest" /> |
+| Semantic Quality Gate | Custom semantic regression framework | <img src="https://img.shields.io/badge/Semantic%20Regression-1F2937" alt="Semantic Regression" /> |
+| Vector and Retrieval | FAISS-based vector storage and RAG indexing | <img src="https://img.shields.io/badge/FAISS-1D4ED8" alt="FAISS" /> <img src="https://img.shields.io/badge/RAG-334155" alt="RAG" /> |
+| Frontend | HTML templates with JavaScript client | <img src="https://img.shields.io/badge/HTML-E34F26?logo=html5&logoColor=white" alt="HTML" /> <img src="https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=111111" alt="JavaScript" /> |
+
+## Model Support
+
+The service supports multiple LLM providers for planner-facing explanation workflows.
+
+### Supported Providers
+
+| Provider | Typical Use |
+|---|---|
+| nollama | Local OpenAI-compatible inference |
+| openai | Hosted OpenAI models |
+| azure | Azure OpenAI deployments |
+| anthropic | Claude-based hosted inference |
+| openvino | Local optimized inference workflows |
+| custom | Organization-specific adapter path |
+
+### Model Configuration
+
+Set provider and model in .env. Example for local Nollama:
+
+```dotenv
+LLM_PROVIDER=nollama
+NOLLAMA_BASE_URL=http://localhost:8000
+NOLLAMA_MODEL=Qwen2.5-Coder-7B-Instruct@GPU
+```
+
+Runtime checks:
+
+- GET /api/llm/models returns discoverable models
+- GET /api/config returns active runtime configuration
+
+For provider-specific setup details, see LLM_PROVIDER_GUIDE.md.
 
 ---
 
@@ -152,16 +215,16 @@ flowchart TB
 
 ## Core Components
 
-| Area | Responsibility | Primary File |
-|---|---|---|
-| API Layer | Endpoints, middleware, runtime diagnostics | webapp/app/main.py |
-| Orchestration | Intent-driven workflow routing and response assembly | webapp/app/analyzer.py |
-| Intent Router | Intent catalog, entities, confidence handling | webapp/app/router_agent.py |
-| KPI Engine | Deterministic KPI calculations and checks | webapp/app/kpi_engine.py |
-| BOM Workflow | Multi-step BOM traversal and evidence synthesis | webapp/app/langgraph_bom.py |
-| SQL Agent | NL-to-SQL pipeline with validation and retries | webapp/app/text_to_sql_agent.py |
-| Grounding | Evidence envelope, citations, confidence mapping | webapp/app/grounding_engine.py |
-| RAG | Indexing and retrieval over planning assets | webapp/app/rag.py |
+| Area | Responsibility |
+|---|---|
+| API Layer | Endpoints, middleware, runtime diagnostics |
+| Orchestration | Intent-driven workflow routing and response assembly |
+| Intent Router | Intent catalog, entities, confidence handling |
+| KPI Engine | Deterministic KPI calculations and checks |
+| BOM Workflow | Multi-step BOM traversal and evidence synthesis |
+| SQL Agent | NL-to-SQL pipeline with validation and retries |
+| Grounding | Evidence envelope, citations, confidence mapping |
+| RAG | Indexing and retrieval over planning assets |
 
 ---
 
@@ -389,29 +452,27 @@ python tests/semantic/run_semantic_regression.py --update-snapshots
 
 ## Project Structure
 
-```text
-ifspstory/
-  README.md
-  BY_ESP_QUERY_CATALOG.csv
-  by_input/
-  by_output/
-  docs/
-  tests/
-  webapp/
-    run.py
-    requirements.txt
-    app/
-      main.py
-      analyzer.py
-      router_agent.py
-      kpi_engine.py
-      langgraph_bom.py
-      text_to_sql_agent.py
-      rag.py
-      grounding_engine.py
-      templates/
-      static/
-```
+This repository is organized into a few easy-to-understand areas:
+
+| Folder or File | What It Is For |
+|---|---|
+| README.md | Main guide to understand and run the project |
+| BY_ESP_QUERY_CATALOG.csv | Reference list of planning query patterns |
+| by_input | Input planning data snapshots (what goes into planning) |
+| by_output | Output planning snapshots (what comes out of planning) |
+| docs | Deep-dive documentation and architecture notes |
+| tests | Automated checks to confirm quality and correctness |
+| webapp | The actual application (API service plus web interface) |
+
+Inside webapp:
+
+| Folder or File | What It Is For |
+|---|---|
+| run.py | Starts the application |
+| requirements.txt | Python dependencies needed to run |
+| app | Core backend logic and APIs |
+| app/templates | Web page templates |
+| app/static | Frontend assets (JavaScript, images, styles) |
 
 ---
 
