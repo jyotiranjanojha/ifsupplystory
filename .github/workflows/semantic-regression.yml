@@ -1,0 +1,74 @@
+name: semantic-regression
+
+on:
+  pull_request:
+    branches: ["main", "develop"]
+  push:
+    branches: ["main", "develop"]
+
+jobs:
+  semantic-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: .
+      SEMANTIC_MODE: legacy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r webapp/requirements.txt
+          python -m pip install pytest
+
+      - name: Run semantic regression framework gate
+        run: |
+          mkdir -p reports
+          python tests/semantic/run_semantic_regression.py --json-report reports/semantic_report.json --html-report reports/semantic_report.html
+
+      - name: Run semantic regression pytest suite
+        id: semantic_pytest
+        continue-on-error: true
+        run: |
+          mkdir -p tests/semantic/reports
+          set -o pipefail
+          pytest tests/semantic --junitxml=tests/semantic/reports/semantic-junit.xml -rA 2>&1 | tee tests/semantic/reports/semantic-console.log
+
+      - name: Generate semantic console summary
+        if: always()
+        run: |
+          python tests/semantic/ci_utils.py --junit tests/semantic/reports/semantic-junit.xml --summary-out tests/semantic/reports/semantic-summary.txt --semantic-report reports/semantic_report.json --gha-summary-out "$GITHUB_STEP_SUMMARY"
+
+      - name: Run workflow utility unit tests
+        run: |
+          pytest -q tests/test_semantic_ci_utils.py tests/test_semantic_snapshot_framework.py
+
+      - name: Enforce semantic test success
+        if: always()
+        run: |
+          if [ "${{ steps.semantic_pytest.outcome }}" != "success" ]; then
+            echo "Semantic regression pytest suite failed. See semantic-console.log and semantic-junit.xml artifacts for details."
+            exit 1
+          fi
+
+      - name: Upload semantic regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-regression-reports
+          path: |
+            reports/semantic_report.json
+            reports/semantic_report.html
+            reports/semantic_snapshot_report.json
+            reports/semantic_coverage_report.json
+            tests/semantic/reports/semantic-junit.xml
+            tests/semantic/reports/semantic-console.log
+            tests/semantic/reports/semantic-summary.txt

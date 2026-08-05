@@ -1,5 +1,8 @@
 # Intel Foundry Supply Planning AI Assistant
 
+[![Semantic Regression](https://github.com/jyotiranjanojha/ifsupplystory/actions/workflows/semantic-regression.yml/badge.svg)](https://github.com/jyotiranjanojha/ifsupplystory/actions/workflows/semantic-regression.yml)
+[![Semantic Regression Reports](https://img.shields.io/badge/CI-Reports-blue)](https://github.com/jyotiranjanojha/ifsupplystory/actions/workflows/semantic-regression.yml)
+
 Enterprise-grade explainability assistant for BY ESP planning snapshots.
 
 This project helps planners ask natural-language questions and get grounded answers using deterministic planning calculations, rule-based checks, and LLM-based understanding/explanation.
@@ -183,6 +186,102 @@ Responsibilities:
 Important boundary:
 - LLM is not the source of truth for file/column/join selection.
 - Retrieval plan governs these decisions.
+
+## Semantic Regression Framework
+
+The repository includes a semantic regression gate designed to validate semantic behavior independently of the LLM layer.
+
+Assets:
+- Gold dataset: [tests/semantic/gold_semantic_dataset.json](tests/semantic/gold_semantic_dataset.json) (240 planner scenarios)
+- Snapshot baseline: [tests/semantic/snapshots/semantic_snapshots.json](tests/semantic/snapshots/semantic_snapshots.json)
+- Runner: [tests/semantic/run_semantic_regression.py](tests/semantic/run_semantic_regression.py)
+- Dataset generator: [tests/semantic/generate_gold_dataset.py](tests/semantic/generate_gold_dataset.py)
+- Deterministic evaluator: [webapp/app/semantic_regression.py](webapp/app/semantic_regression.py)
+
+Gold dataset case schema:
+
+```json
+{
+  "question": "",
+  "expected_intent": "",
+  "expected_entities": {},
+  "expected_files": [],
+  "expected_kpis": []
+}
+```
+
+Scenario coverage includes:
+- Inventory
+- Forecast
+- Capacity Constraints
+- Solver Decisions
+- Root Cause Analysis
+- Recommendations
+
+Metrics produced in reports:
+- Pass Rate
+- Intent Accuracy
+- Entity Accuracy
+- Semantic Retrieval Accuracy
+- File Mapping Accuracy
+- KPI Accuracy
+- Relationship Accuracy
+- Hallucination Rate
+- Snapshot Pass Rate
+
+Quality gates:
+- Intent Accuracy must be >= 95%
+- File Mapping Accuracy must be >= 95%
+- KPI Accuracy must be >= 90%
+- Hallucination Rate must be 0%
+
+Run locally:
+
+```bash
+python tests/semantic/run_semantic_regression.py
+```
+
+Primary JSON quality report output:
+- [reports/semantic_report.json](reports/semantic_report.json)
+
+Run semantic pytest suite locally (same command used in CI):
+
+```bash
+pytest tests/semantic -rA
+```
+
+Update snapshots intentionally after approved semantic changes:
+
+```bash
+python tests/semantic/run_semantic_regression.py --update-snapshots
+```
+
+Generated reports:
+- JSON: [reports/semantic_report.json](reports/semantic_report.json)
+- HTML: [reports/semantic_report.html](reports/semantic_report.html)
+- Snapshot Validation: [reports/semantic_snapshot_report.json](reports/semantic_snapshot_report.json)
+- Coverage: [reports/semantic_coverage_report.json](reports/semantic_coverage_report.json)
+
+Automated endpoint for semantic validation:
+- [webapp/app/main.py](webapp/app/main.py) exposes `POST /api/semantic/debug`
+
+How semantic testing works:
+- Semantic tests in [tests/semantic](tests/semantic) validate intent expectations, entity expectations, and retrieval-plan expectations using the gold dataset.
+- The framework gate in [tests/semantic/run_semantic_regression.py](tests/semantic/run_semantic_regression.py) executes deterministic semantic evaluation and enforces quality thresholds.
+- Snapshot checks ensure semantic outputs remain stable unless intentionally updated.
+
+How GitHub Actions validates the semantic layer:
+- Workflow: [.github/workflows/semantic-regression.yml](.github/workflows/semantic-regression.yml)
+- Triggers on pull requests and pushes to main/develop.
+- Installs dependencies from [webapp/requirements.txt](webapp/requirements.txt), runs semantic regression gate, then executes `pytest tests/semantic`.
+- Produces JUnit XML, console log, summary reports, and semantic quality report JSON/HTML; uploads all reports as artifacts.
+- Publishes a GitHub Actions step summary with tests run/passed/failed and semantic quality metrics.
+- Fails the workflow when semantic tests fail or when quality gates are breached:
+  - Intent Accuracy < 95%
+  - File Mapping Accuracy < 95%
+  - KPI Accuracy < 90%
+  - Hallucination Rate > 0%
+- Fails the workflow if semantic snapshots change unexpectedly (unless snapshots are intentionally updated).
 
 ## LangGraph Workflow
 

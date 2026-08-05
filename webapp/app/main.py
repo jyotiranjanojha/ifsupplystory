@@ -14,9 +14,10 @@ from fastapi.templating import Jinja2Templates
 from .analyzer import ALLOWED_SEMANTIC_MODES, SEMANTIC_MODE, build_grounded_chat_prompt, dataset_inventory, generate_input_dq_html_report, generate_validation_html_report, list_ollama_models, run_chat_assistant, run_input_data_quality, run_insights, run_knowledge_graph, run_log_reader, run_root_cause, run_root_cause_explained, run_scenario_compare, run_validation, run_vision_query, send_html_email_report, smtp_health_check, stream_llm
 from .langgraph_bom import run_bom_drill
 from .text_to_sql_agent import run_sql_query
-from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
+from .models import BomDrillRequest, ChatRequest, CompareRequest, InsightsRequest, KnowledgeGraphRequest, RagQueryRequest, RagReindexRequest, RootCauseRequest, SemanticDebugRequest, SqlQueryRequest, ValidationReportEmailRequest, ValidationReportRequest, ValidationRequest, VisionQueryRequest
 from .rag import build_rag_index, get_rag_status, query_rag
 from .rag_openvino import build_openvino_rag_index, export_embedding_model, export_reranker_model, get_openvino_rag_status, query_openvino_rag
+from .semantic_regression import evaluate_semantic_debug
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -226,6 +227,18 @@ def rag_query(req: RagQueryRequest):
         scenario_id=req.scenario_id,
         site=req.scope.site,
         item_id=req.item_id,
+    )
+
+
+@app.post("/api/semantic/debug")
+def semantic_debug(req: SemanticDebugRequest):
+    return evaluate_semantic_debug(
+        BASE_DIR,
+        question=req.question,
+        week_id=req.week_id,
+        scenario_id=req.scenario_id,
+        scope=req.scope.model_dump(),
+        history=[m.model_dump() for m in req.history],
     )
 
 

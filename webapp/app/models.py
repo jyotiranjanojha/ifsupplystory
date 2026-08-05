@@ -79,6 +79,14 @@ class ChatRequest(BaseModel):
     scope: Scope = Field(default_factory=Scope)
 
 
+class SemanticDebugRequest(BaseModel):
+    question: str
+    week_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    history: List[ChatMessage] = Field(default_factory=list)
+    scope: Scope = Field(default_factory=Scope)
+
+
 class BomDrillRequest(BaseModel):
     root_item: str
     week_id: Optional[str] = None
