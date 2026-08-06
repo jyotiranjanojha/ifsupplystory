@@ -785,18 +785,22 @@ Results: 10 PASS  0 WARN  0 FAIL  (of 10 tests)
 ### Docker Build & Run
 
 ```bash
-# Build image
-cd webapp
-docker build -t ifsp-webapp:latest .
+# Build image from repository root
+docker build -t ifsp-webapp:latest -f webapp/Dockerfile .
 
 # Run container (requires Nollama server on host)
-docker run -p 8010:8010 \
-  -e NOLLAMA_BASE_URL=http://host.docker.internal:8000 \
+docker run -p 8010:8000 \
   -e LLM_PROVIDER=nollama \
-  -v $(pwd)/../by_input:/app/by_input:ro \
-  -v $(pwd)/../by_output:/app/by_output:ro \
+  -e NOLLAMA_BASE_URL=http://host.docker.internal:8000 \
+  -e NOLLAMA_MODEL=qwen2@GPU \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:8000 \
+  -e OLLAMA_MODEL=qwen2@GPU \
+  -v $(pwd)/by_input:/app/by_input:ro \
+  -v $(pwd)/by_output:/app/by_output:ro \
   ifsp-webapp:latest
 ```
+
+For Podman on Windows, use `http://host.containers.internal:8000` instead of `http://host.docker.internal:8000`.
 
 ### Production Deployment
 

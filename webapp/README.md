@@ -23,14 +23,19 @@ uvicorn webapp.app.main:app --reload
 
 Open `http://127.0.0.1:8000`.
 
-### Optional Local Ollama Integration
-If Ollama is already installed and running locally, the chat assistant can use it to turn grounded workflow results into more natural planner-facing answers.
+### Optional Local Nollama or Ollama Integration
+If Nollama or Ollama is already installed and running locally, the chat assistant can use it to turn grounded workflow results into more natural planner-facing answers.
 
 Default settings:
 
 ```bash
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=gemma3:latest
+LLM_PROVIDER=nollama
+NOLLAMA_BASE_URL=http://127.0.0.1:8000
+NOLLAMA_MODEL=qwen2@GPU
+
+# Backward-compatible aliases used by some helper paths.
+OLLAMA_BASE_URL=http://127.0.0.1:8000
+OLLAMA_MODEL=qwen2@GPU
 
 # Optional DataFrame-backed SQL execution
 # When true, DuckDB registers CSVs through pandas DataFrames.
@@ -41,7 +46,9 @@ SQL_USE_PANDAS=false
 SNOWFLAKE_USE_PANDAS=false
 ```
 
-The application keeps BY workflow logic grounded in local data and uses Ollama only to summarize the computed result.
+For a local Ollama server that exposes a different endpoint, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL` to that server instead.
+
+The application keeps BY workflow logic grounded in local data and uses the configured LLM only to summarize the computed result.
 
 If Ollama is unavailable, the app automatically falls back to the built-in rule-based response format.
 
@@ -66,13 +73,38 @@ python webapp/run.py --host 127.0.0.1 --port 8000 --max-tries 30 --reload
 - `POST /api/root-cause`
 - `POST /api/chat`
 
-## Docker Build and Run
+## Docker or Podman Build and Run
 From repository root:
 
 ```bash
 docker build -t ifsp-webapp -f webapp/Dockerfile .
 docker run --rm -p 8000:8000 ifsp-webapp
 ```
+
+For a local Podman test with Nollama already running on the host at `http://127.0.0.1:8000`, publish the web app on a different host port so the host Nollama port remains free:
+
+```powershell
+podman build -t ifsp-webapp -f webapp/Dockerfile .
+
+podman run --rm -p 8010:8000 `
+  -e LLM_PROVIDER=nollama `
+  -e NOLLAMA_BASE_URL=http://host.containers.internal:8000 `
+  -e NOLLAMA_MODEL=qwen2@GPU `
+  -e OLLAMA_BASE_URL=http://host.containers.internal:8000 `
+  -e OLLAMA_MODEL=qwen2@GPU `
+  -v "${PWD}\by_input:/app/by_input:ro" `
+  -v "${PWD}\by_output:/app/by_output:ro" `
+  ifsp-webapp
+```
+
+Then validate the integration:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8010/api/health
+Invoke-RestMethod http://127.0.0.1:8010/api/llm/models
+```
+
+A repeatable smoke test is available in `podman-smoke-test.ps1` at the repository root.
 
 ## Deploy Options
 - Azure Container Apps
