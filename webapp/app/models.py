@@ -71,12 +71,23 @@ class KnowledgeGraphRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: Optional[str] = None
     week_id: Optional[str] = None
     scenario_id: Optional[str] = None
+    show_detailed_analysis: bool = False
     llm_enabled: bool = True
     llm_model: Optional[str] = None
     history: List[ChatMessage] = Field(default_factory=list)
     scope: Scope = Field(default_factory=Scope)
+
+
+class ContextResolveRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+
+
+class ContextResetRequest(BaseModel):
+    session_id: Optional[str] = None
 
 
 class SemanticDebugRequest(BaseModel):

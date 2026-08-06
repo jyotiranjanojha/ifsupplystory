@@ -20,6 +20,7 @@ import uuid
 from .rag import ensure_rag_index, query_rag
 from .intent_classifier import OpenVINOQwenIntentClassifier
 from .grounding_engine import build_grounded_answer
+from .context_resolution import get_context_resolver, get_context_store
 
 
 INPUT_FOLDER = "by_input"
@@ -77,6 +78,7 @@ OPENVINO_VISION_MODEL = os.getenv("OPENVINO_VISION_MODEL", "DeepSeek-R1-Distill-
 
 # Judge/Review LLM Enable Flag
 JUDGE_LLM_ENABLED = os.getenv("JUDGE_LLM_ENABLED", "true")
+NO_LLM_RESPONSE_MODE = os.getenv("NO_LLM_RESPONSE_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # Global OpenVINO pipeline (cached)
 _OPENVINO_PIPELINE = None
@@ -1539,7 +1541,7 @@ def _resolve_chat_item(question: str, history: Optional[List[Dict[str, str]]]) -
             "same item",
             "the item",
         ]
-        demand_supply_terms = ["demand", "supply", "unmet", "root cause", "lineage", "details"]
+        demand_supply_terms = ["demand", "supply", "unmet", "root cause", "lineage", "details", "sku", "exception", "exceptions"]
         is_reference_question = any(term in ql for term in reference_terms)
         is_demand_supply_followup = any(term in ql for term in demand_supply_terms)
         if is_reference_question or is_demand_supply_followup:
@@ -4338,6 +4340,9 @@ def run_root_cause_explained(
                                        EOH, competing demand details
       3. LLM narrative             — told to cite ONLY the pre-computed facts
     """
+    print("[IFSP] RootCauseAnalysis Started", flush=True)
+    print(f"[IFSP] NO_LLM_RESPONSE_MODE = {str(NO_LLM_RESPONSE_MODE).lower()}", flush=True)
+
     raw = run_root_cause(base_dir, week_id, scenario_id, demand_id, scope, demand_entity=demand_entity)
 
     scope_info  = raw.get("Explainability Scope", {})
@@ -4552,19 +4557,73 @@ MEET STATUS: {ds.get('meet_status','unknown')} | FILL RATE: {_fmt(fill_rate)}%
         "(3 specific actions)\n"
     )
 
+    prompt_characters = len(system_prompt) + len(prompt)
+    estimated_tokens = max(1, int(math.ceil(prompt_characters / 4.0)))
+    llm_timeout_ms = 300000 if LLM_CONFIG.get("provider") != "openvino" else 0
+    print("[IFSP] ANALYSIS_COMPLETE workflow=RootCauseAnalysis", flush=True)
+    print(
+        f"[IFSP] FINAL_RESPONSE_START prompt_characters={prompt_characters} estimated_tokens={estimated_tokens}",
+        flush=True,
+    )
+
+    if NO_LLM_RESPONSE_MODE:
+        deterministic = _build_root_cause_deterministic_result(raw, None)
+        print("[IFSP] LLM Invoked = false", flush=True)
+        print("[IFSP] FINAL_RESPONSE_END", flush=True)
+        print("[IFSP] RootCauseAnalysis Completed", flush=True)
+        return {
+            "root_cause": deterministic.get("root_cause", ""),
+            "evidence": deterministic.get("evidence", {}),
+            "kpis": deterministic.get("kpis", {}),
+            "business_rules": deterministic.get("business_rules", []),
+            "narrative": _build_fallback_rc_narrative(
+                stats, raw.get("Root Causes", []), raw.get("Confirmed Findings", [])
+            ),
+            "stats": stats,
+            "question_type": question_type,
+            "question_label": _RC_QUESTION_LABELS.get(question_type, question_type),
+            "llm_model": (llm_model or LLM_CONFIG["model"]),
+            "llm_used": False,
+            "llm_invoked": False,
+            "mode": "NO_LLM_RESPONSE_MODE",
+            "prompt_characters": prompt_characters,
+            "estimated_tokens": estimated_tokens,
+            "llm_duration_ms": 0,
+            "timeout_duration_ms": llm_timeout_ms,
+            "raw_data": raw,
+            "deep_evidence": deep,
+        }
+
+    _llm_started = datetime.utcnow()
+    print(
+        f"[IFSP] LLM_START model={(llm_model or LLM_CONFIG['model']).strip() or LLM_CONFIG['model']} timeout_ms={llm_timeout_ms}",
+        flush=True,
+    )
     narrative = _ollama_chat_with_model(prompt, system_prompt, llm_model or LLM_CONFIG["model"])
+    llm_duration_ms = int((datetime.utcnow() - _llm_started).total_seconds() * 1000)
+    llm_used = bool(narrative)
+    print(f"[IFSP] LLM_END duration_ms={llm_duration_ms}", flush=True)
+    print(f"[IFSP] LLM Invoked = {str(llm_used).lower()}", flush=True)
+    print("[IFSP] FINAL_RESPONSE_END", flush=True)
+    print("[IFSP] RootCauseAnalysis Completed", flush=True)
 
     return {
         "narrative": narrative or _build_fallback_rc_narrative(
             stats, raw.get("Root Causes", []), raw.get("Confirmed Findings", [])
         ),
-        "stats":          stats,
-        "question_type":  question_type,
+        "stats": stats,
+        "question_type": question_type,
         "question_label": _RC_QUESTION_LABELS.get(question_type, question_type),
-        "llm_model":      (llm_model or LLM_CONFIG["model"]),
-        "llm_used":       bool(narrative),
-        "raw_data":       raw,
-        "deep_evidence":  deep,
+        "llm_model": (llm_model or LLM_CONFIG["model"]),
+        "llm_used": llm_used,
+        "llm_invoked": llm_used,
+        "mode": "LLM",
+        "prompt_characters": prompt_characters,
+        "estimated_tokens": estimated_tokens,
+        "llm_duration_ms": llm_duration_ms,
+        "timeout_duration_ms": llm_timeout_ms,
+        "raw_data": raw,
+        "deep_evidence": deep,
     }
 
 
@@ -5311,6 +5370,122 @@ def _run_insights_impl(
     }
 
 
+def run_sku_exception_analysis(
+    base_dir: Path,
+    week_id: Optional[str],
+    scenario_id: Optional[str],
+    item_id: Optional[str],
+    scope: Dict,
+) -> Dict:
+    context = _resolve_context(base_dir, week_id, scenario_id)
+    week_id = context["week_id"]
+    scenario_id = context["scenario_id"]
+    site = (scope.get("site") or scope.get("node") or "").strip()
+
+    output_dir = base_dir / OUTPUT_FOLDER
+    input_dir = base_dir / INPUT_FOLDER
+    exception_file = _find_file_by_prefix(output_dir, "by_if_snop_out_skuexception-")
+    inddmdview_file = _find_file_by_prefix(output_dir, "by_if_snop_out_inddmdview-")
+    bom_file = _find_file_by_prefix(input_dir, "if_snop_billofmaterials-")
+    alt_bom_file = _find_file_by_prefix(input_dir, "if_snop_altbillofmaterials-")
+
+    domain_entity = _parse_demand_entity(item_id, None)
+    domain_entity = _resolve_entity_to_item(inddmdview_file, domain_entity, week_id, scenario_id, site)
+    resolved_item = (domain_entity.resolved_item or domain_entity.entity_id or "").strip()
+
+    exception_rows: List[Dict[str, Any]] = []
+    source_table = Path(exception_file).name if exception_file else ""
+    filters_applied = [f"ITEM={resolved_item}" if resolved_item else "ITEM=<missing>"]
+    if site:
+        filters_applied.append(f"LOC={site}")
+    if week_id:
+        filters_applied.append(f"CAPTURE_WK={week_id}")
+    if scenario_id:
+        filters_applied.append(f"SIMULATION_NAME~={scenario_id}")
+
+    if exception_file and resolved_item:
+        for row in _safe_rows(exception_file):
+            if (row.get("ITEM") or "").strip() != resolved_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            if not _matches_context(row, week_id, scenario_id):
+                continue
+            exception_rows.append(row)
+
+    exception_codes = sorted({(row.get("EXCEPTION") or "").strip() for row in exception_rows if (row.get("EXCEPTION") or "").strip()})
+    affected_boms = sorted({(row.get("BOMNUM") or "").strip() for row in exception_rows if (row.get("BOMNUM") or "").strip() and (row.get("BOMNUM") or "").strip() != "0"})
+    affected_parent_skus = sorted({(row.get("PARENTITEM") or "").strip() for row in exception_rows if (row.get("PARENTITEM") or "").strip() and (row.get("PARENTITEM") or "").strip() != "0"})
+
+    if not affected_parent_skus and bom_file and resolved_item:
+        for row in _safe_rows(bom_file):
+            if (row.get("SUBORD") or "").strip() != resolved_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            affected_parent_skus.append((row.get("ITEM") or "").strip())
+    if alt_bom_file and resolved_item:
+        for row in _safe_rows(alt_bom_file):
+            if (row.get("SUBORD") or "").strip() != resolved_item:
+                continue
+            if site and (row.get("LOC") or "").strip() != site:
+                continue
+            bomnum = (row.get("BOMNUM") or "").strip()
+            if bomnum and bomnum != "0" and bomnum not in affected_boms:
+                affected_boms.append(bomnum)
+
+    exception_descriptions = sorted({(row.get("DESCR") or "").strip() for row in exception_rows if (row.get("DESCR") or "").strip()})
+    locations = sorted({(row.get("LOC") or "").strip() for row in exception_rows if (row.get("LOC") or "").strip()})
+
+    recommended_actions: List[str] = []
+    if any(code == "5529" for code in exception_codes) or any("invalid parent sku" in desc.lower() for desc in exception_descriptions):
+        recommended_actions.append("Validate parent SKU mappings in the BOM")
+    if exception_codes:
+        recommended_actions.append("Review the exception codes and owning planning rules")
+    if affected_parent_skus:
+        recommended_actions.append("Check the affected parent SKUs for BOM consistency")
+    if not recommended_actions:
+        recommended_actions.append("Review item, BOM, and scenario setup for exception causes")
+
+    diagnostics = {
+        "resolved_item": resolved_item,
+        "week": week_id or "",
+        "scenario": scenario_id or "",
+        "exception_rows_found": len(exception_rows),
+        "source_table": source_table,
+        "filters_applied": filters_applied,
+    }
+    print(f"[IFSP] SKU_EXCEPTION_TRACE {json.dumps(diagnostics, ensure_ascii=True)}", flush=True)
+
+    return {
+        "SKU Exception Analysis": {
+            "item": resolved_item,
+            "week_id": week_id,
+            "scenario_id": scenario_id,
+            "site": site or None,
+            "exception_count": len(exception_rows),
+            "exception_codes": exception_codes,
+            "exception_descriptions": exception_descriptions[:10],
+            "affected_boms": affected_boms[:10],
+            "affected_parent_skus": sorted({sku for sku in affected_parent_skus if sku})[:10],
+            "locations": locations[:10],
+            "recommended_actions": recommended_actions[:5],
+            "sample_rows": [
+                {
+                    "exception": (row.get("EXCEPTION") or "").strip() or None,
+                    "description": (row.get("DESCR") or "").strip() or None,
+                    "loc": (row.get("LOC") or "").strip() or None,
+                    "parent_item": (row.get("PARENTITEM") or "").strip() or None,
+                    "bomnum": (row.get("BOMNUM") or "").strip() or None,
+                    "production_method": (row.get("PRODUCTIONMETHOD") or "").strip() or None,
+                }
+                for row in exception_rows[:10]
+            ],
+        },
+        "Diagnostics": diagnostics,
+    }
+
+
 def _short_table_name(file_name: str) -> str:
     name = (file_name or "").strip()
     if not name:
@@ -5980,6 +6155,15 @@ def _dispatch_by_intent(
         result["router_metadata"] = router_meta
         return result
 
+    # ── sku_exception_analysis ───────────────────────────────────────────
+    if intent == "sku_exception_analysis":
+        return {
+            "workflow": "SKU Exception Analysis",
+            "result": run_sku_exception_analysis(base_dir, week_id, scenario_id, resolved_item, scope),
+            "note": "SKU exception analysis uses BY exception outputs filtered by item, location, week, and scenario.",
+            "router_metadata": router_meta,
+        }
+
     # ── domain focus (Fulfillment / Generation / Data Hygiene) ──────────
     if intent in {"domain_fulfillment", "domain_generation", "domain_data_hygiene"}:
         domain_name = _DOMAIN_CATALOG_MAP.get(domain_raw or "", "Data Hygiene")
@@ -6458,6 +6642,18 @@ def _run_chat_workflow_if_needed(
                 "router_metadata": result.get("router_metadata"),
             }
 
+    if retrieval_plan is None and result.get("workflow") in {None, "Conversational Copilot"} and not result.get("result"):
+        ql = (question or "").lower()
+        sku_terms = ["sku exception", "sku exceptions", "exception code", "exception codes", "invalid bom", "invalid parent sku"]
+        item = (meta.get("entities") or {}).get("item") or _resolve_chat_item(question, history).get("selected_item")
+        if item and any(term in ql for term in sku_terms):
+            result = {
+                "workflow": "SKU Exception Analysis",
+                "result": run_sku_exception_analysis(base_dir, week_id, scenario_id, item, scope),
+                "note": "Auto-dispatched to SKU Exception Analysis based on detected item and exception question.",
+                "router_metadata": result.get("router_metadata"),
+            }
+
     # Safety-net for root cause clarification — if item is known, run root cause directly
     if retrieval_plan is None and "Clarification" in (result.get("workflow") or "") and not result.get("result"):
         ql = (question or "").lower()
@@ -6517,6 +6713,149 @@ def _trim_workflow_result_for_prompt(result: Dict) -> Dict:
             v = {ik: iv for ik, iv in v.items() if ik not in _VERBOSE_KEYS}
         trimmed[k] = v
     return trimmed
+
+
+def _summarize_scalar(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, (int, bool)) or value is None:
+        return value
+    text = str(value)
+    if len(text) > 120:
+        return text[:117] + "..."
+    return text
+
+
+def _summarize_list_for_prompt(values: List[Any], sample_size: int = 3) -> Dict[str, Any]:
+    sample: List[Any] = []
+    for item in values[:sample_size]:
+        if isinstance(item, dict):
+            slim = {}
+            for k, v in list(item.items())[:8]:
+                slim[str(k)] = _summarize_scalar(v)
+            sample.append(slim)
+        else:
+            sample.append(_summarize_scalar(item))
+    return {
+        "count": len(values),
+        "sample": sample,
+    }
+
+
+def _summarize_dict_for_prompt(obj: Dict[str, Any], max_keys: int = 12) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    keys = list(obj.keys())[:max_keys]
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, list):
+            summary[str(k)] = _summarize_list_for_prompt(v)
+        elif isinstance(v, dict):
+            nested = {}
+            for nk, nv in list(v.items())[:8]:
+                if isinstance(nv, list):
+                    nested[str(nk)] = _summarize_list_for_prompt(nv)
+                else:
+                    nested[str(nk)] = _summarize_scalar(nv)
+            summary[str(k)] = nested
+        else:
+            summary[str(k)] = _summarize_scalar(v)
+    if len(obj.keys()) > max_keys:
+        summary["truncated_keys"] = len(obj.keys()) - max_keys
+    return summary
+
+
+def _build_root_cause_prompt_summary(workflow_result: Dict) -> Dict[str, Any]:
+    ds = workflow_result.get("Demand and Supply Summary") if isinstance(workflow_result.get("Demand and Supply Summary"), dict) else {}
+    constraints = workflow_result.get("Constraint and Exception Analysis") if isinstance(workflow_result.get("Constraint and Exception Analysis"), dict) else {}
+    lineage = workflow_result.get("Lineage and Linkage Findings") if isinstance(workflow_result.get("Lineage and Linkage Findings"), dict) else {}
+    planned = workflow_result.get("Planned Supply Evidence") if isinstance(workflow_result.get("Planned Supply Evidence"), dict) else {}
+    scope = workflow_result.get("Explainability Scope") if isinstance(workflow_result.get("Explainability Scope"), dict) else {}
+    return {
+        "scope": {
+            "week_id": scope.get("week_id"),
+            "scenario_id": scope.get("scenario_id"),
+            "demand_item": scope.get("demand_item"),
+        },
+        "demand_supply": {
+            "demand_qty_total": ds.get("demand_qty_total"),
+            "scheduled_qty_total": ds.get("scheduled_qty_total"),
+            "unmet_qty": ds.get("unmet_qty"),
+            "meet_status": ds.get("meet_status"),
+            "on_time_scheduled_qty": ds.get("on_time_scheduled_qty"),
+            "late_scheduled_qty": ds.get("late_scheduled_qty"),
+        },
+        "planned_supply": {
+            "plan_arrival_qty": planned.get("plan_arrival_qty"),
+            "plan_order_qty": planned.get("plan_order_qty"),
+            "plan_purchase_qty": planned.get("plan_purchase_qty"),
+        },
+        "constraints": {
+            "sku_exception_rows_for_item": constraints.get("sku_exception_rows_for_item"),
+            "capacity_exception_rows": constraints.get("capacity_exception_rows"),
+            "capacity_overutil_qty": constraints.get("capacity_overutil_qty"),
+            "higher_priority_competing_qty": constraints.get("higher_priority_competing_qty"),
+            "resource_count": constraints.get("resource_count"),
+        },
+        "lineage_summary": {
+            "inddmdlink_rows": lineage.get("inddmdlink_rows"),
+            "pegged_demand_qty": lineage.get("pegged_demand_qty"),
+            "pegged_supply_qty": lineage.get("pegged_supply_qty"),
+            "supply_methods_seen": _summarize_list_for_prompt(lineage.get("supply_methods_seen") or [], sample_size=5),
+        },
+        "confirmed_findings": _summarize_list_for_prompt(workflow_result.get("Confirmed Findings") or [], sample_size=6),
+        "root_causes": _summarize_list_for_prompt(workflow_result.get("Root Causes") or [], sample_size=6),
+    }
+
+
+def _summarize_workflow_result_for_prompt(workflow_name: str, workflow_result: Optional[Dict]) -> Dict[str, Any]:
+    if not isinstance(workflow_result, dict):
+        return {}
+    if _is_root_cause_workflow(workflow_name):
+        return _build_root_cause_prompt_summary(workflow_result)
+    trimmed = _trim_workflow_result_for_prompt(workflow_result)
+    return _summarize_dict_for_prompt(trimmed, max_keys=16)
+
+
+def _summarize_retrieval_plan_for_prompt(retrieval_plan: Optional[Dict]) -> Dict[str, Any]:
+    if not isinstance(retrieval_plan, dict):
+        return {}
+    relationships = retrieval_plan.get("relationships") if isinstance(retrieval_plan.get("relationships"), list) else []
+    return {
+        "intent": retrieval_plan.get("intent"),
+        "entities": _summarize_dict_for_prompt(retrieval_plan.get("entities") if isinstance(retrieval_plan.get("entities"), dict) else {}, max_keys=8),
+        "files": _summarize_list_for_prompt(retrieval_plan.get("files") or [], sample_size=8),
+        "kpis": _summarize_list_for_prompt(retrieval_plan.get("kpis") or [], sample_size=8),
+        "business_rules": _summarize_list_for_prompt(retrieval_plan.get("business_rules") or [], sample_size=8),
+        "relationships": {
+            "count": len(relationships),
+            "sample": _relationship_strings_from_plan(retrieval_plan)[:8],
+        },
+    }
+
+
+def _prompt_breakdown_metrics(breakdown: Dict[str, int]) -> Dict[str, Any]:
+    total = sum(int(v or 0) for v in breakdown.values())
+    largest_key = ""
+    largest_val = -1
+    for key, val in breakdown.items():
+        iv = int(val or 0)
+        if iv > largest_val:
+            largest_key = key
+            largest_val = iv
+    return {
+        "conversation_history_chars": int(breakdown.get("conversation_history_chars", 0)),
+        "retrieved_data_chars": int(breakdown.get("retrieved_data_chars", 0)),
+        "evidence_chars": int(breakdown.get("evidence_chars", 0)),
+        "kpi_chars": int(breakdown.get("kpi_chars", 0)),
+        "rule_chars": int(breakdown.get("rule_chars", 0)),
+        "semantic_retrieval_chars": int(breakdown.get("semantic_retrieval_chars", 0)),
+        "prompt_template_chars": int(breakdown.get("prompt_template_chars", 0)),
+        "total_chars": total,
+        "largest_contributor": {
+            "component": largest_key,
+            "chars": max(largest_val, 0),
+        },
+    }
 
 
 def _build_semantic_retrieval_prompt(user_query: str, semantic_model: Dict) -> Tuple[str, str]:
@@ -6795,6 +7134,7 @@ def build_grounded_chat_prompt(
     week_id: Optional[str],
     scenario_id: Optional[str],
     scope: Dict,
+    session_id: Optional[str] = None,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str, Dict]:
     """
@@ -6802,13 +7142,30 @@ def build_grounded_chat_prompt(
     No LLM call happens here — pure data gathering, safe to run before streaming.
     """
     import time as _time
+    build_started_at = _time.perf_counter()
     q = (question or "").strip()
+    context_store = get_context_store()
+    session_ctx = context_store.get_or_create(session_id)
+    resolution = get_context_resolver().resolve(q, session_ctx)
+    q = (resolution.resolved_query or q).strip()
 
     parsed_command = _parse_chat_command(q)
-    effective_week = week_id
-    effective_scenario = scenario_id
+    effective_week = week_id or session_ctx.current_week_id
+    effective_scenario = scenario_id or session_ctx.current_scenario_id
     effective_scope = dict(scope or {})
+    if not (effective_scope.get("site") or "") and session_ctx.current_location:
+        effective_scope["site"] = session_ctx.current_location
+    if not (effective_scope.get("resource") or "") and session_ctx.current_resource:
+        effective_scope["resource"] = session_ctx.current_resource
     retrieval_plan: Optional[Dict] = None
+    timing_metrics = {
+        "intent_entities_ms": 0,
+        "grounding_build_ms": 0,
+        "semantic_plan_ms": 0,
+        "workflow_duration_ms": 0,
+        "rag_duration_ms": 0,
+        "total_build_duration_ms": 0,
+    }
 
     if parsed_command.get("is_command"):
         workflow_payload = _execute_chat_command(base_dir, parsed_command, week_id, scenario_id, effective_scope)
@@ -6840,15 +7197,43 @@ def build_grounded_chat_prompt(
         from .router_agent import route_question
 
         _tp = _time.perf_counter()
-        routed_meta = route_question(q, history, week_id, scenario_id, effective_scope)
+        routed_meta = route_question(q, history, effective_week, effective_scenario, effective_scope)
         routed_meta = _enrich_router_meta_with_openvino_intent(routed_meta, q, history)
         routed_meta["question"] = q
-        print(f"[IFSP]   intent_entities={int((_time.perf_counter()-_tp)*1000)}ms", flush=True)
+
+        # Preserve key entities from session context for follow-up turns when omitted in the current query.
+        entities = dict(routed_meta.get("entities") or {})
+        entity_sources = dict(routed_meta.get("entity_sources") or {})
+        if not entities.get("item") and session_ctx.current_item:
+            entities["item"] = session_ctx.current_item
+            entity_sources["item"] = "session_context"
+        if not entities.get("site") and session_ctx.current_location:
+            entities["site"] = session_ctx.current_location
+            entity_sources["site"] = "session_context"
+        if not entities.get("resource") and session_ctx.current_resource:
+            entities["resource"] = session_ctx.current_resource
+            entity_sources["resource"] = "session_context"
+        if not entities.get("week_id") and effective_week:
+            entities["week_id"] = effective_week
+            entity_sources["week_id"] = "session_context" if not week_id else "question_or_request"
+        if not entities.get("scenario_id") and effective_scenario:
+            entities["scenario_id"] = effective_scenario
+            entity_sources["scenario_id"] = "session_context" if not scenario_id else "question_or_request"
+        routed_meta["entities"] = entities
+        routed_meta["entity_sources"] = entity_sources
+
+        print(
+            f"[IFSP] ENTITY_TRACE {json.dumps({'current_item': session_ctx.current_item or '', 'resolved_item': entities.get('item') or '', 'entity_source': entity_sources.get('item') or '', 'context_used': resolution.context_used}, ensure_ascii=True)}",
+            flush=True,
+        )
+        timing_metrics["intent_entities_ms"] = int((_time.perf_counter()-_tp)*1000)
+        print(f"[IFSP]   intent_entities={timing_metrics['intent_entities_ms']}ms", flush=True)
 
         _tg = _time.perf_counter()
         context = _resolve_context(base_dir, effective_week, effective_scenario)
         grounding = _build_chat_grounding(base_dir, q, context, effective_scope)
-        print(f"[IFSP]   grounding_build={int((_time.perf_counter()-_tg)*1000)}ms", flush=True)
+        timing_metrics["grounding_build_ms"] = int((_time.perf_counter()-_tg)*1000)
+        print(f"[IFSP]   grounding_build={timing_metrics['grounding_build_ms']}ms", flush=True)
 
         _ts = _time.perf_counter()
         retrieval_plan = _build_semantic_retrieval_plan(
@@ -6863,20 +7248,22 @@ def build_grounded_chat_prompt(
         audit_path = _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
         if audit_path:
             retrieval_plan.setdefault("audit", {})["storage_path"] = audit_path
-        print(f"[IFSP]   semantic_plan={int((_time.perf_counter()-_ts)*1000)}ms", flush=True)
+        timing_metrics["semantic_plan_ms"] = int((_time.perf_counter()-_ts)*1000)
+        print(f"[IFSP]   semantic_plan={timing_metrics['semantic_plan_ms']}ms", flush=True)
 
         _tw = _time.perf_counter()
         workflow_payload = _run_chat_workflow_if_needed(
             base_dir,
             q,
-            week_id,
-            scenario_id,
+            effective_week,
+            effective_scenario,
             effective_scope,
             history=history,
             router_meta=routed_meta,
             retrieval_plan=retrieval_plan,
         )
-        print(f"[IFSP]   workflow={int((_time.perf_counter()-_tw)*1000)}ms intent={workflow_payload.get('workflow')}", flush=True)
+        timing_metrics["workflow_duration_ms"] = int((_time.perf_counter()-_tw)*1000)
+        print(f"[IFSP]   workflow={timing_metrics['workflow_duration_ms']}ms intent={workflow_payload.get('workflow')}", flush=True)
 
         _tr = _time.perf_counter()
         rag_evidence = None
@@ -6892,14 +7279,15 @@ def build_grounded_chat_prompt(
                     base_dir,
                     q,
                     top_k=6,
-                    week_id=week_id,
-                    scenario_id=scenario_id,
+                    week_id=effective_week,
+                    scenario_id=effective_scenario,
                     site=(effective_scope or {}).get("site"),
                     item_id=item_hint,
                 )
         except Exception:
             rag_evidence = None
-        print(f"[IFSP]   rag={int((_time.perf_counter()-_tr)*1000)}ms", flush=True)
+        timing_metrics["rag_duration_ms"] = int((_time.perf_counter()-_tr)*1000)
+        print(f"[IFSP]   rag={timing_metrics['rag_duration_ms']}ms", flush=True)
 
         if isinstance(workflow_payload, dict):
             workflow_payload["retrieval_plan"] = retrieval_plan
@@ -6926,8 +7314,10 @@ def build_grounded_chat_prompt(
     clarification = workflow_payload.get("clarification")
 
     semantic_retrieval_mode = SEMANTIC_MODE == "semantic_retrieval"
-    # hybrid mode enables structured semantic routing planner behavior
-    semantic_router_mode = SEMANTIC_MODE == "hybrid"
+    # Keep chat conversational by default, even in hybrid mode.
+    # Structured semantic router output can be explicitly enabled for debugging.
+    structured_semantic_chat = os.getenv("CHAT_STRUCTURED_SEMANTIC_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    semantic_router_mode = SEMANTIC_MODE == "hybrid" and structured_semantic_chat
     semantic_file_discovery_mode = False
     semantic_kpi_selector_mode = False
     solver_explainability_planner_mode = SEMANTIC_MODE == "solver_explainability"
@@ -6943,23 +7333,34 @@ def build_grounded_chat_prompt(
         "Separate what is confirmed from what is inferred."
     )
 
+    workflow_summary = _summarize_workflow_result_for_prompt(workflow_name, workflow_result)
+    retrieval_plan_summary = _summarize_retrieval_plan_for_prompt(retrieval_plan)
+    history_window = (history or [])[-10:]
+    conversation_history_chars = sum(
+        len(str((m.get("content") if isinstance(m, dict) else "") or "")) for m in history_window
+    )
+
     prompt_sections: List[str] = []
+    if resolution.resolved_query != resolution.original_query:
+        prompt_sections.append(
+            f"## Conversation Context Resolution\nOriginal: {resolution.original_query}\nResolved: {resolution.resolved_query}"
+        )
     prompt_sections.append(f"## User Question\n{q}")
     prompt_sections.append(f"## Workflow Identified\n{workflow_name}")
     prompt_sections.append(f"## Resolved Planning Context\nWeek: {context.get('week_id')} | Scenario: {context.get('scenario_id')}")
 
     if workflow_result is not None:
-        # Strip deeply nested or verbose keys to keep prompt under ~1500 tokens
-        trimmed = _trim_workflow_result_for_prompt(workflow_result)
         prompt_sections.append(
-            f"## Grounded Planning Data (use this as primary evidence)\n{json.dumps(trimmed, ensure_ascii=True)}"
+            f"## Grounded Planning Data Summary (use this as primary evidence)\n{json.dumps(workflow_summary, ensure_ascii=True)}"
         )
 
+    evidence_chars = 0
     if rag_evidence is not None:
         hits = (rag_evidence or {}).get("hits", [])[:3]
         if hits:
             # Only include essential fields from each RAG hit
             slim_hits = [{"table": h.get("table"), "text": (h.get("text") or h.get("snippet", ""))[:200]} for h in hits]
+            evidence_chars = len(json.dumps(slim_hits, ensure_ascii=True))
             prompt_sections.append(f"## RAG Evidence (top hits)\n{json.dumps(slim_hits, ensure_ascii=True)}")
 
     if workflow_result is None:
@@ -6977,7 +7378,7 @@ def build_grounded_chat_prompt(
 
     if retrieval_plan is not None:
         prompt_sections.append(
-            f"## Authoritative Retrieval Plan (Semantic Layer Source of Truth)\n{json.dumps(retrieval_plan, ensure_ascii=True)}"
+            f"## Authoritative Retrieval Plan Summary (Semantic Layer Source of Truth)\n{json.dumps(retrieval_plan_summary, ensure_ascii=True)}"
         )
 
     prompt_sections.append(
@@ -6994,6 +7395,33 @@ def build_grounded_chat_prompt(
         prompt_sections.append(
             "For this demand query, state clearly: total demand, scheduled supply, unmet quantity, and whether demand was fully met, partially met, or not met."
         )
+
+    retrieved_data_chars = len(json.dumps(workflow_summary, ensure_ascii=True)) if workflow_summary else 0
+    rule_chars = len(json.dumps((retrieval_plan_summary.get("business_rules") or {}), ensure_ascii=True)) if retrieval_plan_summary else 0
+    kpi_chars = len(json.dumps((retrieval_plan_summary.get("kpis") or {}), ensure_ascii=True)) if retrieval_plan_summary else 0
+    semantic_retrieval_chars = len(json.dumps({
+        "files": retrieval_plan_summary.get("files") if retrieval_plan_summary else {},
+        "relationships": retrieval_plan_summary.get("relationships") if retrieval_plan_summary else {},
+        "entities": retrieval_plan_summary.get("entities") if retrieval_plan_summary else {},
+    }, ensure_ascii=True)) if retrieval_plan_summary else 0
+    prompt_template_chars = len(system_prompt) + len("\n\n".join([section for section in prompt_sections if section.startswith("## User Question") or section.startswith("## Instructions")]))
+    prompt_breakdown = _prompt_breakdown_metrics({
+        "conversation_history_chars": conversation_history_chars,
+        "retrieved_data_chars": retrieved_data_chars,
+        "evidence_chars": evidence_chars,
+        "kpi_chars": kpi_chars,
+        "rule_chars": rule_chars,
+        "semantic_retrieval_chars": semantic_retrieval_chars,
+        "prompt_template_chars": prompt_template_chars,
+    })
+
+    formatter_metrics = {
+        "workflow_raw_chars": len(json.dumps(workflow_result, ensure_ascii=True)) if isinstance(workflow_result, dict) else 0,
+        "workflow_summary_chars": retrieved_data_chars,
+        "retrieval_plan_raw_chars": len(json.dumps(retrieval_plan, ensure_ascii=True)) if isinstance(retrieval_plan, dict) else 0,
+        "retrieval_plan_summary_chars": len(json.dumps(retrieval_plan_summary, ensure_ascii=True)) if isinstance(retrieval_plan_summary, dict) else 0,
+    }
+    timing_metrics["total_build_duration_ms"] = int((_time.perf_counter() - build_started_at) * 1000)
 
     if semantic_file_discovery_mode:
         file_catalog = {
@@ -7016,11 +7444,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "semantic_file_discovery_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7051,11 +7484,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "semantic_kpi_selector_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7087,11 +7525,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "solver_explainability_planner_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7123,11 +7566,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "recommendation_retrieval_planner_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7154,11 +7602,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "semantic_router_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7188,11 +7641,16 @@ def build_grounded_chat_prompt(
             "rag_evidence": rag_evidence,
             "clarification": clarification,
             "follow_ups": _suggest_followups(workflow_name, q),
-            "history_window": (history or [])[-10:],
+            "history_window": history_window,
             "grounding": grounding,
             "workflow_payload": workflow_payload,
             "semantic_retrieval_mode": True,
             "retrieval_plan": retrieval_plan,
+            "context_resolution": resolution.model_dump(),
+            "session_id": session_ctx.session_id,
+            "prompt_breakdown": prompt_breakdown,
+            "response_formatter_metrics": formatter_metrics,
+            "timing_metrics": timing_metrics,
         }
         return system_prompt, semantic_prompt, meta
 
@@ -7203,10 +7661,15 @@ def build_grounded_chat_prompt(
         "rag_evidence": rag_evidence,
         "clarification": clarification,
         "follow_ups": _suggest_followups(workflow_name, q),
-        "history_window": (history or [])[-10:],
+        "history_window": history_window,
         "grounding": grounding,
         "workflow_payload": workflow_payload,
         "retrieval_plan": retrieval_plan,
+        "context_resolution": resolution.model_dump(),
+        "session_id": session_ctx.session_id,
+        "prompt_breakdown": prompt_breakdown,
+        "response_formatter_metrics": formatter_metrics,
+        "timing_metrics": timing_metrics,
     }
     return system_prompt, "\n\n".join(prompt_sections), meta
 
@@ -7260,17 +7723,299 @@ def _compute_answer_confidence(
     }
 
 
+def _derive_analysis_topic(workflow_name: str, question: str) -> Optional[str]:
+    wl = (workflow_name or "").lower()
+    ql = (question or "").lower()
+    if "root cause" in wl or "reason" in ql or "caused" in ql:
+        return "RootCause"
+    if "demand" in wl or "demand" in ql or "unmet" in ql:
+        return "UnmetDemand"
+    if "capacity" in wl or "capacity" in ql:
+        return "CapacityConstraint"
+    return None
+
+
+def _derive_context_entities(
+    question: str,
+    workflow_name: str,
+    workflow_payload: Dict,
+    workflow_result: Optional[Dict],
+    retrieval_plan: Optional[Dict],
+    scope: Dict,
+) -> Dict[str, Any]:
+    entities: Dict[str, Any] = {}
+    router_meta = workflow_payload.get("router_metadata") if isinstance(workflow_payload, dict) else None
+    if isinstance(router_meta, dict) and isinstance(router_meta.get("entities"), dict):
+        entities.update({k: v for k, v in router_meta.get("entities", {}).items() if v not in {None, ""}})
+    if isinstance(retrieval_plan, dict) and isinstance(retrieval_plan.get("entities"), dict):
+        for key, value in retrieval_plan.get("entities", {}).items():
+            if entities.get(key) in {None, ""} and value not in {None, ""}:
+                entities[key] = value
+
+    if isinstance(workflow_result, dict):
+        item = workflow_result.get("Item")
+        if item and entities.get("item") in {None, ""}:
+            entities["item"] = item
+
+        stats = workflow_result.get("Demand vs Supply Stats") if isinstance(workflow_result.get("Demand vs Supply Stats"), dict) else {}
+        if isinstance(stats, dict) and entities.get("item") in {None, ""} and stats.get("item"):
+            entities["item"] = stats.get("item")
+
+        root_causes = workflow_result.get("Root Causes") if isinstance(workflow_result.get("Root Causes"), list) else []
+        root_text = " ".join([str(x).lower() for x in root_causes])
+        if "capacity" in root_text:
+            entities["constraint_type"] = "Capacity"
+        elif "supply" in root_text:
+            entities["constraint_type"] = "Supply"
+
+    if scope.get("site") and entities.get("location") in {None, ""}:
+        entities["location"] = scope.get("site")
+
+    topic = _derive_analysis_topic(workflow_name, question)
+    if topic:
+        entities["analysis_topic"] = topic
+
+    return entities
+
+
+def _update_chat_session_context(
+    session_id: Optional[str],
+    question: str,
+    response_text: str,
+    workflow_name: str,
+    workflow_payload: Dict,
+    workflow_result: Optional[Dict],
+    retrieval_plan: Optional[Dict],
+    scope: Dict,
+    context_resolution: Optional[Dict],
+) -> None:
+    if not session_id:
+        return
+
+    entities = _derive_context_entities(question, workflow_name, workflow_payload, workflow_result, retrieval_plan, scope)
+
+    router_meta = workflow_payload.get("router_metadata") if isinstance(workflow_payload, dict) else None
+    last_intent = None
+    if isinstance(router_meta, dict):
+        last_intent = router_meta.get("normalized_intent") or router_meta.get("intent")
+    if not last_intent:
+        last_intent = workflow_name
+
+    files_used: List[str] = []
+    kpis: List[str] = []
+    if isinstance(retrieval_plan, dict):
+        files_used = [str(x) for x in (retrieval_plan.get("files") or []) if str(x).strip()]
+        kpis = [str(x) for x in (retrieval_plan.get("kpis") or []) if str(x).strip()]
+
+    resolved_query = None
+    if isinstance(context_resolution, dict):
+        resolved_query = context_resolution.get("resolved_query")
+
+    get_context_store().update_after_query(
+        session_id,
+        entities=entities,
+        last_intent=str(last_intent) if last_intent else None,
+        last_retrieval_plan=retrieval_plan if isinstance(retrieval_plan, dict) else None,
+        last_files_used=files_used,
+        last_kpis=kpis,
+        response_summary=(response_text or "")[:500],
+        user_query=question,
+        resolved_query=resolved_query,
+    )
+
+
+def _is_root_cause_workflow(workflow_name: Optional[str]) -> bool:
+    wf = (workflow_name or "").strip().lower()
+    return "root cause" in wf or wf == "root_cause"
+
+
+def _build_root_cause_deterministic_result(workflow_result: Optional[Dict], retrieval_plan: Optional[Dict]) -> Dict:
+    result = workflow_result if isinstance(workflow_result, dict) else {}
+    summary = result.get("Demand and Supply Summary") if isinstance(result.get("Demand and Supply Summary"), dict) else {}
+    constraints = result.get("Constraint and Exception Analysis") if isinstance(result.get("Constraint and Exception Analysis"), dict) else {}
+    lineage = result.get("Lineage and Linkage Findings") if isinstance(result.get("Lineage and Linkage Findings"), dict) else {}
+    scope = result.get("Explainability Scope") if isinstance(result.get("Explainability Scope"), dict) else {}
+
+    root_causes = result.get("Root Causes") if isinstance(result.get("Root Causes"), list) else []
+    root_cause_text = " | ".join(str(cause) for cause in root_causes if str(cause).strip())
+
+    def _to_float(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        return _safe_float(value)
+
+    demand_qty = _to_float(summary.get("demand_qty_total"))
+    scheduled_qty = _to_float(summary.get("scheduled_qty_total"))
+    unmet_qty = _to_float(summary.get("unmet_qty"))
+    fill_rate = round((scheduled_qty / demand_qty) * 100.0, 2) if demand_qty > 0 else 0.0
+
+    business_rules: List[str] = []
+    if isinstance(retrieval_plan, dict):
+        business_rules = [
+            str(rule) for rule in (retrieval_plan.get("business_rules") or []) if str(rule).strip()
+        ]
+    if not business_rules:
+        policy = ((result.get("Cause Attribution (BY ESP Expert View)") or {}).get("policy"))
+        if policy:
+            business_rules = [f"Attribution policy: {policy}"]
+
+    return {
+        "root_cause": root_cause_text,
+        "evidence": {
+            "scope": scope,
+            "summary": summary,
+            "constraints": constraints,
+            "lineage": lineage,
+            "confirmed_findings": result.get("Confirmed Findings") if isinstance(result.get("Confirmed Findings"), list) else [],
+        },
+        "kpis": {
+            "demand_qty_total": round(demand_qty, 3),
+            "scheduled_qty_total": round(scheduled_qty, 3),
+            "unmet_qty": round(unmet_qty, 3),
+            "fill_rate_pct": fill_rate,
+            "meet_status": summary.get("meet_status"),
+        },
+        "business_rules": business_rules,
+    }
+
+
+def _format_planner_number(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        number = _safe_float(value)
+    if abs(number - round(number)) < 0.0001:
+        return f"{int(round(number)):,}"
+    return f"{number:,.3f}".rstrip("0").rstrip(".")
+
+
+def _build_root_cause_planner_summary(deterministic: Optional[Dict]) -> str:
+    payload = deterministic if isinstance(deterministic, dict) else {}
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    scope = evidence.get("scope") if isinstance(evidence.get("scope"), dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    constraints = evidence.get("constraints") if isinstance(evidence.get("constraints"), dict) else {}
+    item = scope.get("demand_item") or ((scope.get("demand_entity") or {}).get("resolved_item") if isinstance(scope.get("demand_entity"), dict) else None) or "Unknown"
+
+    def _num(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        return _safe_float(value)
+
+    demand_qty = _format_planner_number(summary.get("demand_qty_total"))
+    scheduled_qty = _format_planner_number(summary.get("scheduled_qty_total"))
+    unmet_qty = _format_planner_number(summary.get("unmet_qty"))
+    late_qty = _format_planner_number(summary.get("late_scheduled_qty"))
+    sku_exceptions = int(_num(constraints.get("sku_exception_rows_for_item")))
+    competing_rows = int(_num(constraints.get("higher_priority_competing_rows")))
+
+    findings: List[str] = []
+    if _num(summary.get("unmet_qty")) > 0:
+        findings.append(f"Demand exceeds supply by {unmet_qty} units")
+    if _num(summary.get("late_scheduled_qty")) > 0:
+        findings.append(f"{late_qty} units are late")
+    if sku_exceptions > 0:
+        findings.append(f"{sku_exceptions} SKU exceptions exist")
+    if competing_rows > 0:
+        findings.append("Competing higher-priority demand detected")
+    if not findings and payload.get("root_cause"):
+        findings.append(str(payload.get("root_cause")))
+
+    actions: List[str] = []
+    if sku_exceptions > 0:
+        actions.append("Review SKU exceptions")
+    if competing_rows > 0:
+        actions.append("Investigate competing demand allocation")
+    if _num(summary.get("unmet_qty")) > 0:
+        actions.append("Improve supply coverage")
+    if _num(summary.get("late_scheduled_qty")) > 0:
+        actions.append("Review late supply timing")
+    if not actions:
+        actions.append("Review planning constraints and supply coverage")
+
+    findings_text = "\n".join(f"- {entry}" for entry in findings[:4])
+    actions_text = "\n".join(f"- {entry}" for entry in actions[:4])
+    return (
+        "Root Cause Analysis\n\n"
+        f"Item: {item}\n\n"
+        f"Demand: {demand_qty}\n"
+        f"Scheduled Supply: {scheduled_qty}\n"
+        f"Unmet Quantity: {unmet_qty}\n\n"
+        f"Key Findings:\n{findings_text}\n\n"
+        f"Recommended Actions:\n{actions_text}"
+    )
+
+
+def _build_sku_exception_planner_summary(workflow_result: Optional[Dict]) -> str:
+    result = workflow_result if isinstance(workflow_result, dict) else {}
+    summary = result.get("SKU Exception Analysis") if isinstance(result.get("SKU Exception Analysis"), dict) else {}
+    item = summary.get("item") or "Unknown"
+    exception_count = int(summary.get("exception_count") or 0)
+    exception_codes = summary.get("exception_codes") if isinstance(summary.get("exception_codes"), list) else []
+    affected_boms = summary.get("affected_boms") if isinstance(summary.get("affected_boms"), list) else []
+    affected_parent_skus = summary.get("affected_parent_skus") if isinstance(summary.get("affected_parent_skus"), list) else []
+    recommended_actions = summary.get("recommended_actions") if isinstance(summary.get("recommended_actions"), list) else []
+
+    codes_text = ", ".join(str(code) for code in exception_codes[:6]) or "None"
+    boms_text = ", ".join(str(code) for code in affected_boms[:4]) or "None identified"
+    parents_text = ", ".join(str(code) for code in affected_parent_skus[:4]) or "None identified"
+    actions_text = "\n".join(f"- {str(action)}" for action in recommended_actions[:4]) or "- Review planning exceptions"
+
+    return (
+        "SKU Exception Analysis\n\n"
+        f"Item: {item}\n\n"
+        f"Exception Count: {exception_count}\n"
+        f"Exception Codes: {codes_text}\n"
+        f"Affected BOMs: {boms_text}\n"
+        f"Affected Parent SKUs: {parents_text}\n\n"
+        f"Recommended Actions:\n{actions_text}"
+    )
+
+
+def build_planner_friendly_deterministic_reply(
+    workflow_name: Optional[str],
+    workflow_result: Optional[Dict],
+    retrieval_plan: Optional[Dict] = None,
+    show_detailed_analysis: bool = False,
+) -> str:
+    if _is_root_cause_workflow(workflow_name):
+        deterministic = _build_root_cause_deterministic_result(workflow_result, retrieval_plan)
+        if show_detailed_analysis:
+            return json.dumps(deterministic, ensure_ascii=True)
+        return _build_root_cause_planner_summary(deterministic)
+    if (workflow_name or "").strip().lower() == "sku exception analysis":
+        if show_detailed_analysis:
+            return json.dumps(workflow_result if isinstance(workflow_result, dict) else {}, ensure_ascii=True)
+        return _build_sku_exception_planner_summary(workflow_result)
+    if (workflow_name or "").strip().lower() == "item demand supply" and isinstance(workflow_result, dict):
+        return _build_item_demand_supply_reply(workflow_result) or ""
+    return ""
+
+
+def build_no_llm_deterministic_payload(
+    workflow_name: Optional[str],
+    workflow_result: Optional[Dict],
+    retrieval_plan: Optional[Dict] = None,
+) -> Dict:
+    if _is_root_cause_workflow(workflow_name):
+        return _build_root_cause_deterministic_result(workflow_result, retrieval_plan)
+    return {}
+
+
 def run_chat_assistant(
     base_dir: Path,
     question: str,
+    session_id: Optional[str],
     week_id: Optional[str],
     scenario_id: Optional[str],
     scope: Dict,
     llm_enabled: bool = True,
     llm_model: Optional[str] = None,
     history: Optional[List[Dict[str, str]]] = None,
+    show_detailed_analysis: bool = False,
 ) -> Dict:
     q = (question or "").strip()
+    effective_llm_enabled = bool(llm_enabled) and not NO_LLM_RESPONSE_MODE
     if not q:
         return {
             "Assistant Reply": "Please type your question so I can help.",
@@ -7278,7 +8023,7 @@ def run_chat_assistant(
         }
 
     system_prompt, grounded_prompt, meta = build_grounded_chat_prompt(
-        base_dir, q, week_id, scenario_id, scope, history=history
+        base_dir, q, week_id, scenario_id, scope, session_id=session_id, history=history
     )
     workflow_payload = meta["workflow_payload"]
     context = meta["context"]
@@ -7291,14 +8036,20 @@ def run_chat_assistant(
     history_window = meta["history_window"]
     grounding = meta["grounding"]
     retrieval_plan = meta.get("retrieval_plan") if isinstance(meta.get("retrieval_plan"), dict) else None
+    context_resolution = meta.get("context_resolution") if isinstance(meta.get("context_resolution"), dict) else None
     semantic_file_discovery_mode = bool(meta.get("semantic_file_discovery_mode"))
     semantic_kpi_selector_mode = bool(meta.get("semantic_kpi_selector_mode"))
     solver_explainability_planner_mode = bool(meta.get("solver_explainability_planner_mode"))
     recommendation_retrieval_planner_mode = bool(meta.get("recommendation_retrieval_planner_mode"))
     semantic_router_mode = bool(meta.get("semantic_router_mode"))
     semantic_retrieval_mode = bool(meta.get("semantic_retrieval_mode"))
+    prompt_breakdown = meta.get("prompt_breakdown") if isinstance(meta.get("prompt_breakdown"), dict) else {}
+    formatter_metrics = meta.get("response_formatter_metrics") if isinstance(meta.get("response_formatter_metrics"), dict) else {}
     citations = _extract_citations_from_rag(rag_evidence)
     confidence = _compute_answer_confidence(workflow_result, rag_evidence, clarification, citations)
+    prompt_characters = int(prompt_breakdown.get("total_chars") or len(system_prompt) + len(grounded_prompt))
+    estimated_tokens = max(1, int(math.ceil(prompt_characters / 4.0)))
+    llm_timeout_ms = 300000 if LLM_CONFIG.get("provider") != "openvino" else 0
 
     parsed_command = _parse_chat_command(q)
     effective_scope = dict(scope or {})
@@ -7314,13 +8065,64 @@ def run_chat_assistant(
     effective_week = context.get("week_id")
     effective_scenario = context.get("scenario_id")
 
-    if llm_enabled:
+    def _finalize(response: Dict) -> Dict:
+        assistant_text = str(response.get("Assistant Reply") or "")
+        _update_chat_session_context(
+            session_id,
+            q,
+            assistant_text,
+            workflow_name,
+            workflow_payload,
+            workflow_result if isinstance(workflow_result, dict) else None,
+            retrieval_plan,
+            effective_scope,
+            context_resolution,
+        )
+        return response
+
+    llm_invoked = False
+    llm_duration_ms = 0
+    print(f"[IFSP] ANALYSIS_COMPLETE workflow={workflow_name}", flush=True)
+    print(
+        f"[IFSP] FINAL_RESPONSE_START prompt_characters={prompt_characters} estimated_tokens={estimated_tokens}",
+        flush=True,
+    )
+    if prompt_breakdown:
+        print(
+            "[IFSP] PROMPT_BREAKDOWN "
+            f"conversation_history_chars={int(prompt_breakdown.get('conversation_history_chars') or 0)} "
+            f"retrieved_data_chars={int(prompt_breakdown.get('retrieved_data_chars') or 0)} "
+            f"evidence_chars={int(prompt_breakdown.get('evidence_chars') or 0)} "
+            f"kpi_chars={int(prompt_breakdown.get('kpi_chars') or 0)} "
+            f"rule_chars={int(prompt_breakdown.get('rule_chars') or 0)} "
+            f"semantic_retrieval_chars={int(prompt_breakdown.get('semantic_retrieval_chars') or 0)} "
+            f"prompt_template_chars={int(prompt_breakdown.get('prompt_template_chars') or 0)}",
+            flush=True,
+        )
+        largest = prompt_breakdown.get("largest_contributor") if isinstance(prompt_breakdown.get("largest_contributor"), dict) else {}
+        print(
+            f"[IFSP] PROMPT_LARGEST_CONTRIBUTOR component={largest.get('component') or ''} chars={int(largest.get('chars') or 0)}",
+            flush=True,
+        )
+    if _is_root_cause_workflow(workflow_name):
+        print("[IFSP] RootCauseAnalysis Started", flush=True)
+        print(f"[IFSP] NO_LLM_RESPONSE_MODE = {str(NO_LLM_RESPONSE_MODE).lower()}", flush=True)
+
+    if effective_llm_enabled:
+        llm_invoked = True
+        _llm_started = datetime.utcnow()
+        print(
+            f"[IFSP] LLM_START model={(llm_model or LLM_CONFIG['model']).strip() or LLM_CONFIG['model']} timeout_ms={llm_timeout_ms}",
+            flush=True,
+        )
         conversational_reply = _ollama_chat_with_model(
             grounded_prompt,
             system_prompt,
             llm_model,
             history=history_window,
         )
+        llm_duration_ms = int((datetime.utcnow() - _llm_started).total_seconds() * 1000)
+        print(f"[IFSP] LLM_END duration_ms={llm_duration_ms}", flush=True)
         if conversational_reply:
             if retrieval_plan is not None:
                 retrieval_plan.setdefault("stages", {})["llm_explanation"] = "complete"
@@ -7360,12 +8162,20 @@ def run_chat_assistant(
                     "LLM Model": (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"],
                     "Confidence": confidence,
                     "Semantic Mode": semantic_mode,
+                    "LLM Invoked": True,
+                    "NO_LLM_RESPONSE_MODE": NO_LLM_RESPONSE_MODE,
+                    "Prompt Characters": prompt_characters,
+                    "Estimated Tokens": estimated_tokens,
+                    "LLM Duration MS": llm_duration_ms,
+                    "Timeout Duration MS": llm_timeout_ms,
+                    "Prompt Breakdown": prompt_breakdown,
+                    "Response Formatter Metrics": formatter_metrics,
                 }
                 if retrieval_plan is not None:
                     response["Retrieval Plan"] = retrieval_plan
                 if workflow_payload.get("router_metadata"):
                     response["Router Metadata"] = workflow_payload["router_metadata"]
-                return response
+                return _finalize(response)
 
             judge_review = _judge_llm_output(
                 q, conversational_reply, workflow_name, context,
@@ -7380,6 +8190,14 @@ def run_chat_assistant(
                 "LLM Provider": LLM_CONFIG["provider"].capitalize(),
                 "LLM Model": (llm_model or LLM_CONFIG["model"]).strip() or LLM_CONFIG["model"],
                 "Confidence": confidence,
+                "LLM Invoked": True,
+                "NO_LLM_RESPONSE_MODE": NO_LLM_RESPONSE_MODE,
+                "Prompt Characters": prompt_characters,
+                "Estimated Tokens": estimated_tokens,
+                "LLM Duration MS": llm_duration_ms,
+                "Timeout Duration MS": llm_timeout_ms,
+                "Prompt Breakdown": prompt_breakdown,
+                "Response Formatter Metrics": formatter_metrics,
             }
             if retrieval_plan is not None:
                 response["Retrieval Plan"] = retrieval_plan
@@ -7404,11 +8222,21 @@ def run_chat_assistant(
             )
             response["Grounded Response"] = grounded
             response.update(grounded)
-            return response
+            if _is_root_cause_workflow(workflow_name):
+                print("[IFSP] RootCauseAnalysis Completed", flush=True)
+                print("[IFSP] LLM Invoked = true", flush=True)
+            print("[IFSP] FINAL_RESPONSE_END", flush=True)
+            return _finalize(response)
 
     fallback_reply = "I can answer BY ESP planning questions in natural language and run validation, compare, root-cause, and insights workflows."
-    if workflow_name.lower() == "item demand supply" and isinstance(workflow_result, dict):
-        fallback_reply = _build_item_demand_supply_reply(workflow_result) or fallback_reply
+    planner_friendly_reply = build_planner_friendly_deterministic_reply(
+        workflow_name,
+        workflow_result if isinstance(workflow_result, dict) else None,
+        retrieval_plan,
+        show_detailed_analysis=show_detailed_analysis,
+    )
+    if planner_friendly_reply:
+        fallback_reply = planner_friendly_reply
 
     fallback = {
         "Assistant Reply": fallback_reply,
@@ -7416,6 +8244,14 @@ def run_chat_assistant(
         "Context Resolution": context,
         "Suggested Follow-ups": follow_ups,
         "Confidence": confidence,
+        "LLM Invoked": False,
+        "NO_LLM_RESPONSE_MODE": NO_LLM_RESPONSE_MODE,
+        "Prompt Characters": prompt_characters,
+        "Estimated Tokens": estimated_tokens,
+        "LLM Duration MS": llm_duration_ms,
+        "Timeout Duration MS": llm_timeout_ms,
+        "Prompt Breakdown": prompt_breakdown,
+        "Response Formatter Metrics": formatter_metrics,
         "Knowledge Areas": [
             "BY ESP LP optimization mechanics",
             "Input/output table definitions and columns",
@@ -7436,6 +8272,14 @@ def run_chat_assistant(
         retrieval_plan.setdefault("audit", {})["last_stage_update_utc"] = datetime.utcnow().isoformat() + "Z"
         _persist_retrieval_plan_for_audit(base_dir, retrieval_plan)
         fallback["Retrieval Plan"] = retrieval_plan
+    if NO_LLM_RESPONSE_MODE:
+        fallback["Mode"] = "NO_LLM_RESPONSE_MODE"
+        fallback["Note"] = "LLM generation is disabled by NO_LLM_RESPONSE_MODE=true. Returning deterministic grounded response."
+    if _is_root_cause_workflow(workflow_name):
+        fallback["Deterministic Result"] = _build_root_cause_deterministic_result(
+            workflow_result if isinstance(workflow_result, dict) else None,
+            retrieval_plan,
+        )
     if workflow_result is not None:
         fallback["Grounded Result"] = workflow_result
     if rag_evidence is not None:
@@ -7455,4 +8299,8 @@ def run_chat_assistant(
     )
     fallback["Grounded Response"] = grounded
     fallback.update(grounded)
-    return fallback
+    if _is_root_cause_workflow(workflow_name):
+        print("[IFSP] RootCauseAnalysis Completed", flush=True)
+        print(f"[IFSP] LLM Invoked = {str(llm_invoked).lower()}", flush=True)
+    print("[IFSP] FINAL_RESPONSE_END", flush=True)
+    return _finalize(fallback)

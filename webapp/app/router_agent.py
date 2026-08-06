@@ -93,6 +93,19 @@ INTENT_CATALOG: Dict[str, Dict[str, Any]] = {
         "workflow": "RootCause",
         "domain": None,
     },
+    "sku_exception_analysis": {
+        "description": "SKU exception analysis for an item, including exception codes, affected BOMs, and parent SKUs.",
+        "terms": [
+            "sku exception", "sku exceptions", "which sku exception", "which sku exceptions",
+            "what sku exception", "what sku exceptions", "exception code", "exception codes",
+            "invalid parent sku", "bom invalid", "bom is invalid",
+        ],
+        "required_slots": ["item"],
+        "optional_slots": ["site", "week_id", "scenario_id"],
+        "priority": 10,
+        "workflow": "SkuExceptionAnalysis",
+        "domain": None,
+    },
     "item_demand_supply": {
         "description": "Demand vs supply details, fill rate, EOH (end-of-horizon inventory), and fulfillment status for a specific item",
         "terms": [
@@ -564,11 +577,22 @@ _TABLE_NAME_RE = re.compile(
 
 
 def _extract_item(text: str) -> Optional[str]:
+    def _is_valid_item_candidate(candidate: str) -> bool:
+        val = (candidate or "").strip(" .,:;!?()[]{}")
+        if not val:
+            return False
+        if val.lower() in _ITEM_KEYWORD_BLOCKLIST:
+            return False
+        # Avoid truncation/partial matches like "item 100".
+        if val.isdigit() and len(val) < 6:
+            return False
+        return True
+
     for pattern in _ITEM_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             val = m.group(1).strip(" .,:;!?()[]{}")
-            if val and val.lower() not in _ITEM_KEYWORD_BLOCKLIST:
+            if _is_valid_item_candidate(val):
                 return val
     m = _NUMERIC_ITEM_RE.search(text)
     return m.group(0) if m else None

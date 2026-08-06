@@ -52,6 +52,18 @@ const VALIDATION_TAB_META = {
   },
 };
 const VALIDATION_TABS = Object.keys(VALIDATION_TAB_META);
+const SESSION_STORAGE_KEY = 'ifsp_session_id';
+
+function getOrCreateSessionId() {
+  let sid = localStorage.getItem(SESSION_STORAGE_KEY);
+  if (!sid) {
+    sid = (window.crypto && typeof window.crypto.randomUUID === 'function')
+      ? window.crypto.randomUUID()
+      : `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(SESSION_STORAGE_KEY, sid);
+  }
+  return sid;
+}
 
 function createValidationTabState() {
   const tabs = {};
@@ -456,6 +468,83 @@ function normalizeAssistantReply(data) {
     text: 'Here is what I found.',
     details: data,
   };
+}
+
+function tryParseJsonObject(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+
+  const candidates = [];
+  candidates.push(raw);
+
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    candidates.push(fenceMatch[1].trim());
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (!(candidate.startsWith('{') && candidate.endsWith('}'))) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Ignore parse failures and keep trying candidates.
+    }
+  }
+  return null;
+}
+
+function toUserFacingAssistantText(rawText) {
+  const raw = String(rawText || '').trim();
+  if (!raw) return 'No response received.';
+
+  const parsed = tryParseJsonObject(raw);
+  if (!parsed) return raw;
+
+  const directKeys = [
+    'Assistant Reply',
+    'assistant_reply',
+    'answer',
+    'message',
+    'summary',
+    'explanation',
+    'narrative',
+    'response',
+  ];
+  for (const key of directKeys) {
+    const value = parsed[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  const findings = Array.isArray(parsed.findings) ? parsed.findings.filter((x) => typeof x === 'string' && x.trim()) : [];
+  const causes = Array.isArray(parsed.root_causes) ? parsed.root_causes.filter((x) => typeof x === 'string' && x.trim()) : [];
+  const gaps = Array.isArray(parsed.data_gaps) ? parsed.data_gaps.filter((x) => typeof x === 'string' && x.trim()) : [];
+  const nextStep = typeof parsed.next_step === 'string' ? parsed.next_step.trim() : '';
+
+  const parts = [];
+  if (findings.length) {
+    parts.push(`Key findings: ${findings.slice(0, 3).join('; ')}.`);
+  }
+  if (causes.length) {
+    parts.push(`Likely causes: ${causes.slice(0, 3).join('; ')}.`);
+  }
+  if (gaps.length) {
+    parts.push(`Data gaps: ${gaps.slice(0, 2).join('; ')}.`);
+  }
+  if (nextStep) {
+    parts.push(`Next step: ${nextStep}`);
+  }
+
+  if (parts.length) {
+    return parts.join(' ');
+  }
+
+  return 'I completed the analysis and can explain any part in simple terms. Ask a follow-up like: What is the main reason for the result?';
 }
 
 function buildGraphColumns(nodes) {
@@ -2082,6 +2171,7 @@ async function submitChat() {
   const chatSiteEl = document.getElementById('chatSite');
   const body = JSON.stringify({
     question,
+    session_id: getOrCreateSessionId(),
     week_id: document.getElementById('chatWeek').value || null,
     scenario_id: document.getElementById('chatScenario').value || null,
     llm_enabled: chatLlmEnabled.checked,
@@ -2144,11 +2234,26 @@ async function submitChat() {
   } finally {
     clearInterval(elapsedTimer);
     // Remove typing cursor, show final text
-    chatMessages[streamIdx].content = fullText || 'No response received.';
+    const displayText = toUserFacingAssistantText(fullText);
+    const uiFallbackTriggered = displayText.toLowerCase().includes('model response timed out');
+    console.debug('[IFSP_UI] UI_RESPONSE_RECEIVED', {
+      response_length: displayText.length,
+      fallback_triggered: uiFallbackTriggered,
+      fallback_reason: uiFallbackTriggered ? 'LLM_TIMEOUT_FALLBACK_TEXT' : '',
+      formatted_response: displayText,
+    });
+    if (uiFallbackTriggered) {
+      console.debug('[IFSP_UI] FALLBACK_TRIGGERED', {
+        fallback_triggered: true,
+        fallback_reason: 'LLM_TIMEOUT_FALLBACK_TEXT',
+        fallback_source: 'toUserFacingAssistantText',
+      });
+    }
+    chatMessages[streamIdx].content = displayText;
     renderChatThread();
 
     chatHistory.push({ role: 'user', content: question });
-    chatHistory.push({ role: 'assistant', content: fullText });
+    chatHistory.push({ role: 'assistant', content: displayText });
     if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
 
     chatBtn.disabled = false;
