@@ -73,6 +73,92 @@ python webapp/run.py --host 127.0.0.1 --port 8000 --max-tries 30 --reload
 - `POST /api/root-cause`
 - `POST /api/chat`
 
+## Conversation Context Resolution
+
+The copilot includes a deterministic context layer that runs **before** intent classification.
+
+Flow:
+
+`User Query -> Context Resolution -> Intent Classification -> Entity Extraction -> Semantic Retrieval -> Data Retrieval -> KPI Engine -> Rule Engine -> LLM Explanation -> Response`
+
+### Session Context Lifecycle
+
+Per-session context captures:
+
+- `session_id`
+- `current_item`, `current_location`, `current_resource`, `current_supplier`
+- `current_analysis_topic`, `current_constraint_type`
+- `last_intent`, `last_entities`, `last_retrieval_plan`
+- `last_files_used`, `last_kpis`, `last_response_summary`
+- `conversation_history`, timestamps
+
+Context behavior:
+
+- Updated after each successful chat response
+- Automatically expires after 30 minutes of inactivity
+- Automatically resets after 10 user turns
+- Can be reset via API
+
+### Follow-up Query Examples
+
+Turn 1:
+
+`Check if demand is met for item 100000000004`
+
+Turn 2:
+
+`Can you find the exact reason for the unmet quantity?`
+
+Resolved query sent to the retrieval pipeline:
+
+`Can you find the exact reason for the unmet quantity for item 100000000004?`
+
+### Configuration Options
+
+- `SEMANTIC_MODE`: one of `legacy | semantic_retrieval | hybrid | solver_explainability`
+- `CHAT_STRUCTURED_SEMANTIC_MODE=false` (recommended): keep chat responses conversational in hybrid mode
+- Context layer constants (code defaults):
+  - `MAX_CONTEXT_TURNS = 10`
+  - `CONTEXT_TIMEOUT_MINUTES = 30`
+
+### Context APIs
+
+Get current context snapshot:
+
+```bash
+GET /api/context/current?session_id=<session-id>
+```
+
+Resolve a follow-up query with session context:
+
+```bash
+POST /api/context/resolve
+{
+  "session_id": "planner-session-1",
+  "query": "What caused it?"
+}
+```
+
+Example response:
+
+```json
+{
+  "resolved_query": "What caused unmet demand for item 100000000004?",
+  "context_used": ["current_item", "current_analysis_topic"],
+  "confidence": 0.95,
+  "follow_up_detected": true
+}
+```
+
+Reset session context:
+
+```bash
+POST /api/context/reset
+{
+  "session_id": "planner-session-1"
+}
+```
+
 ## Docker or Podman Build and Run
 From repository root:
 
