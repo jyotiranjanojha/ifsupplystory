@@ -15,6 +15,14 @@
   <a href="https://github.com/jyotiranjanojha/ifsupplystory/actions/workflows/semantic-regression.yml">
     <img src="https://img.shields.io/badge/CI-Reports-blue" alt="CI Reports" />
   </a>
+  <img src="https://img.shields.io/badge/Runtime-Hybrid%20Node%20%2B%20Python-0EA5E9?logo=githubactions&logoColor=white" alt="Hybrid runtime" />
+  <img src="https://img.shields.io/badge/Status-Production%20ready%20for%20local%20validation-16A34A?logo=check-circle&logoColor=white" alt="Status" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Planning-Validation%20%7C%20Root%20Cause%20%7C%20Compare-1F2937" alt="Planning capabilities" />
+  <img src="https://img.shields.io/badge/Evidence-Grounded%20AI-7C3AED" alt="Grounded AI" />
+  <img src="https://img.shields.io/badge/Access-Node%20front%20door%20%2F%20Python%20backend-0F172A" alt="Access model" />
 </p>
 
 ---
@@ -72,10 +80,11 @@ Built for planning teams that need explainability, traceability, and operational
 
 | Category | Stack |
 |---|---|
-| API | FastAPI |
-| Language | Python 3.11+ |
+| Public Entry Point | Node.js + Express |
+| Planning Engine | Python + FastAPI + Uvicorn |
 | Data | BY ESP CSV snapshots (by_input and by_output) |
-| Explainability | Deterministic KPI and rule engines plus grounded LLM narratives |
+| Explainability | Deterministic KPI, rule, and lineage engines plus grounded LLM narratives |
+| Runtime Pattern | Hybrid compatibility shell: public Node app, private Python backend |
 | Quality Gate | Semantic regression with CI thresholds |
 
 ---
@@ -83,9 +92,12 @@ Built for planning teams that need explainability, traceability, and operational
 ## Tech Stack
 
 <p>
+  <img src="https://img.shields.io/badge/Node.js-339933?logo=nodedotjs&logoColor=white" alt="Node.js" />
+  <img src="https://img.shields.io/badge/Express-000000?logo=express&logoColor=white" alt="Express" />
   <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
   <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/Uvicorn-111111?logo=uvicorn&logoColor=white" alt="Uvicorn" />
+  <img src="https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white" alt="Docker" />
   <img src="https://img.shields.io/badge/Pandas-150458?logo=pandas&logoColor=white" alt="Pandas" />
   <img src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white" alt="NumPy" />
   <img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&logoColor=white" alt="Pydantic" />
@@ -96,12 +108,14 @@ Built for planning teams that need explainability, traceability, and operational
 
 | Layer | Technology | Icon |
 |---|---|---|
-| Backend Framework | FastAPI | <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" /> |
+| Public API Shell | Node.js + Express | <img src="https://img.shields.io/badge/Node.js-339933?logo=nodedotjs&logoColor=white" alt="Node.js" /> <img src="https://img.shields.io/badge/Express-000000?logo=express&logoColor=white" alt="Express" /> |
+| Planning Backend | FastAPI | <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" /> |
 | Runtime Language | Python 3.11+ | <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python" /> |
 | API Server | Uvicorn | <img src="https://img.shields.io/badge/Uvicorn-111111?logo=uvicorn&logoColor=white" alt="Uvicorn" /> |
+| Container Runtime | Docker / Compose | <img src="https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white" alt="Docker" /> |
 | Data Processing | Pandas and NumPy | <img src="https://img.shields.io/badge/Pandas-150458?logo=pandas&logoColor=white" alt="Pandas" /> <img src="https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white" alt="NumPy" /> |
 | Validation Models | Pydantic | <img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&logoColor=white" alt="Pydantic" /> |
-| Workflow Orchestration | LangGraph | <img src="https://img.shields.io/badge/LangGraph-0B132B?logoColor=white" alt="LangGraph" /> |
+| Workflow Orchestration | LangGraph and domain orchestrators | <img src="https://img.shields.io/badge/LangGraph-0B132B?logoColor=white" alt="LangGraph" /> |
 | Testing | pytest | <img src="https://img.shields.io/badge/pytest-0A9EDC?logo=pytest&logoColor=white" alt="pytest" /> |
 | Semantic Quality Gate | Custom semantic regression framework | <img src="https://img.shields.io/badge/Semantic%20Regression-1F2937" alt="Semantic Regression" /> |
 | Vector and Retrieval | FAISS-based vector storage and RAG indexing | <img src="https://img.shields.io/badge/FAISS-1D4ED8" alt="FAISS" /> <img src="https://img.shields.io/badge/RAG-334155" alt="RAG" /> |
@@ -147,37 +161,32 @@ For provider-specific setup details, see LLM_PROVIDER_GUIDE.md.
 
 ```mermaid
 flowchart LR
-  %% User to Answer lane
-  Q([Planner Question]) --> I[Intent and Entity Detection]
-  I --> S[Semantic Retrieval Plan]
-  S --> D[Deterministic Data Retrieval]
+  U([Planner Request]) --> N[Node.js public shell]
+  N --> P[Express route proxy]
+  P --> B[Private Python FastAPI backend]
 
-  %% Deterministic reasoning lane
-  D --> K[KPI Engine]
-  D --> RU[Rule and Constraint Engine]
-  K --> G[Evidence Grounding and Citations]
-  RU --> G
+  B --> O[Intent router + planner orchestration]
+  O --> D[Deterministic KPI + validation + rules]
+  O --> R[Retrieval / lineage / BOM / SQL context]
+  D --> G[Evidence grounding]
+  R --> G
+  G --> L[LLM narrative generation]
+  L --> A([Decision-ready answer])
 
-  %% Explanation lane
-  G --> L[LLM Narrative Builder]
-  L --> O([Grounded Final Response])
-
-  %% Data dependencies
   D -. reads .-> IN[(by_input snapshots)]
   D -. reads .-> OUT[(by_output snapshots)]
-  D -. retrieves .-> RAG[(RAG index)]
+  R -. queries .-> IDX[(RAG / semantic index)]
 
-  classDef user fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.5px,color:#0f172a;
-  classDef plan fill:#ecfeff,stroke:#0e7490,stroke-width:1.5px,color:#0f172a;
-  classDef deterministic fill:#f0fdf4,stroke:#15803d,stroke-width:1.5px,color:#0f172a;
+  classDef public fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.5px,color:#0f172a;
+  classDef backend fill:#ecfeff,stroke:#0e7490,stroke-width:1.5px,color:#0f172a;
+  classDef logic fill:#f0fdf4,stroke:#15803d,stroke-width:1.5px,color:#0f172a;
   classDef explain fill:#fff7ed,stroke:#c2410c,stroke-width:1.5px,color:#0f172a;
   classDef data fill:#f8fafc,stroke:#475569,stroke-dasharray: 4 2,color:#0f172a;
 
-  class Q,O user;
-  class I,S plan;
-  class D,K,RU,G deterministic;
-  class L explain;
-  class IN,OUT,RAG data;
+  class U,N,P public;
+  class B,O,R,D,G backend;
+  class L,A explain;
+  class IN,OUT,IDX data;
 ```
 
 ### Runtime Components
@@ -185,84 +194,89 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph C[Client Layer]
-      UI[Web UI]
-      APIClient[API Clients]
+      UI[Web UI / Browser]
+      APIClient[REST clients]
     end
 
-    subgraph SVC[Application Service Layer]
-      Routes[API Routes and Middleware]
-      Orchestrator[Request Orchestrator]
-      Router[Intent Router]
-      SQLAgent[Text-to-SQL Agent]
-      BomGraph[BOM Explainability Graph]
-      Grounding[Grounding Engine]
+    subgraph NODE[Public Runtime Layer]
+      Express[Node.js Express app]
+      Proxy[Python proxy layer]
+      Health[Health checks + port compatibility]
     end
 
-    subgraph DET[Deterministic Logic Layer]
-      KPIEngine[KPI Engine]
-      Validation[Validation Checks]
-      Policy[Constraint Attribution Policy]
+    subgraph PY[Planner Runtime Layer]
+      Routes[FastAPI routes]
+      Orchestrator[Request orchestrator]
+      Router[Intent router]
+      Validate[Validation engine]
+      RootCause[Root-cause analyst]
+      Compare[Scenario comparator]
+      SQL[Text-to-SQL + lineage tools]
+      Grounding[Evidence grounding]
     end
 
-    subgraph DS[Data Layer]
+    subgraph DATA[Data Layer]
       InputCSV[(by_input snapshots)]
       OutputCSV[(by_output snapshots)]
-      RagIndex[(RAG index)]
+      RagIndex[(RAG / semantic index)]
     end
 
     subgraph M[Model Layer]
-      Provider[OpenAI or Azure or Anthropic or Nollama or OpenVINO]
+      LLM[LLM provider / local model]
     end
 
-    UI -->|planner requests| Routes
-    APIClient -->|service calls| Routes
-    Routes -->|dispatch| Orchestrator
+    UI -->|public requests| Express
+    APIClient -->|internal service calls| Express
+    Express --> Proxy
+    Proxy -->|route to backend| Routes
 
-    Orchestrator -->|route by intent| Router
-    Orchestrator -->|SQL workflow| SQLAgent
-    Orchestrator -->|BOM drill workflow| BomGraph
-    Orchestrator -->|assemble evidence| Grounding
+    Routes --> Orchestrator
+    Orchestrator --> Router
+    Orchestrator --> Validate
+    Orchestrator --> RootCause
+    Orchestrator --> Compare
+    Orchestrator --> SQL
+    Orchestrator --> Grounding
 
-    Orchestrator -->|deterministic KPIs| KPIEngine
-    Orchestrator -->|data quality gates| Validation
-    Orchestrator -->|constraint logic| Policy
+    Validate --> InputCSV
+    RootCause --> OutputCSV
+    Compare --> InputCSV
+    SQL --> InputCSV
+    Grounding --> RagIndex
+    Grounding --> LLM
 
-    Orchestrator -->|read input master data| InputCSV
-    Orchestrator -->|read solver outputs| OutputCSV
-    Orchestrator -->|retrieve context| RagIndex
-    Orchestrator -->|generate explanation| Provider
+    classDef client fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.2px,color:#0f172a;
+    classDef node fill:#ecfeff,stroke:#0e7490,stroke-width:1.2px,color:#0f172a;
+    classDef py fill:#f0fdf4,stroke:#15803d,stroke-width:1.2px,color:#0f172a;
+    classDef data fill:#f8fafc,stroke:#475569,stroke-width:1.2px,color:#0f172a;
+    classDef model fill:#fff7ed,stroke:#c2410c,stroke-width:1.2px,color:#0f172a;
 
-    classDef layerClient fill:#eef6ff,stroke:#1d4ed8,stroke-width:1.2px,color:#0f172a;
-    classDef layerService fill:#ecfeff,stroke:#0e7490,stroke-width:1.2px,color:#0f172a;
-    classDef layerDet fill:#f0fdf4,stroke:#15803d,stroke-width:1.2px,color:#0f172a;
-    classDef layerData fill:#f8fafc,stroke:#475569,stroke-width:1.2px,color:#0f172a;
-    classDef layerModel fill:#fff7ed,stroke:#c2410c,stroke-width:1.2px,color:#0f172a;
-
-    class UI,APIClient layerClient;
-    class Routes,Orchestrator,Router,SQLAgent,BomGraph,Grounding layerService;
-    class KPIEngine,Validation,Policy layerDet;
-    class InputCSV,OutputCSV,RagIndex layerData;
-    class Provider layerModel;
+    class UI,APIClient client;
+    class Express,Proxy,Health node;
+    class Routes,Orchestrator,Router,Validate,RootCause,Compare,SQL,Grounding py;
+    class InputCSV,OutputCSV,RagIndex data;
+    class LLM model;
 ```
 
 ### Executive View (One-Page)
 
 ```mermaid
 flowchart LR
-  A([Planner Question]) --> B[Understand Intent]
-  B --> C[Collect Planning Evidence]
-  C --> D[Run Deterministic Checks]
-  D --> E[Generate Grounded Explanation]
-  E --> F([Decision-Ready Answer])
+  A([Planner Question]) --> B[Node public entry point]
+  B --> C[Python planner backend]
+  C --> D[Collect evidence from BY snapshots]
+  D --> E[Run deterministic validation and diagnosis]
+  E --> F[Grounded answer with citations]
+  F --> G([Decision-ready planning insight])
 
-  C -. uses .-> I[(Input Snapshots)]
-  C -. uses .-> O[(Output Snapshots)]
-  C -. uses .-> R[(RAG Context)]
+  D -. uses .-> I[(by_input)]
+  D -. uses .-> O[(by_output)]
+  D -. uses .-> R[(RAG / semantic context)]
 
   classDef exec fill:#f8fafc,stroke:#0f172a,stroke-width:1.2px,color:#0f172a;
   classDef data fill:#ecfeff,stroke:#0e7490,stroke-dasharray: 4 2,color:#0f172a;
 
-  class A,B,C,D,E,F exec;
+  class A,B,C,D,E,F,G exec;
   class I,O,R data;
 ```
 
@@ -272,7 +286,8 @@ flowchart LR
 
 | Area | Responsibility |
 |---|---|
-| API Layer | Endpoints, middleware, runtime diagnostics |
+| Node Public Shell | Express layer for public-facing API and host compatibility |
+| Python Backend | FastAPI planning engine, routes, and deterministic logic |
 | Orchestration | Intent-driven workflow routing and response assembly |
 | Intent Router | Intent catalog, entities, confidence handling |
 | KPI Engine | Deterministic KPI calculations and checks |
@@ -377,11 +392,29 @@ SEMANTIC_MODE=legacy
 
 ### Run the Application
 
+The current runtime pattern is a hybrid deployment:
+
+- Public entry point: Node.js app on port 3004
+- Private planning engine: Python FastAPI app on an internal port such as 8000, 8001, or 8002
+
+#### Start the Python backend
+
 ```bash
-python webapp/run.py --port 8000
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+python webapp/run.py --host 127.0.0.1 --port 8000
 ```
 
-Open in browser: http://127.0.0.1:8000
+#### Start the public Node shell
+
+```bash
+npm install
+npm start
+```
+
+Then open in browser: http://localhost:3004
+
+For containerized deployment, the project also supports a combined startup script and Docker Compose flow with the backend kept internal-only while the public Express app serves the front door.
 
 ---
 
