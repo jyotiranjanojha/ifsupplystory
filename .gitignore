@@ -9,5 +9,6 @@ env/
 .pytest_cache/
 .rag/
 embedding_model/
+node_modules/
 _test_output.txt
 tests/test_nollama.py
