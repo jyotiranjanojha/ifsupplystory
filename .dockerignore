@@ -1,10 +1,29 @@
+# VCS and editor noise
 .git
 .gitignore
 .vscode
+
+# Python caches
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.log
 .venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node packages and local artifacts
+node_modules/
+npm-debug.log
+coverage/
+
+# Sensitive runtime config
 .env
+
+# Keep app code and runtime config needed for Docker build
+!webapp/
+!src/
+!package*.json
+!README.md
+!Dockerfile
