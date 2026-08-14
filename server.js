@@ -2,7 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 
 function parseArgs(argv) {
-  const args = { host: '127.0.0.1', port: 8000, reload: false, help: false };
+  const args = { host: '127.0.0.1', port: 8001, reload: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const current = argv[i];
     if (current === '--host') args.host = argv[i + 1] || args.host;
@@ -23,7 +23,7 @@ function main() {
   const repoRoot = __dirname;
 
   if (options.help) {
-    console.log('Usage: node server.js [--host 127.0.0.1] [--port 8000] [--reload] [--max-tries 30]');
+    console.log('Usage: node server.js [--host 127.0.0.1] [--port 8001] [--reload] [--max-tries 30]');
     console.log('This launcher starts the existing Python/FastAPI IFSP application with a Node-based entrypoint.');
     return;
   }

@@ -239,9 +239,33 @@ async def security_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def _decode_oauth_token_claims(token: str | None) -> dict:
+    if not token:
+        return {}
+
+    value = (token or "").strip()
+    if not value or value.count(".") < 2:
+        return {}
+
+    try:
+        payload_segment = value.split(".")[1]
+        padded = payload_segment + "=" * (-len(payload_segment) % 4)
+        decoded = base64.urlsafe_b64decode(padded)
+        payload = json.loads(decoded.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _extract_auth_profile(request: Request) -> dict:
     headers = request.headers
+    token = (
+        request.cookies.get("access_token")
+        or request.query_params.get("access_token")
+        or (headers.get("authorization") or "").replace("Bearer ", "", 1).strip()
+    ).strip()
 
+    display_name = None
     login = (headers.get("x-ms-client-principal-name") or "").strip() or None
     email = (
         headers.get("x-forwarded-email")
@@ -278,11 +302,23 @@ def _extract_auth_profile(request: Request) -> dict:
         elif request.headers.get("remote-user"):
             source = "remote-user"
 
+    if not (login or email) and token:
+        claims = _decode_oauth_token_claims(token)
+        if claims:
+            display_name = (claims.get("name") or "").strip() or None
+            if not login:
+                login = (claims.get("preferred_username") or claims.get("upn") or claims.get("email") or claims.get("name") or claims.get("unique_name") or "").strip() or None
+            if not email:
+                email = (claims.get("preferred_username") or claims.get("upn") or claims.get("email") or claims.get("unique_name") or "").strip() or None
+            if not source:
+                source = "access-token-cookie" if request.cookies.get("access_token") else "authorization-header"
+
     return {
-        "authenticated": bool(login or email),
+        "authenticated": bool(login or email or token),
+        "displayName": display_name,
         "login": login,
         "email": email,
-        "source": source or "none",
+        "source": source or ("access-token-cookie" if request.cookies.get("access_token") else "none"),
     }
 
 

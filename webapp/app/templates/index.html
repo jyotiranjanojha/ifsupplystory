@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Intel Foundry Planning AI Assistant</title>
     <link rel="icon" type="image/png" href="/static/intelfoundrylogo.png" />
-    <link rel="stylesheet" href="/static/styles.css?v=8" />
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
   </head>
   <body>
     <div class="bg-grid"></div>
@@ -20,9 +20,8 @@
           <button id="summaryBtn" class="btn primary">Load Dataset Summary</button>
         </section>
         <aside class="hero-side">
-          <span class="brand-pill">Planner Workspace</span>
+          <div id="authUserBadge" class="auth-user-badge" aria-live="polite">Checking sign-in…</div>
           <div class="global-model-card">
-            <div class="global-model-head">Assistant Model</div>
             <div class="global-model-controls">
               <label class="toggle-row compact-toggle" for="chatLlmEnabled">
                 <input id="chatLlmEnabled" type="checkbox" checked />
@@ -295,6 +294,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=18"></script>
+    <script src="/static/app.js?v=19"></script>
   </body>
 </html>

@@ -10,5 +10,7 @@ env/
 .rag/
 embedding_model/
 node_modules/
+.env
+logs/
 _test_output.txt
 tests/test_nollama.py

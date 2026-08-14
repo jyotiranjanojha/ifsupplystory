@@ -2007,7 +2007,9 @@ async function loadLlmModels() {
   try {
     const res = await fetch('/api/llm/models');
     const data = await res.json();
-    const models = Array.isArray(data.models) ? data.models : [];
+    const models = Array.isArray(data.models)
+      ? [...new Set(data.models.filter((modelName) => typeof modelName === 'string' && modelName.trim()))]
+      : [];
     const defaultModel = data.default_model || 'gemma3:latest';
     const bestAvailable = data.best_available || defaultModel;
     const modelInfo = data.model_info || {};
@@ -2053,12 +2055,30 @@ async function loadLlmModels() {
   setLlmControls();
 }
 
+function renderAuthBadge() {
+  const badge = document.getElementById('authUserBadge');
+  if (!badge) {
+    return;
+  }
+
+  const displayName = authProfile.displayName || authProfile.login || authProfile.email || 'Not signed in';
+  const text = authProfile.authenticated ? displayName : 'Single sign-on not active';
+
+  badge.textContent = text;
+  badge.title = authProfile.authenticated ? `Authenticated via ${authProfile.source}` : 'No SSO session detected';
+  badge.classList.toggle('is-authenticated', authProfile.authenticated);
+}
+
 async function loadAuthProfile() {
   try {
-    const res = await fetch('/api/auth/me');
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('access_token');
+    const url = token ? `/api/auth/me?access_token=${encodeURIComponent(token)}` : '/api/auth/me';
+    const res = await fetch(url);
     const data = await res.json();
     authProfile = {
       authenticated: Boolean(data.authenticated),
+      displayName: data.displayName || null,
       login: data.login || null,
       email: data.email || null,
       source: data.source || 'none',
@@ -2066,11 +2086,14 @@ async function loadAuthProfile() {
   } catch (_err) {
     authProfile = {
       authenticated: false,
+      displayName: null,
       login: null,
       email: null,
       source: 'none',
     };
   }
+
+  renderAuthBadge();
 }
 
 async function downloadValidationHtml(tab, tabName) {

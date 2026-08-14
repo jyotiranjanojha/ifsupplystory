@@ -70,14 +70,14 @@ body {
 }
 
 .global-model-card {
-  min-width: 280px;
-  max-width: 360px;
+  min-width: 250px;
+  max-width: 320px;
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 0.55rem 0.65rem;
+  padding: 0.4rem 0.5rem;
   display: grid;
-  gap: 0.38rem;
+  gap: 0.25rem;
 }
 
 .global-model-head {
@@ -91,8 +91,23 @@ body {
 .global-model-controls {
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 0.5rem;
+  gap: 0.35rem;
   align-items: end;
+}
+
+.global-model-card .compact-toggle {
+  font-size: 0.68rem;
+}
+
+.global-model-card .compact-field label,
+.global-model-card .compact-note {
+  font-size: 0.65rem;
+}
+
+.global-model-card select {
+  padding: 0.32rem 0.45rem;
+  font-size: 0.72rem;
+  border-radius: 8px;
 }
 
 .brand-logo {
@@ -111,6 +126,27 @@ body {
   background: linear-gradient(110deg, var(--intel-blue), var(--accent));
   border-radius: 999px;
   padding: 0.34rem 0.72rem;
+}
+
+.auth-user-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.1rem;
+  padding: 0.42rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 104, 181, 0.2);
+  background: rgba(14, 165, 233, 0.08);
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.auth-user-badge.is-authenticated {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #0f5c3d;
 }
 
 .hero h1 {

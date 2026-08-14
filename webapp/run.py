@@ -78,18 +78,30 @@ def pick_port(host: str, start_port: int, max_tries: int) -> int:
     raise RuntimeError(f"No free port found in range {start_port}-{start_port + max_tries - 1}")
 
 
+def resolve_port(host: str, port: int, max_tries: int) -> int:
+    if _port_is_free(host, port):
+        return port
+
+    for candidate in range(port, port + max_tries):
+        if _port_is_free(host, candidate):
+            print(f"[IFSP] Port {port} is already in use; using {candidate} instead.")
+            return candidate
+
+    raise RuntimeError(f"Port {port} is already in use and no fallback port is available in range {port}-{port + max_tries - 1}.")
+
+
 def main() -> None:
     # Load .env before anything else so env vars are set before module imports
     _load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
     parser = argparse.ArgumentParser(description="Run IFSP web app on a free port.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8000, help="Preferred starting port (default: 8000)")
+    parser.add_argument("--port", type=int, default=8001, help="Preferred starting port (default: 8001)")
     parser.add_argument("--max-tries", type=int, default=30, help="Number of ports to scan (default: 30)")
     parser.add_argument("--reload", action="store_true", help="Enable autoreload for development")
     args = parser.parse_args()
 
-    selected_port = pick_port(args.host, args.port, args.max_tries)
+    selected_port = resolve_port(args.host, args.port, args.max_tries)
     print(f"[IFSP] Starting server at http://{args.host}:{selected_port}")
 
     # Warm up the LLM in background so first user query isn't cold-start slow

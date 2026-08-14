@@ -2,20 +2,22 @@ version: '3.9'
 
 services:
   ifspstory:
+    image: amr-registry-pre.caas.intel.com/if-pdh-ai-assist/ifspstory:latest
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ifspstory
     ports:
       - "3000:3000"
+      - "8001:8001"
     env_file:
       - .env
     environment:
       NODE_ENV: production
       PORT: 3000
+      HOST: 0.0.0.0
       BACKEND_HOST: 0.0.0.0
-      BACKEND_PORT: 8000
+      BACKEND_PORT: 8001
+      PYTHON_BASE_URL: http://127.0.0.1:8001
       SEMANTIC_MODE: legacy
     restart: unless-stopped
-    # The Python backend remains internal to the container and is accessed by the Node app,
-    # not published to the host network.
